@@ -89,7 +89,6 @@ pip install pybuildingenergy
 - For heating system inputs (ISO EN 15316-1) refer to [Heating System Input](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_15316_input/)
 
 
-
 ## Example
 
 **New examples will follow soon...**
@@ -106,6 +105,12 @@ We welcome and appreciate contributions! Every contribution, no matter how small
 
 - Free software: BSD 3-Clause License  
 - Documentation: [pyBuildingEnergy Docs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/)
+
+## Author
+
+- [Daniele Antonucci](https://www.eurac.edu/it/people/daniele-antonucci)
+- [Ulrich Filippi Oberegger](https://www.eurac.edu/it/people/ulrich-filippi)
+- [Olga Somova](https://www.eurac.edu/it/people/olga-somova)
 
 ## Acknowledgment
 
