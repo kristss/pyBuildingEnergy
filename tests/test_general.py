@@ -230,7 +230,7 @@ def building_data():
 def hvac_system_config():
     """Fixture per la configurazione del sistema HVAC"""
     return {
-        'emitter_type': 'Floor heating 1',
+        'emitter_type': 'Floor heating',
         'nominal_power': 8,
         'emission_efficiency': 90,
         'flow_temp_control_type': 'Type 2 - Based on outdoor temperature',

@@ -253,7 +253,7 @@ BUI = {
 
 INPUT_SYSTEM_HVAC = {
     # ---- emitter ----
-    'emitter_type': 'Floor heating 1',
+    'emitter_type': 'Floor heating',
     'nominal_power': 8,
     'emission_efficiency': 90,
     'flow_temp_control_type': 'Type 2 - Based on outdoor temperature',
