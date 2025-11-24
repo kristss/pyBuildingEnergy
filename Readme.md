@@ -7,6 +7,10 @@
 *Please cite us if you use this library*: 
 [![DOI](https://zenodo.org/badge/761715706.svg)](https://zenodo.org/doi/10.5281/zenodo.10887919)
 
+## Documentation
+
+Check our **new documentation** in GitHub Pages: [pybuildingenergy docs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/).
+
 ## Features
 
 The new EPBD recast provides an update on building performance assessment through a methodology that must take into account various aspects such as the thermal characteristics of the building, the use of energy from renewable sources, building automation and control systems, ventilation, cooling, energy recovery, etc.
@@ -84,9 +88,7 @@ pip install pybuildingenergy
 - For building inputs refer to [Building Inputs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_input/)
 - For heating system inputs (ISO EN 15316-1) refer to [Heating System Input](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_15316_input/)
 
-## Documentation
 
-Check our documentation [here](https://eurac-eebgroup.github.io/pybuildingenergy-docs/).
 
 ## Example
 
