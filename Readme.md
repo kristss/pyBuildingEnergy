@@ -33,6 +33,8 @@ The calculation methods can be used for residential or non-residential buildings
 
 ISO 52016-1:2018 also contains specifications for the assessment of thermal zones in the building or in the part of a building. The calculations are performed per thermal zone. In the calculations, the thermal zones can be assumed to be thermally coupled or not. ISO 52016-1:2018 is applicable to buildings at the design stage, to new buildings after construction and to existing buildings in the use phase.
 
+-- 
+
 ## Weather Data
 
 The tool can use weather data coming from 2 main sources:
@@ -51,7 +53,7 @@ More details in the example folder.
 
 The ISO EN 15316 series covers the calculation method for system energy requirements and system efficiencies. This family of standards is an integral part of the EPB set and covers:
 
-### ISO EN 15316 Modular Structure
+## ISO EN 15316 Modular Structure **(New)**
 
 - [x] ISO EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
 - [ ] ISO EN 15316-2: Emission systems (heating and cooling)
@@ -66,6 +68,57 @@ The ISO EN 15316 series covers the calculation method for system energy requirem
 - [ ] ISO EN 15316-5: Storage systems
 
 For space heating, applicable standards include ISO EN 15316-1, ISO EN 15316-2-1, ISO EN 15316-2-3 and the appropriate parts of ISO EN 15316-4 depending on the system type, including losses and control aspects.
+
+## Single zone and Multiple Zones
+# EN ISO 52016 — Multi-zone Calculation and Adjacent Zones
+
+**EN ISO 52016 defines that:**  
+The calculation now allows the definition of several **thermal** and **non-thermal** zones adjacent to the considered zone.
+
+
+**External Adjacent – Unheated Zone**: It is possible to define an **unheated adjacent zone** in contact with the considered thermal zone.  
+The length of the separating wall may be **entirely** or **partially** connected to the considered zone.  
+
+The calculation involves:
+1. Determining the **internal temperature** of the non-thermal zone.
+2. Evaluating the **heat exchange** with the thermal zone.
+
+
+**External Adjacent – Heated Zone**: In this case, the wall between the two zones is considered **adiabatic** (no heat exchange).
+**Adjusted Coefficient**: To account for the **different temperatures** between zones (e.g., thermal and non-thermal), an **adjusted coefficient** is calculated.
+
+
+### Assumptions and Simplifications
+The standard defines various assumptions specified in section *6.5.3 — Assumptions and specific conditions*.  
+In general, it aims to **simplify the zoning** approach by reducing the number of zones to a minimum (ISO EN 52016-2:2018).  
+
+It also emphasizes that:
+
+> *A multi-zone calculation with interactions between the zones requires significant and often arbitrary input data (on transmission properties and air flow direction and size).  
+> It can also lead to other technical and procedural complications that add uncertainties to the results.  
+> A further complication can be the involvement of different heating, cooling and ventilation systems for different zones, which adds to the complexity and arbitrariness of the input and modelling.*  
+
+**Key Remark**: **Therefore, the benefits of calculations with thermally coupled zones can be smaller than the drawbacks.**
+
+---
+
+## ISO EN 16798-7 & 16798-1 - Natual ventilation and profiles
+
+Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zone either: 
+
+- from natural ventilation (ISO 16798-7:2017, single-sided airing via windows, wind/stack), or 
+- from occupancy-driven flow (simplified volumetric rate per floor area).
+
+For more detail refers to [natural ventilation](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_ventilation/).
+
+Due to the need to have profiles of occupancy and consumption of buildings for some uses, tables of profiles useful for evaluating, occupancy, lights, heating, cooling, internal gains have been implemented.
+These tables are provided by ANNEX A of ISO EN 156798-1. 
+In the tool they are available here: [Table](https://github.com/EURAC-EEBgroup/pyBuildingEnergy/blob/master/src/pybuildingenergy/source/table_iso_16798_1.py)
+
+# Input Quality check 
+
+The data provided before being used for the simulation are processed and evaluated to be considered fit for the simulation. This process includes a series of checks that allow to identify any potential errors. 
+For more details refers to [Input Quality check](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_input_check/).
 
 ## Limitations
 
@@ -128,6 +181,7 @@ DHW Calculation developed with data and methods from EPBCenter spreadsheet.
 - Directive (EU) 2024/1275 - Official Journal of the EU, May 8, 2024
 - EN ISO 52010-1:2018 - External climatic conditions  
 - EN ISO 52016-1:2018 - Energy needs for heating and cooling  
+- EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and iso 52017-1
 - EN ISO 12831-3:2018 - DHW systems heat load and characterization  
 - EN ISO 15316-1:2018 - System energy requirements and efficiencies  
 - EN ISO 16798-7 & 16798-1 - Ventilation standards
