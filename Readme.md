@@ -52,23 +52,23 @@ More details in the example folder.
 
 ## Primary Energy - Heating System **(New)**
 
-The ISO EN 15316 series covers the calculation method for system energy requirements and system efficiencies. This family of standards is an integral part of the EPB set and covers:
+The EN 15316 series covers the calculation method for system energy requirements and system efficiencies. This family of standards is an integral part of the EPB set and covers:
 
-## ISO EN 15316 Modular Structure **(New)**
+## EN 15316 Modular Structure **(New)**
 
-- [x] ISO EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
-- [ ] ISO EN 15316-2: Emission systems (heating and cooling)
-- [ ] ISO EN 15316-3: Distribution systems (DHW, heating, cooling)
-- [ ] ISO EN 15316-4-X: Heat generation systems:
+- [x] EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
+- [ ] EN 15316-2: Emission systems (heating and cooling)
+- [ ] EN 15316-3: Distribution systems (DHW, heating, cooling)
+- [ ] EN 15316-4-X: Heat generation systems:
   - 4-1: Combustion boilers
   - 4-2: Heat pumps
   - 4-3: Solar thermal and photovoltaic systems
   - 4-4: Cogeneration systems
   - 4-5: District heating
   - 4-7: Biomass
-- [ ] ISO EN 15316-5: Storage systems
+- [ ] EN 15316-5: Storage systems
 
-For space heating, applicable standards include ISO EN 15316-1, ISO EN 15316-2-1, ISO EN 15316-2-3 and the appropriate parts of ISO EN 15316-4 depending on the system type, including losses and control aspects.
+For space heating, applicable standards include EN 15316-1, EN 15316-2-1, EN 15316-2-3 and the appropriate parts of EN 15316-4 depending on the system type, including losses and control aspects.
 
 ## Single zone and Multiple Zones **(New)**
 # EN ISO 52016 — Multi-zone Calculation and Adjacent Zones
@@ -103,7 +103,7 @@ It also emphasizes that:
 
 ---
 
-## ISO EN 16798-7 & 16798-1 - Natual ventilation and profiles **(New)**
+## EN 16798-7 & 16798-1 - Natual ventilation and profiles **(New)**
 
 Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zone either: 
 
@@ -113,7 +113,7 @@ Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zon
 For more detail refers to [natural ventilation](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_ventilation/).
 
 Due to the need to have profiles of occupancy and consumption of buildings for some uses, tables of profiles useful for evaluating, occupancy, lights, heating, cooling, internal gains have been implemented.
-These tables are provided by ANNEX A of ISO EN 156798-1. 
+These tables are provided by ANNEX A of ISO EN 16798-1. 
 In the tool they are available here: [Table](https://github.com/EURAC-EEBgroup/pyBuildingEnergy/blob/master/src/pybuildingenergy/source/table_iso_16798_1.py)
 
 ## Input Quality check  **(New)**
@@ -140,7 +140,7 @@ pip install pybuildingenergy
 ## Building - System Inputs
 
 - For building inputs refer to [Building Inputs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_input/)
-- For heating system inputs (ISO EN 15316-1) refer to [Heating System Input](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_15316_input/)
+- For heating system inputs (EN 15316-1) refer to [Heating System Input](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_15316_input/)
 
 
 ## Example
@@ -183,6 +183,6 @@ DHW Calculation developed with data and methods from EPBCenter spreadsheet.
 - EN ISO 52010-1:2018 - External climatic conditions  
 - EN ISO 52016-1:2018 - Energy needs for heating and cooling  
 - EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and iso 52017-1
-- EN ISO 12831-3:2018 - DHW systems heat load and characterization  
-- EN ISO 15316-1:2018 - System energy requirements and efficiencies  
-- EN ISO 16798-7 & 16798-1 - Ventilation standards
+- EN 12831-3:2018 - DHW systems heat load and characterization  
+- EN 15316-1:2018 - System energy requirements and efficiencies  
+- EN 16798-7 & 16798-1 - Ventilation standards
