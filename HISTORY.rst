@@ -29,3 +29,6 @@ History
 * Reshape the building and havc inputs in a more user-friendly way
 * Adding example of multizone calculation
 
+2.0.1 and 2.0.2 (2025-11-24)
+------------------
+* Update information regarding authors, license, etc.
