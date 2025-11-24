@@ -7,7 +7,7 @@
 *Please cite us if you use this library*: 
 [![DOI](https://zenodo.org/badge/761715706.svg)](https://zenodo.org/doi/10.5281/zenodo.10887919)
 
-## Documentation
+## Documentation **(New)**
 
 Check our **new documentation** in GitHub Pages: [pybuildingenergy docs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/).
 
@@ -49,7 +49,7 @@ More details in the example folder.
 - [x] Calculation of volume and energy need for domestic hot water according to ISO 12831-3.
 - [ ] Assessment of thermal load based on the type of DHW system.
 
-## Primary Energy - Heating System
+## Primary Energy - Heating System **(New)**
 
 The ISO EN 15316 series covers the calculation method for system energy requirements and system efficiencies. This family of standards is an integral part of the EPB set and covers:
 
@@ -69,7 +69,7 @@ The ISO EN 15316 series covers the calculation method for system energy requirem
 
 For space heating, applicable standards include ISO EN 15316-1, ISO EN 15316-2-1, ISO EN 15316-2-3 and the appropriate parts of ISO EN 15316-4 depending on the system type, including losses and control aspects.
 
-## Single zone and Multiple Zones
+## Single zone and Multiple Zones **(New)**
 # EN ISO 52016 — Multi-zone Calculation and Adjacent Zones
 
 **EN ISO 52016 defines that:**  
@@ -102,7 +102,7 @@ It also emphasizes that:
 
 ---
 
-## ISO EN 16798-7 & 16798-1 - Natual ventilation and profiles
+## ISO EN 16798-7 & 16798-1 - Natual ventilation and profiles **(New)**
 
 Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zone either: 
 
@@ -115,7 +115,7 @@ Due to the need to have profiles of occupancy and consumption of buildings for s
 These tables are provided by ANNEX A of ISO EN 156798-1. 
 In the tool they are available here: [Table](https://github.com/EURAC-EEBgroup/pyBuildingEnergy/blob/master/src/pybuildingenergy/source/table_iso_16798_1.py)
 
-# Input Quality check 
+## Input Quality check  **(New)**
 
 The data provided before being used for the simulation are processed and evaluated to be considered fit for the simulation. This process includes a series of checks that allow to identify any potential errors. 
 For more details refers to [Input Quality check](https://eurac-eebgroup.github.io/pybuildingenergy-docs/iso_52016_input_check/).
