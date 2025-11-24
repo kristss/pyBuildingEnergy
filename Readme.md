@@ -3,8 +3,8 @@
 ![pyBuildingEnergy Logo](https://github.com/EURAC-EEBgroup/pyBuildingEnergy/blob/master/src/pybuildingenergy/assets/Logo_pyBuild.png)
 
 ## Citation
-Please cite us if you use the library.
 
+*Please cite us if you use this library*: 
 [![DOI](https://zenodo.org/badge/761715706.svg)](https://zenodo.org/doi/10.5281/zenodo.10887919)
 
 ## Features
