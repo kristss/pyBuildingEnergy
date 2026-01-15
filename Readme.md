@@ -127,8 +127,6 @@ The library is developed with the intent of demonstrating specific elements of c
 
 The information and views set out in this document are those of the authors and do not necessarily reflect the official opinion of the European Union.
 
-The calculation is currently aimed at single-zone buildings with ground floor. The evaluation of multi-zone buildings is under evaluation.
-
 ## Getting Started
 
 Install the latest version of the library:
