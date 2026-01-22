@@ -27,10 +27,11 @@ scikit-learn==1.7.2
 scipy==1.16.2
 setuptools==80.9.0
 soupsieve==2.8
-timezonefinder==8.1.0
+timezonefinder==6.0.1
 tqdm==4.67.1
 typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
 workalendar==17.0.0
 pytest==9.0.1
+h3==3.7.6
