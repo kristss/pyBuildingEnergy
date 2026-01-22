@@ -8,6 +8,7 @@ import requests
 import pandas as pd
 import datetime as dt
 import math
+import io
 from pathlib import Path
 import tempfile
 from timezonefinder import TimezoneFinder
@@ -203,6 +204,7 @@ class ISO52010:
         period="1991-2020",
         data_type="tmy",
         out_dir=None,
+        in_memory=True, 
     ):
         """
         Get Weather data from climatedataforbuildings.eu and save to an EPW file.
@@ -212,8 +214,10 @@ class ISO52010:
         :param period: reference period ("1991-2020" or "2006-2020").
         :param data_type: data type to use (only "tmy" supported).
         :param out_dir: output directory for the downloaded EPW file.
+        :param in_memory: if True, return an in-memory EPW buffer instead of saving to disk. True tends to be faster. 
+        :param user_agent: custom User-Agent header for requests.
 
-        :return: path of the downloaded EPW file (type: **Path**)
+        :return: path of the downloaded EPW file or an in-memory buffer (type: **Path** or **io.BytesIO**)
         """
 
         if isinstance(building_object, dict):
@@ -238,6 +242,10 @@ class ISO52010:
         if period not in valid_periods:
             raise ValueError("period must be 1991-2020 or 2006-2020")
 
+        
+        user_agent = f"pybuildingenergy"
+        headers = {"User-Agent": user_agent}
+
         def _haversine_km(lat1, lon1, lat2, lon2):
             radius_km = 6371
             to_rad = math.radians
@@ -252,7 +260,7 @@ class ISO52010:
             return 2 * radius_km * math.asin(math.sqrt(a))
 
         index_url = f"https://www.climatedataforbuildings.eu/api/{data_type}-{dataset.lower()}.json"
-        response = requests.get(index_url, timeout=30)
+        response = requests.get(index_url, headers=headers, timeout=30)
         if response.status_code != 200:
             raise RuntimeError(
                 f"Failed to fetch index file from {index_url}: HTTP Error {response.status_code}"
@@ -275,16 +283,21 @@ class ISO52010:
             raise RuntimeError(f"No file available for period {period} in {index_url}")
 
         epw_url = f"https://www.climatedataforbuildings.eu/FA{data_type.upper()}/{file_path}"
-        if out_dir is None:
-            out_dir = Path.home() / "Downloads"
-        else:
-            out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / Path(file_path).name
-
-        response = requests.get(epw_url, stream=True, timeout=60)
+        response = requests.get(epw_url, headers=headers, stream=True, timeout=60)
         try:
             response.raise_for_status()
+            if in_memory:
+                # EPW is a text format; provide a text buffer
+                return io.StringIO(response.content.decode(errors="ignore"))
+            
+            if out_dir is None:
+                out_dir = Path.home() / "Downloads"
+            else:
+                out_dir = Path(out_dir)
+            
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / Path(file_path).name
+            
             try:
                 with out_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=8192):
@@ -298,6 +311,7 @@ class ISO52010:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             handle.write(chunk)
+
         finally:
             response.close()
 
@@ -309,7 +323,7 @@ class ISO52010:
         """
         Get Wetaher data from epw file
 
-        :param path_weather_file: path of the .epw weather file. (e.g (../User/documents/epw/athens.epw))
+        :param path_weather_file: path of the .epw weather file or an in-memory buffer.
 
         :return:
             * *elevation*: altitude of specifici location (type: **float**)
@@ -320,6 +334,15 @@ class ISO52010:
         """
 
         # Read EPW file
+        if isinstance(path_weather_file, (bytes, bytearray)):
+            path_weather_file = io.StringIO(
+                bytes(path_weather_file).decode(errors="ignore")
+            )
+        elif isinstance(path_weather_file, io.BytesIO):
+            path_weather_file.seek(0)
+            path_weather_file = io.StringIO(
+                path_weather_file.read().decode(errors="ignore")
+            )
         weather_data = epw.read_epw(path_weather_file)
 
         # Weather data filter in a format to be used by ISO52016 in a csv
@@ -760,7 +783,9 @@ def Calculation_ISO_52010(building_object, path_weather_file, weather_source="pv
         weatherData = ISO52010.get_tmy_data_epw(path_weather_file)
     elif weather_source == "climatedata":
         if path_weather_file is None:
-            path_weather_file = ISO52010.get_tmy_data_climatedataforbuildings(building_object)
+            path_weather_file = ISO52010.get_tmy_data_climatedataforbuildings(
+                building_object, in_memory=True
+            )
         weatherData = ISO52010.get_tmy_data_epw(path_weather_file)
     else:
         raise ValueError("select the right weather source: 'epw', 'pvgis', or 'climatedata'")
