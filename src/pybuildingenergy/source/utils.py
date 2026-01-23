@@ -219,7 +219,7 @@ class ISO52010:
 
         :return: path of the downloaded EPW file or an in-memory buffer (type: **Path** or **io.BytesIO**)
         """
-
+        # Extract latitude and longitude from building object
         if isinstance(building_object, dict):
             latitude = building_object["building"]["latitude"]
             longitude = building_object["building"]["longitude"]
@@ -230,11 +230,11 @@ class ISO52010:
         dataset = str(dataset).upper()
         data_type = str(data_type).lower()
         period = str(period)
-
+        # Validate inputs
         valid_types = {"tmy"}
         valid_datasets = {"EU", "NO"}
         valid_periods = {"1991-2020", "2006-2020"}
-
+        
         if data_type not in valid_types:
             raise ValueError("type must be tmy")
         if dataset not in valid_datasets:
@@ -242,10 +242,10 @@ class ISO52010:
         if period not in valid_periods:
             raise ValueError("period must be 1991-2020 or 2006-2020")
 
-        
+        # Set User-Agent header
         user_agent = f"pybuildingenergy"
         headers = {"User-Agent": user_agent}
-
+        # Haversine formula to calculate distance between two lat/lon points
         def _haversine_km(lat1, lon1, lat2, lon2):
             radius_km = 6371
             to_rad = math.radians
@@ -258,7 +258,7 @@ class ISO52010:
                 * math.sin(dlon / 2) ** 2
             )
             return 2 * radius_km * math.asin(math.sqrt(a))
-
+        # Fetch index file for locations
         index_url = f"https://www.climatedataforbuildings.eu/api/{data_type}-{dataset.lower()}.json"
         response = requests.get(index_url, headers=headers, timeout=30)
         if response.status_code != 200:
@@ -266,7 +266,7 @@ class ISO52010:
                 f"Failed to fetch index file from {index_url}: HTTP Error {response.status_code}"
             )
         points = response.json()
-
+        # Find closest point
         best = None
         best_dist = float("inf")
         for point in points:
@@ -277,33 +277,36 @@ class ISO52010:
 
         if best is None:
             raise RuntimeError(f"No points returned by {index_url}")
-
+        # Download EPW file for closest point
         file_path = best["files"].get(period)
         if not file_path:
             raise RuntimeError(f"No file available for period {period} in {index_url}")
 
         epw_url = f"https://www.climatedataforbuildings.eu/FA{data_type.upper()}/{file_path}"
         response = requests.get(epw_url, headers=headers, stream=True, timeout=60)
+        # Save to disk or return in-memory buffer
         try:
             response.raise_for_status()
+            # Return in-memory buffer
             if in_memory:
                 # EPW is a text format; provide a text buffer
                 return io.StringIO(response.content.decode(errors="ignore"))
-            
+            # Save to disk
             if out_dir is None:
                 out_dir = Path.home() / "Downloads"
             else:
                 out_dir = Path(out_dir)
-            
+            # Create output directory if it doesn't exist
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / Path(file_path).name
-            
+            # Write to file with permission error handling
             try:
+                # Write to specified output directory
                 with out_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             handle.write(chunk)
-            except PermissionError:
+            except PermissionError: # Fallback to temp directory
                 out_dir = Path(tempfile.gettempdir()) / "pybuildingenergy"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = out_dir / Path(file_path).name
@@ -311,8 +314,7 @@ class ISO52010:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             handle.write(chunk)
-
-        finally:
+        finally: # Ensure response is closed
             response.close()
 
         return out_path
