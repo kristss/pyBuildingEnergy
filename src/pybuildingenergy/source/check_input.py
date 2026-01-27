@@ -1,6 +1,8 @@
 from copy import deepcopy
 import numpy as np
 from pybuildingenergy.global_inputs import TB14 as TB14_backup
+import pandas as pd
+from pybuildingenergy.source.table_iso_16798_1 import internal_gains_occupants
 
 def _dir_from_orientation(azimuth: float, tilt: float) -> str:
     '''
@@ -24,7 +26,7 @@ def _dir_from_orientation(azimuth: float, tilt: float) -> str:
     if abs(az-90.0) <= 1e-6:  return "EV"
     if abs(az-180.0) <= 1e-6: return "SV"
     if abs(az-270.0) <= 1e-6: return "WV"
-    # snap al più vicino
+    # snap to nearest
     pts  = [0.0, 90.0, 180.0, 270.0]
     labs = ["NV","EV","SV","WV"]
     return labs[int(np.argmin(np.abs((az - np.array(pts)) % 360.0)))]
@@ -41,7 +43,7 @@ def _adj_op_area_in_dir(adj_zone: dict, dir_code: str) -> float:
 #  CHECK INPUT HEATING SYSTEM
 # -------------------------------------------------------------------
 
-import pandas as pd
+
 
 def check_heating_system_inputs(system_input: dict):
     """
@@ -51,7 +53,7 @@ def check_heating_system_inputs(system_input: dict):
     - If 'TB14' is present and DataFrame -> use that.
     - Otherwise -> use the backup TB14 from global_inputs.py.
     - If emitter_type is not an index of the TB14 selected:
-        -> set automatico al primo indice disponibile e messaggio di avviso.
+        -> auto-set to the first available index and emit a warning message.
     - If gen_flow_temp_control_type = Type A, then gen_outdoor_temp_data must be provided as a dataframe.
     - If gen_flow_temp_control_type = Type C, if θHW_gen_flw_const is not provided, it is set to 50.
 
@@ -60,13 +62,13 @@ def check_heating_system_inputs(system_input: dict):
             "TB14_used": DataFrame,
             "emitter_type": str,
             "messages": list[str],
-            "config": dict  # input normalizzato con emitter_type aggiornato
+            "config": dict  # input normalized with updated emitter_type
         }
     """
     messages = []
     cfg = deepcopy(system_input)
 
-    # 1) TB14: custom o default
+    # 1) TB14: custom or default
     tb14_custom = cfg.get("TB14", None)
     if isinstance(tb14_custom, pd.DataFrame):
         TB14 = tb14_custom
@@ -75,7 +77,7 @@ def check_heating_system_inputs(system_input: dict):
         TB14 = TB14_backup
         messages.append("⚙️ Default TB14 table loaded from global_inputs.py.")
 
-    # 2) Validazione emitter_type rispetto alla TB14 usata
+    # 2) Validate emitter_type against TB14
     emitter_type = cfg.get("emitter_type", None)
     valid_emitters = list(TB14.index)
 
@@ -154,16 +156,30 @@ def sanitize_and_validate_BUI(bui: dict,
             if not (isinstance(val, (int, float)) and val > 0):
                 if fix and isinstance(val, (int, float)) and val == 0:
                     b[key] = max(eps, 1.0)
-                    add_issue("WARN", f"building.{key}", f"{key} era 0; impostato a {b[key]}", fixed=True)
+                    add_issue("WARN", f"building.{key}", f"{key} was 0; set to {b[key]}", fixed=True)
                 else:
-                    add_issue("ERROR", f"building.{key}", f"{key} deve essere > 0; valore={val}", fixed=False)
+                    add_issue("ERROR", f"building.{key}", f"{key} should be > 0; value={val}", fixed=False)
 
     if "n_floors" in b and (not isinstance(b["n_floors"], (int, float)) or b["n_floors"] <= 0):
         if fix and isinstance(b["n_floors"], (int, float)) and b["n_floors"] == 0:
             b["n_floors"] = 1
-            add_issue("WARN", "building.n_floors", "n_floors era 0; impostato a 1", fixed=True)
+            add_issue("WARN", "building.n_floors", "n_floors was 0; set to 1", fixed=True)
         else:
-            add_issue("ERROR", "building.n_floors", f"n_floors deve essere > 0; valore={b.get('n_floors')}", fixed=False)
+            add_issue("ERROR", "building.n_floors", f"n_floors should be > 0; value={b.get('n_floors')}", fixed=False)
+
+    # building_type_class validation against internal_gains_occupants table
+    btc = b.get("building_type_class", None)
+    if btc is not None:
+        allowed_classes = set(internal_gains_occupants.keys())
+        fallback_class = "Residential_apartment"
+        if btc not in allowed_classes:
+            msg = (
+                f"building_type_class '{btc}' not recognized; set to '{fallback_class}' "
+                f"and continuing with the fallback."
+            )
+            b["building_type_class"] = fallback_class
+            print(f"⚠️ {msg}")
+            add_issue("WARN", "building.building_type_class", msg, fixed=True)
 
     # ---------------------------
     # 2) SURFACES CHECKS
@@ -173,70 +189,70 @@ def sanitize_and_validate_BUI(bui: dict,
 
     for i, s in enumerate(bui_clean.get("building_surface", [])):
         path = f"building_surface[{i}]"
-        # correzione refusi type
+        # typo correction for "type"
         t = s.get("type")
         if isinstance(t, str) and t.lower() in type_corrections:
             old = t
             s["type"] = type_corrections[t.lower()]
-            add_issue("WARN", f"{path}.type", f'type="{old}" corretto in "{s["type"]}"', fixed=True)
+            add_issue("WARN", f"{path}.type", f'type="{old}" corrected to "{s["type"]}"', fixed=True)
         t = (s.get("type") or "").lower()
         if t not in allowed_types:
-            add_issue("ERROR", f"{path}.type", f'type "{s.get("type")}" non riconosciuto', fixed=False)
+            add_issue("ERROR", f"{path}.type", f'type "{s.get("type")}" not recognized', fixed=False)
 
         # area
         area = s.get("area", None)
         if not (isinstance(area, (int, float)) and area > 0):
             if fix and isinstance(area, (int, float)) and area == 0:
                 s["area"] = max(eps, 1.0)
-                add_issue("WARN", f"{path}.area", f"area era 0; impostata a {s['area']}", fixed=True)
+                add_issue("WARN", f"{path}.area", f"area was 0; set to {s['area']}", fixed=True)
             else:
-                add_issue("ERROR", f"{path}.area", f"area deve essere > 0; valore={area}", fixed=False)
+                add_issue("ERROR", f"{path}.area", f"area should be > 0; value={area}", fixed=False)
 
         # sky_view_factor
         svf = s.get("sky_view_factor", None)
         if not (isinstance(svf, (int, float)) and 0.0 <= svf <= 1.0):
             if fix and isinstance(svf, (int, float)):
                 s["sky_view_factor"] = min(1.0, max(0.0, svf))
-                add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor fuori range; clippato a {s['sky_view_factor']}", fixed=True)
+                add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor out of range; clipped to {s['sky_view_factor']}", fixed=True)
             else:
-                add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor mancante o non in [0,1]; valore={svf}", fixed=False)
+                add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor missing or not in [0,1]; values={svf}", fixed=False)
 
-        # U-value per opaque/transparent
+        # U-value for opaque/transparent
         if t in {"opaque", "transparent"}:
             u = s.get("u_value", None)
             if not (isinstance(u, (int, float)) and u > 0):
                 if fix:
                     default_u = D["opaque_u_default"] if t == "opaque" else D["transparent_u_default"]
                     s["u_value"] = default_u
-                    add_issue("WARN", f"{path}.u_value", f"u_value non valido ({u}); impostato default {default_u}", fixed=True)
+                    add_issue("WARN", f"{path}.u_value", f"u_value invalid ({u}); set to default value: {default_u}", fixed=True)
                 else:
-                    add_issue("ERROR", f"{path}.u_value", f"u_value deve essere > 0; valore={u}", fixed=False)
+                    add_issue("ERROR", f"{path}.u_value", f"u_value should be > 0; value={u}", fixed=False)
 
-        # g-value per trasparenti
+        # g-value for transparent
         if t == "transparent":
             g = s.get("g_value", None)
             if not (isinstance(g, (int, float)) and g > 0):
                 if fix:
                     s["g_value"] = D["g_default"]
-                    add_issue("WARN", f"{path}.g_value", f"g_value non valido ({g}); impostato default {D['g_default']}", fixed=True)
+                    add_issue("WARN", f"{path}.g_value", f"g_value invalid ({g}); set to default value {D['g_default']}", fixed=True)
                 else:
-                    add_issue("ERROR", f"{path}.g_value", f"g_value deve essere > 0; valore={g}", fixed=False)
+                    add_issue("ERROR", f"{path}.g_value", f"g_value should be > 0; value={g}", fixed=False)
 
-            # dimensioni finestra
+            # window dimensions
             h = s.get("height", None)
             w = s.get("width", None)
             if not (isinstance(h, (int, float)) and h > 0):
                 if fix:
                     s["height"] = 1.0
-                    add_issue("WARN", f"{path}.height", f"height non valido ({h}); impostato a 1.0", fixed=True)
+                    add_issue("WARN", f"{path}.height", f"height not valid ({h}); set to 1.0", fixed=True)
                 else:
-                    add_issue("ERROR", f"{path}.height", f"height deve essere > 0; valore={h}", fixed=False)
+                    add_issue("ERROR", f"{path}.height", f"height should be > 0; value={h}", fixed=False)
             if not (isinstance(w, (int, float)) and w > 0):
                 if fix:
                     s["width"] = 1.0
-                    add_issue("WARN", f"{path}.width", f"width non valido ({w}); impostato a 1.0", fixed=True)
+                    add_issue("WARN", f"{path}.width", f"width not valid ({w}); set to 1.0", fixed=True)
                 else:
-                    add_issue("ERROR", f"{path}.width", f"width deve essere > 0; valore={w}", fixed=False)
+                    add_issue("ERROR", f"{path}.width", f"width should be > 0; value={w}", fixed=False)
 
             # parapet 0..height
             para = s.get("parapet", None)
@@ -244,28 +260,28 @@ def sanitize_and_validate_BUI(bui: dict,
                 if not (0.0 <= para <= max(h, 0.0)):
                     if fix:
                         s["parapet"] = min(max(0.0, para if isinstance(para, (int,float)) else 0.0), h if isinstance(h,(int,float)) else 1.0)
-                        add_issue("WARN", f"{path}.parapet", f"parapet fuori range; clippato a {s['parapet']}", fixed=True)
+                        add_issue("WARN", f"{path}.parapet", f"parapet out of range; clipped to {s['parapet']}", fixed=True)
                     else:
-                        add_issue("WARN", f"{path}.parapet", f"parapet fuori range (0..height); valore={para}, height={h}", fixed=False)
+                        add_issue("WARN", f"{path}.parapet", f"parapet out of range (0..height); value={para}, height={h}", fixed=False)
 
-        # orientamenti consigliati
+        # recommended orientations
         ori = s.get("orientation", {})
         tilt = ori.get("tilt", None)
         az   = ori.get("azimuth", None)
         if not (isinstance(tilt, (int, float)) and tilt in (0, 90)):
             if fix and isinstance(tilt, (int, float)):
                 s["orientation"]["tilt"] = 0 if abs(tilt - 0) < abs(tilt - 90) else 90
-                add_issue("WARN", f"{path}.orientation.tilt", f"tilt non standard ({tilt}); normalizzato a {s['orientation']['tilt']}", fixed=True)
+                add_issue("WARN", f"{path}.orientation.tilt", f"tilt non-standard ({tilt}); normalized to {s['orientation']['tilt']}", fixed=True)
             else:
-                add_issue("WARN", f"{path}.orientation.tilt", f"tilt consigliato 0 o 90; valore={tilt}", fixed=False)
+                add_issue("WARN", f"{path}.orientation.tilt", f"tilt recommended 0 or 90; value={tilt}", fixed=False)
         if not (isinstance(az, (int, float)) and az in (0, 90, 180, 270)):
             if fix and isinstance(az, (int, float)):
                 snapped = int(round(az / 90.0) * 90) % 360
                 if snapped == 360: snapped = 0
                 s["orientation"]["azimuth"] = snapped
-                add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth non standard ({az}); normalizzato a {snapped}", fixed=True)
+                add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth non-standard ({az}); normalized to {snapped}", fixed=True)
             else:
-                add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth consigliato in {{0,90,180,270}}; valore={az}", fixed=False)
+                add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth recommended in {{0,90,180,270}}; value={az}", fixed=False)
 
     # ---------------------------
     # 3) ADJACENT ZONES CHECKS
@@ -276,11 +292,11 @@ def sanitize_and_validate_BUI(bui: dict,
         if not (isinstance(vol, (int, float)) and vol > 0):
             if fix and isinstance(vol, (int, float)) and vol == 0:
                 az["volume"] = 1.0
-                add_issue("WARN", f"{path}.volume", "volume era 0; impostato a 1.0", fixed=True)
+                add_issue("WARN", f"{path}.volume", "volume era 0; set to 1.0", fixed=True)
             else:
-                add_issue("ERROR", f"{path}.volume", f"volume deve essere > 0; valore={vol}", fixed=False)
+                add_issue("ERROR", f"{path}.volume", f"volume should be > 0; value={vol}", fixed=False)
 
-        # coerenza lunghezze
+        # length coherence
         arrs = {
             "area_facade_elements": az.get("area_facade_elements"),
             "typology_elements": az.get("typology_elements"),
@@ -289,7 +305,7 @@ def sanitize_and_validate_BUI(bui: dict,
         }
         lengths = [len(v) for v in arrs.values() if isinstance(v, (list, np.ndarray))]
         if lengths and len(set(lengths)) != 1:
-            add_issue("ERROR", path, f"Lunghezze arrays non coerenti: {[ (k, None if v is None else len(v)) for k,v in arrs.items() ]}", fixed=False)
+            add_issue("ERROR", path, f"Array lengths are inconsistent: {[ (k, None if v is None else len(v)) for k,v in arrs.items() ]}", fixed=False)
 
         # U elementi > 0
         U = arrs.get("transmittance_U_elements")
@@ -300,7 +316,7 @@ def sanitize_and_validate_BUI(bui: dict,
                 if fix:
                     U[U <= 0] = D["opaque_u_default"]
                     az["transmittance_U_elements"] = U
-                    add_issue("WARN", f"{path}.transmittance_U_elements", f"U<=0 ai idx {bad}; impostati a {D['opaque_u_default']}", fixed=True)
+                    add_issue("WARN", f"{path}.transmittance_U_elements", f"U<=0 at idx {bad}; set to {D['opaque_u_default']}", fixed=True)
                 else:
                     add_issue("ERROR", f"{path}.transmittance_U_elements", f"U<=0 ai idx {bad}", fixed=False)
     
@@ -332,7 +348,7 @@ def sanitize_and_validate_BUI(bui: dict,
         tilt = ori.get("tilt", None)
         az   = ori.get("azimuth", None)
 
-        # Consideriamo solo pareti verticali
+        # Only consider vertical walls
         if not (isinstance(tilt, (int,float)) and abs(tilt-90) < 1e-6):
             i += 1
             continue
@@ -349,22 +365,22 @@ def sanitize_and_validate_BUI(bui: dict,
 
         adj_name = s["name_adj_zone"]
         if adj_name not in adj_by_name:
-            add_issue("ERROR", path, f"name_adj_zone='{adj_name}' non trovata in adjacent_zones", fixed=False)
+            add_issue("ERROR", path, f"name_adj_zone='{adj_name}' not found in adjacent_zones", fixed=False)
             i += 1
             continue
 
-        # --- arrays zona adiacente (writable) ---
+        # --- adjacent zone arrays (writable) ---
         azone = adj_by_name[adj_name]
         A_arr  = np.array(azone.get("area_facade_elements", []), dtype=float).copy()
         TypArr = np.array(azone.get("typology_elements", []),     dtype=object)
         OriArr = np.array(azone.get("orientation_elements", []),  dtype=object)
 
         if not (len(A_arr) == len(TypArr) == len(OriArr)):
-            add_issue("ERROR", f"adjacent_zones[{adj_name}]", "Arrays non coerenti (len mismatch) per il cap per direzione", fixed=False)
+            add_issue("ERROR", f"adjacent_zones[{adj_name}]", "Arrays are inconsistent (len mismatch) for direction cap", fixed=False)
             i += 1
             continue
 
-        # === (1) CAP area OP della zona adiacente sulla direzione ===
+        # === (1) Cap OP area of the adjacent zone in the direction ===
         mask_op_dir = (np.char.upper(TypArr.astype(str)) == "OP") & (np.char.upper(OriArr.astype(str)) == dir_card)
         idx = np.where(mask_op_dir)[0]
         if idx.size == 0:
@@ -372,8 +388,8 @@ def sanitize_and_validate_BUI(bui: dict,
         else:
             A_adj_dir_cap = float(A_arr[idx].sum())
             if A_adj_dir_cap > A_bui_orig + eps:
-                msg = (f"Zona '{adj_name}' OP {dir_card}={A_adj_dir_cap:.3f} m² > parete BUI {A_bui_orig:.3f} m² "
-                       f"({s.get('name','(senza nome)')})")
+                msg = (f"Zone '{adj_name}' OP {dir_card}={A_adj_dir_cap:.3f} m² > BUI wall {A_bui_orig:.3f} m² "
+                       f"({s.get('name','(no name)')})")
                 if not fix:
                     add_issue("ERROR", path, msg + " (no fix)", fixed=False)
                 else:
@@ -381,9 +397,9 @@ def sanitize_and_validate_BUI(bui: dict,
                     A_arr[idx] = A_arr[idx] * sf
                     azone["area_facade_elements"] = A_arr  # write-back
                     A_adj_dir_cap = float(A_arr[idx].sum())
-                    add_issue("WARN", path, msg + f" → ridotto (scale {sf:.3f})", fixed=True)
+                    add_issue("WARN", path, msg + f" → reduced (scale {sf:.3f})", fixed=True)
 
-        # === (2) WINDOW CHECK nella stessa direzione (usa A_bui_orig e A_adj_dir_cap) ===
+        # === (2) WINDOW CHECK in the same direction (uses A_bui_orig and A_adj_dir_cap) ===
         win_idx = []
         for k, ws in enumerate(bui_clean.get("building_surface", [])):
             if (ws.get("type") == "transparent"
@@ -397,30 +413,30 @@ def sanitize_and_validate_BUI(bui: dict,
             diff = max(A_bui_orig - A_adj_dir_cap, 0.0)
 
             if A_win_dir > diff + eps:
-                msg = (f"Finestre {dir_card}: area finestre={A_win_dir:.3f} m² > differenza "
-                       f"(A_BUI_adjacent - A_adj_OP)={diff:.3f} m² su {s.get('name','(senza nome)')}")
+                msg = (f"Windows {dir_card}: window area={A_win_dir:.3f} m² > difference "
+                       f"(A_BUI_adjacent - A_adj_OP)={diff:.3f} m² on {s.get('name','(no name)')}")
                 if not fix:
                     add_issue("ERROR", path, msg + " (no fix)", fixed=False)
                 else:
-                    # scala proporzionalmente tutte le finestre in questa direzione per farle sommare a 'diff'
+                    # scale all windows in this direction proportionally so they sum to 'diff'
                     sfw = (diff / max(A_win_dir, eps)) if diff > 0 else 0.0
                     for k in win_idx:
                         oldA = float(bui_clean["building_surface"][k].get("area", 0.0))
                         newA = oldA * sfw
                         bui_clean["building_surface"][k]["area"] = newA
-                    add_issue("WARN", path, msg + f" → aree finestre ridotte (scale {sfw:.3f})", fixed=True)
+                    add_issue("WARN", path, msg + f" → window areas reduced (scale {sfw:.3f})", fixed=True)
 
-        # === (3) SPLIT: se la zona adiacente copre meno di A_bui_orig, crea nuova parete 'opaque' per il residuo ===
+        # === (3) SPLIT: if the adjacent zone covers less than A_bui_orig, create new 'opaque' wall for the residual ===
         diff_ext = max(A_bui_orig - A_adj_dir_cap, 0.0)
         if diff_ext > eps:
             if not fix:
-                add_issue("ERROR", path, (f"Parete 'adjacent' {s.get('name','(senza nome)')} non coperta interamente dalla "
-                                          f"zona '{adj_name}' ({A_adj_dir_cap:.3f} < {A_bui_orig:.3f}). "
-                                          f"Residuo {diff_ext:.3f} m² non allocato."), fixed=False)
+                add_issue("ERROR", path, (f"'adjacent' wall {s.get('name','(no name)')} not fully covered by "
+                                          f"zone '{adj_name}' ({A_adj_dir_cap:.3f} < {A_bui_orig:.3f}). "
+                                          f"Residual {diff_ext:.3f} m² not allocated."), fixed=False)
             else:
-                # crea nuovo elemento OPAQUE per il residuo
+                # create new OPAQUE element for the residual
                 new_surf = {
-                    "name": f"{s.get('name','(adjacent)')} — residuo esterno",
+                    "name": f"{s.get('name','(adjacent)')} — external residual",
                     "type": "opaque",
                     "area": float(diff_ext),
                     "sky_view_factor": s.get("sky_view_factor", 0.5),
@@ -435,31 +451,31 @@ def sanitize_and_validate_BUI(bui: dict,
                 }
                 bui_clean["building_surface"].append(new_surf)
 
-                # ridimensiona la parete adjacent alla sola area coperta dalla zona adiacente
+                # resize the adjacent wall to only the area covered by the adjacent zone
                 s["area"] = float(A_adj_dir_cap)
 
-                add_issue("WARN", path, (f"Creato elemento 'opaque' residuo di {diff_ext:.3f} m² e "
-                                         f"ridimensionata parete 'adjacent' a {A_adj_dir_cap:.3f} m²."), fixed=True)
+                add_issue("WARN", path, (f"Created 'opaque' residual of {diff_ext:.3f} m² and "
+                                         f"resized 'adjacent' wall to {A_adj_dir_cap:.3f} m²."), fixed=True)
 
-        # passo al prossimo elemento (attenzione: la lista può essere cresciuta)
+        # move to next element (list may have grown)
         i += 1
 
         # ----------------------------------------------------------
-        # 4) SPLIT PARETI ADJACENT: parte adiacente + parte esterna
-        #    Crea nuova superficie "opaque" per la porzione esterna.
-        #    (ESEGUIRE DOPO TUTTI I CHECK)
+        # 4) SPLIT ADJACENT WALLS: adjacent part + external part
+        #    Create a new "opaque" surface for the external portion.
+        #    (EXECUTE AFTER ALL CHECKS)
         # ----------------------------------------------------------
-        new_surfaces = []   # colleziono qui e aggiungo con .extend a fine loop
+        new_surfaces = []   # collect here and append with .extend at end of loop
         for i, s in enumerate(bui_clean.get("building_surface", [])):
             if (s.get("type") != "adjacent") or (not s.get("name_adj_zone")):
                 continue
 
-            # Direzione NV/EV/SV/WV/HOR della superficie BUI
+            # Direction NV/EV/SV/WV/HOR of the BUI surface
             az = s.get("orientation", {}).get("azimuth", 0.0)
             tl = s.get("orientation", {}).get("tilt", 90.0)
             dir_code = _dir_from_orientation(az, tl)
 
-            # Consideriamo SOLO le verticali per lo split con zona adiacente
+            # Only consider vertical walls for splitting with adjacent zones
             if dir_code not in ("NV","EV","SV","WV"):
                 continue
 
@@ -467,7 +483,7 @@ def sanitize_and_validate_BUI(bui: dict,
             if A_bui <= 0:
                 continue
 
-            # Trova la zona adiacente corrispondente per nome
+            # Find the matching adjacent zone by name
             adj_name = s.get("name_adj_zone")
             adj_zone = None
             for azj in bui_clean.get("adjacent_zones", []):
@@ -475,29 +491,29 @@ def sanitize_and_validate_BUI(bui: dict,
                     adj_zone = azj
                     break
             if adj_zone is None:
-                # Nome non trovato: segnalo
-                add_issue("WARN", f"building_surface[{i}]", f'name_adj_zone="{adj_name}" non trovato tra le adjacent_zones', fixed=False)
+                # Name not found: log it
+                add_issue("WARN", f"building_surface[{i}]", f'name_adj_zone="{adj_name}" not found among adjacent_zones', fixed=False)
                 continue
 
-            # Area OP della adj-zone nella stessa direzione
+            # OP area of the adjacent zone in the same direction
             A_adj_dir = _adj_op_area_in_dir(adj_zone, dir_code)
 
-            # CAP: l’adiacente non può eccedere la parete BUI
+            # CAP: adjacent zone cannot exceed the BUI wall
             if A_adj_dir > A_bui:
                 add_issue("WARN",
                         f"building_surface[{i}]",
-                        f"Area zona adiacente {adj_name} in {dir_code} ({A_adj_dir:.3f} m²) > area BUI ({A_bui:.3f} m²); cappata a {A_bui:.3f}",
+                        f"Adjacent zone area {adj_name} in {dir_code} ({A_adj_dir:.3f} m²) > BUI area ({A_bui:.3f} m²); capped to {A_bui:.3f}",
                         fixed=True)
                 A_adj_dir = A_bui
 
-            # Se la zona adiacente è PIÙ PICCOLA della parete BUI → crea residuo esterno
+            # If the adjacent zone is smaller than the BUI wall → create external residual
             diff = A_bui - A_adj_dir
             if diff > 1e-9:
-                # 1) riduci la superficie ADJACENT alla sola parte a contatto con la zona non termica
+                # 1) shrink the ADJACENT surface to only the part in contact with the unconditioned zone
                 old_area = s["area"]
                 s["area"] = A_adj_dir
 
-                # 2) crea una NUOVA superficie "opaque" esterna con area = diff
+                # 2) create a NEW external "opaque" surface with area = diff
                 new_surf = {
                     "name": f'{s.get("name","Adjacent split")} — external residual',
                     "type": "opaque",
@@ -510,10 +526,10 @@ def sanitize_and_validate_BUI(bui: dict,
                         "azimuth": az,
                         "tilt": tl,
                     },
-                    "name_adj_zone": None,   # importantissimo: esterno, non adiacente
+                    "name_adj_zone": None,   # critical: exterior, not adjacent
                 }
 
-                # se il coeff. conv./rad. sono già stati idratati, copiali (non obbligatorio)
+                # if conv./rad. coefficients are already hydrated, copy them (optional)
                 for k in (
                     "convective_heat_transfer_coefficient_internal",
                     "radiative_heat_transfer_coefficient_internal",
@@ -525,10 +541,10 @@ def sanitize_and_validate_BUI(bui: dict,
                 new_surfaces.append(new_surf)
                 add_issue("INFO",
                         f"building_surface[{i}]",
-                        f"Split {dir_code}: ridotta area ADJ da {old_area:.3f} a {A_adj_dir:.3f} m²; creata nuova OPAQUE esterna da {diff:.3f} m².",
+                        f"Split {dir_code}: reduced ADJ area from {old_area:.3f} to {A_adj_dir:.3f} m²; created new external OPAQUE of {diff:.3f} m².",
                         fixed=True)
 
-        # Aggiungo in coda TUTTE le nuove superfici
+        # Append all new surfaces
         if new_surfaces:
             bui_clean["building_surface"].extend(new_surfaces)
 
@@ -537,292 +553,3 @@ def sanitize_and_validate_BUI(bui: dict,
 
 
     
-
-
-# def sanitize_and_validate_BUI(bui: dict,
-#                               fix: bool = False,
-#                               eps: float = 1e-6,
-#                               defaults: dict | None = None):
-#     """
-#     Validate and (optionally) sanitize a BUI.
-    
-#     Parameters
-#     ----------
-#     bui : dict
-#         The BUI dictionary to validate.
-#     fix : bool
-#         If True, attempts to correct invalid/zero values (clipping to eps, defaults, etc.).
-#     eps : float
-#         Minimum value for clipping of positive quantities.
-#     defaults : dict | None
-#         Optional physical defaults, e.g.:
-#         {
-#           "opaque_u_default": 0.5,
-#           "transparent_u_default": 1.6,
-#           "g_default": 0.6
-#         }
-    
-#     Returns
-#     -------
-#     bui_clean : dict
-#         Copy of the BUI (modified if fix=True).
-#     issues : list[dict]
-#         List of issues found: {"level": "ERROR|WARN", "path": str, "msg": str, "fix_applied": bool}
-#     """
-
-#     bui_clean = deepcopy(bui)
-#     issues = []
-#     D = defaults or {
-#         "opaque_u_default": 0.5,
-#         "transparent_u_default": 1.6,
-#         "g_default": 0.6
-#     }
-
-#     def add_issue(level, path, msg, fixed=False):
-#         issues.append({"level": level, "path": path, "msg": msg, "fix_applied": fixed})
-
-#     # ---------------------------
-#     # 1) BUILDING-LEVEL CHECKS
-#     # ---------------------------
-#     b = bui_clean.get("building", {})
-#     for key in ["net_floor_area", "exposed_perimeter", "height"]:
-#         if key in b:
-#             val = b[key]
-#             if not (isinstance(val, (int, float)) and val > 0):
-#                 if fix and isinstance(val, (int, float)) and val == 0:
-#                     b[key] = max(eps, 1.0)
-#                     add_issue("WARN", f"building.{key}", f"{key} era 0; impostato a {b[key]}", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"building.{key}", f"{key} deve essere > 0; valore={val}", fixed=False)
-
-#     if "n_floors" in b and (not isinstance(b["n_floors"], (int, float)) or b["n_floors"] <= 0):
-#         if fix and isinstance(b["n_floors"], (int, float)) and b["n_floors"] == 0:
-#             b["n_floors"] = 1
-#             add_issue("WARN", "building.n_floors", "n_floors era 0; impostato a 1", fixed=True)
-#         else:
-#             add_issue("ERROR", "building.n_floors", f"n_floors deve essere > 0; valore={b.get('n_floors')}", fixed=False)
-
-#     # ---------------------------
-#     # 2) SURFACES CHECKS
-#     # ---------------------------
-#     type_corrections = {"opque": "opaque", "opaqu": "opaque", "trasparent": "transparent"}
-#     allowed_types = {"opaque", "transparent", "adiabatic", "adjacent"}
-
-#     for i, s in enumerate(bui_clean.get("building_surface", [])):
-#         path = f"building_surface[{i}]"
-#         # Correggi/refusi type
-#         t = s.get("type")
-#         if isinstance(t, str) and t.lower() in type_corrections:
-#             old = t
-#             s["type"] = type_corrections[t.lower()]
-#             add_issue("WARN", f"{path}.type", f'type="{old}" corretto in "{s["type"]}"', fixed=True)
-#         t = (s.get("type") or "").lower()
-#         if t not in allowed_types:
-#             add_issue("ERROR", f"{path}.type", f'type "{s.get("type")}" non riconosciuto', fixed=False)
-
-#         # area
-#         area = s.get("area", None)
-#         if not (isinstance(area, (int, float)) and area > 0):
-#             if fix and isinstance(area, (int, float)) and area == 0:
-#                 s["area"] = max(eps, 1.0)
-#                 add_issue("WARN", f"{path}.area", f"area was 0; set to {s['area']}", fixed=True)
-#             else:
-#                 add_issue("ERROR", f"{path}.area", f"area must be > 0; value={area}", fixed=False)
-
-#         # sky_view_factor
-#         svf = s.get("sky_view_factor", None)
-#         if not (isinstance(svf, (int, float)) and 0.0 <= svf <= 1.0):
-#             if fix and isinstance(svf, (int, float)):
-#                 s["sky_view_factor"] = min(1.0, max(0.0, svf))
-#                 add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor out of range; clippato a {s['sky_view_factor']}", fixed=True)
-#             else:
-#                 add_issue("WARN", f"{path}.sky_view_factor", f"sky_view_factor missing or not in [0,1]; value={svf}", fixed=False)
-
-#         # U-value per opaque/transparent
-#         if t in {"opaque", "transparent"}:
-#             u = s.get("u_value", None)
-#             if not (isinstance(u, (int, float)) and u > 0):
-#                 if fix:
-#                     default_u = D["opaque_u_default"] if t == "opaque" else D["transparent_u_default"]
-#                     s["u_value"] = default_u
-#                     add_issue("WARN", f"{path}.u_value", f"u_value was invalid ({u}); set to default {default_u}", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"{path}.u_value", f"u_value must be > 0; value={u}", fixed=False)
-
-#         # g-value per trasparenti
-#         if t == "transparent":
-#             g = s.get("g_value", None)
-#             if not (isinstance(g, (int, float)) and g > 0):
-#                 if fix:
-#                     s["g_value"] = D["g_default"]
-#                     add_issue("WARN", f"{path}.g_value", f"g_value was invalid ({g}); set to default {D['g_default']}", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"{path}.g_value", f"g_value must be > 0; value={g}", fixed=False)
-
-#             # dimensioni finestra
-#             h = s.get("height", None)
-#             w = s.get("width", None)
-#             if not (isinstance(h, (int, float)) and h > 0):
-#                 if fix:
-#                     s["height"] = 1.0
-#                     add_issue("WARN", f"{path}.height", f"height was invalid ({h}); set to 1.0", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"{path}.height", f"height must be > 0; value={h}", fixed=False)
-#             if not (isinstance(w, (int, float)) and w > 0):
-#                 if fix:
-#                     s["width"] = 1.0
-#                     add_issue("WARN", f"{path}.width", f"width was invalid ({w}); set to 1.0", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"{path}.width", f"width must be > 0; value={w}", fixed=False)
-
-#             # parapet 0..height
-#             para = s.get("parapet", None)
-#             if para is not None and isinstance(para, (int, float)) and h is not None and isinstance(h, (int,float)):
-#                 if not (0.0 <= para <= max(h, 0.0)):
-#                     if fix:
-#                         s["parapet"] = min(max(0.0, para if isinstance(para, (int,float)) else 0.0), h if isinstance(h,(int,float)) else 1.0)
-#                         add_issue("WARN", f"{path}.parapet", f"parapet was out of range; clippato a {s['parapet']}", fixed=True)
-#                     else:
-#                         add_issue("WARN", f"{path}.parapet", f"parapet was out of range (0..height); value={para}, height={h}", fixed=False)
-
-#         # orientamenti
-#         ori = s.get("orientation", {})
-#         tilt = ori.get("tilt", None)
-#         az   = ori.get("azimuth", None)
-
-#         # tilt 0 o 90 consigliati
-#         if not (isinstance(tilt, (int, float)) and tilt in (0, 90)):
-#             if fix and isinstance(tilt, (int, float)):
-#                 s["orientation"]["tilt"] = 0 if abs(tilt - 0) < abs(tilt - 90) else 90
-#                 add_issue("WARN", f"{path}.orientation.tilt", f"tilt was non standard ({tilt}); normalized to {s['orientation']['tilt']}", fixed=True)
-#             else:
-#                 add_issue("WARN", f"{path}.orientation.tilt", f"tilt was non standard ({tilt}); normalized to {s['orientation']['tilt']}", fixed=False)
-
-#         # azimuth 0/90/180/270 consigliati
-#         if not (isinstance(az, (int, float)) and az in (0, 90, 180, 270)):
-#             if fix and isinstance(az, (int, float)):
-#                 snapped = int(round(az / 90.0) * 90) % 360
-#                 if snapped == 360: snapped = 0
-#                 s["orientation"]["azimuth"] = snapped
-#                 add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth non standard ({az}); normalizzato a {snapped}", fixed=True)
-#             else:
-#                 add_issue("WARN", f"{path}.orientation.azimuth", f"azimuth consigliato in {{0,90,180,270}}; valore={az}", fixed=False)
-
-#     # ---------------------------
-#     # 3) ADJACENT ZONES CHECKS
-#     # ---------------------------
-#     for j, az in enumerate(bui_clean.get("adjacent_zones", [])):
-#         path = f"adjacent_zones[{j}]"
-#         vol = az.get("volume", None)
-#         if not (isinstance(vol, (int, float)) and vol > 0):
-#             if fix and isinstance(vol, (int, float)) and vol == 0:
-#                 az["volume"] = 1.0
-#                 add_issue("WARN", f"{path}.volume", "volume era 0; impostato a 1.0", fixed=True)
-#             else:
-#                 add_issue("ERROR", f"{path}.volume", f"volume deve essere > 0; valore={vol}", fixed=False)
-
-#         # coerenza lunghezze
-#         arrs = {
-#             "area_facade_elements": az.get("area_facade_elements"),
-#             "typology_elements": az.get("typology_elements"),
-#             "transmittance_U_elements": az.get("transmittance_U_elements"),
-#             "orientation_elements": az.get("orientation_elements"),
-#         }
-#         lengths = [len(v) for v in arrs.values() if isinstance(v, (list, np.ndarray))]
-#         if lengths and len(set(lengths)) != 1:
-#             add_issue("ERROR", path, f"Lengths of arrays are not coherent: {[ (k, None if v is None else len(v)) for k,v in arrs.items() ]}", fixed=False)
-
-#         # U elementi > 0
-#         U = arrs.get("transmittance_U_elements")
-#         if isinstance(U, (list, np.ndarray)):
-#             U = np.asarray(U, dtype=float)
-#             bad = np.where(U <= 0)[0].tolist()
-#             if bad:
-#                 if fix:
-#                     U[U <= 0] = D["opaque_u_default"]
-#                     az["transmittance_U_elements"] = U
-#                     add_issue("WARN", f"{path}.transmittance_U_elements", f"U<=0 ai idx {bad}; impostati a {D['opaque_u_default']}", fixed=True)
-#                 else:
-#                     add_issue("ERROR", f"{path}.transmittance_U_elements", f"U<=0 ai idx {bad}", fixed=False)
-
-#     # -------------------------------------------------------------------
-#     # 4) ADJACENCY PAIRING CAPS: OP (verticale) della zona ≤ area BUI
-#     # -------------------------------------------------------------------
-#     def _azimuth_to_dir(az: float) -> str | None:
-#         """Mappa 0/90/180/270 -> 'NV'/'EV'/'SV'/'WV'. Altri valori -> None."""
-#         if az is None:
-#             return None
-#         azn = int(round(float(az))) % 360
-#         if azn in (0, 360): return "NV"
-#         if azn == 90:       return "EV"
-#         if azn == 180:      return "SV"
-#         if azn == 270:      return "WV"
-#         return None
-
-#     # Mappa nome zona -> dizionario zona (per lookup rapido)
-#     adj_by_name = { z.get("name"): z for z in bui_clean.get("adjacent_zones", []) }
-
-#     for i, s in enumerate(bui_clean.get("building_surface", [])):
-#         path = f"building_surface[{i}]"
-#         if (s.get("type") != "adjacent") or (not s.get("name_adj_zone")):
-#             continue
-
-#         az = s.get("orientation", {}).get("azimuth", None)
-#         tilt = s.get("orientation", {}).get("tilt", None)
-
-#         # Consideriamo solo pareti verticali del BUI (tilt≈90) con direzione cardinale nota
-#         if not (isinstance(tilt, (int,float)) and abs(tilt-90) < 1e-6):
-#             continue
-
-#         dir_card = _azimuth_to_dir(az)
-#         if dir_card is None:  # orizzontali o azimut non standard -> skip
-#             continue
-
-#         A_bui = s.get("area", None)
-#         if not (isinstance(A_bui, (int,float)) and A_bui > 0):
-#             continue  # già segnalato sopra
-
-#         adj_name = s["name_adj_zone"]
-#         if adj_name not in adj_by_name:
-#             add_issue("ERROR", path, f"name_adj_zone='{adj_name}' not found in adjacent_zones", fixed=False)
-#             continue
-
-#         azone = adj_by_name[adj_name]
-
-#         # Assicuriamoci che gli array siano numpy *scrivibili*
-#         A_arr  = np.array(azone.get("area_facade_elements", []), dtype=float).copy()
-#         TypArr = np.array(azone.get("typology_elements", []),     dtype=object)
-#         OriArr = np.array(azone.get("orientation_elements", []),  dtype=object)
-
-#         if not (len(A_arr) == len(TypArr) == len(OriArr)):
-#             add_issue("ERROR", f"adjacent_zones[{adj_name}]", "Arrays are not coherent (len mismatch) for the cap for direction", fixed=False)
-#             continue
-
-#         # Indici: OP and direction equal to dir_card (NV/EV/SV/WV)
-#         mask = (np.char.upper(TypArr.astype(str)) == "OP") & (np.char.upper(OriArr.astype(str)) == dir_card)
-#         idx = np.where(mask)[0]
-#         if idx.size == 0:
-#             # Nessuna parete OP in quella direzione: nulla da fare
-#             continue
-
-#         A_adj_dir = float(A_arr[idx].sum())
-#         if A_adj_dir <= A_bui + 1e-9:
-#             # OK: già ≤ BUI
-#             continue
-
-#         # Serve riduzione: o errore (fix=False) o correzione (fix=True)
-#         msg = (f"Zona '{adj_name}' has OP area {dir_card}={A_adj_dir:.3f} m² superiore "
-#                f"all’area BUI {A_bui:.3f} m² associated to {s.get('name','(senza nome)')}")
-#         if not fix:
-#             add_issue("ERROR", path, msg + " (no fix applied)", fixed=False)
-#             continue
-
-#         # Proportional reduction
-#         sf = A_bui / max(A_adj_dir, eps)
-#         A_arr[idx] = A_arr[idx] * sf
-
-#         # Scriviamo indietro gli array *writable*
-#         azone["area_facade_elements"] = A_arr
-#         add_issue("WARN", path, msg + f" → redistributed proportionally (scale {sf:.3f})", fixed=True)
-
-#     return bui_clean, issues

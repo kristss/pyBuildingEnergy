@@ -278,21 +278,20 @@ class ISO52010:
         building_object
     ):
         """
-        calculate t
-        Calcola il fattore di riduzione per ombreggiamento per ciascuna finestra.
-        Ritorna un oggetto Shading_Reduction_factor_window oppure None se non applicabile.
+        Calculates the shading reduction factor for each window.
+        Returns a Shading_Reduction_factor_window object, or None if not applicable.
         """
 
-        # 1) Casi banali / invalidi
+        # 1) Trivial / invalid cases
         if orientation is None:
-            # Nessuna orientazione specificata: o ritorna None, oppure potresti decidere di iterare su tutte.
+            # No orientation specified: either returns None, or you may decide to iterate over all of them.
             return None
 
         if orientation == "HOR":
-            # Orizzontale: nessuna finestra verticale da calcolare
+            # Horizontal: no vertical window to calculate
             return None
 
-        # 2) Mappatura coerente (come nella 1ª funzione)
+        # 2) Consistent mapping (as in the 1st function)
         orientation_lookup = {
             "NV": 0.0,    # North-facing azimuth
             "SV": 180.0,  # South
@@ -304,7 +303,7 @@ class ISO52010:
 
         orientation_angle = float(orientation_lookup[orientation]) % 360.0
 
-        # 3) Filtro finestre trasparenti con confronto robusto dell’azimut
+        # 3) Transparent window filter with robust azimuth comparison
         def _matches_orientation(surface):
             az = surface.get("orientation", {}).get("azimuth")
             if az is None:
@@ -322,7 +321,7 @@ class ISO52010:
         if not filtered_windows:
             return None
 
-        # 4) Calcolo fattori per ciascuna finestra
+        # 4) Calculate factors for each window
         F_sh_dir_df = pd.DataFrame(index=calendar.index)
 
         for window in filtered_windows:
@@ -330,7 +329,7 @@ class ISO52010:
             h_k_sun_t_hour     = pd.Series(np.zeros(n_timesteps), index=calendar.index, dtype=float)
 
             for i in range(n_timesteps):
-                # Proteggi da NaN nei valori angolari
+                # Protect from NaN in angle values
                 alpha_deg = float(np.degrees(solar_altitude_angle.iloc[i])) if pd.notna(solar_altitude_angle.iloc[i]) else 0.0
                 phi_deg   = float(np.degrees(solar_azimuth_angle.iloc[i]))  if pd.notna(solar_azimuth_angle.iloc[i])  else 0.0
 
@@ -346,7 +345,7 @@ class ISO52010:
                     W_k=window.get("width"),
                 )
 
-                # Attenzione: assumo F_sh_dir_k_t = (fattore_dir, altezza_sole)
+                # Warning: I assume F_sh_dir_k_t = (dir_factor, sun_height)
                 fatt_dir = F_sh_dir_k_t[0] if F_sh_dir_k_t is not None else 0.0
                 if fatt_dir > 0:
                     I_dir = float(I_dir_tot.iloc[i]) if pd.notna(I_dir_tot.iloc[i]) else 0.0
@@ -1173,12 +1172,21 @@ class ISO52016:
 
         # ============================
         """
-        Area in contact with the ground. 
-        If the value is nor provided by the user 
+        Area in contact with the ground.
+        Prefer surfaces with horizontal tilt (e.g. slab on grade); fall back to net floor area.
         """
+        sog_area = None
         for surf in building_object["building_surface"]:
-            if surf["sky_view_factor"] == 0:
+            sky_view_factor = surf.get("sky_view_factor")
+            orientation = surf.get("orientation", {})
+            tilt = orientation.get("tilt")
+            if sky_view_factor == 0 or tilt == 0:
                 sog_area = surf["area"]
+                break
+        if sog_area is None:
+            sog_area = building_object["building"].get("net_floor_area")
+        if sog_area is None:
+            raise ValueError("Ground-contact area is missing: provide a surface with tilt 0 or sky_view_factor 0, or set net_floor_area.")
         # ============================
 
         # ============================
@@ -1451,7 +1459,10 @@ class ISO52016:
             "a_sol_A": 0.0,       # solar_absorptance * A
             "thermal_capacity": 0.0,
             "ISO52016_type_string": None,
-            "ISO52016_orientation_string": None
+            "ISO52016_orientation_string": None,
+            "width": 0.0,
+            "height": 0.0,
+            "parapet": 0.0,
         })
 
         for s in building_object["building_surface"]:
@@ -1461,6 +1472,9 @@ class ISO52016:
 
             A = float(s.get("area", 0.0))
             U = float(s.get("u_value", 0.0))
+            width_ = float(s.get("width", 0.0))
+            height_ = float(s.get("height", 0.0))
+            parapet_ = float(s.get("parapet", 0.0))
             g = float(s.get("g_value", 0.0)) if s.get("type") == "transparent" else 0.0
             svf = float(s.get("sky_view_factor", 0.0))
             hci = float(s.get("convective_heat_transfer_coefficient_internal", 0.0))
@@ -1486,6 +1500,9 @@ class ISO52016:
             b["hreA"] += hre * A
             b["a_sol_A"] += a_sol * A
             b["thermal_capacity"] += Cth
+            b["width"] += width_
+            b["height"] += height_
+            b["parapet"] += parapet_
 
         # Build new surfaces list
         new_surfaces = []
@@ -1508,6 +1525,9 @@ class ISO52016:
                 "radiative_heat_transfer_coefficient_internal": b["hriA"] / A,
                 "convective_heat_transfer_coefficient_external": b["hceA"] / A,
                 "radiative_heat_transfer_coefficient_external": b["hreA"] / A,
+                "width": b["width"],
+                "height": b["height"],
+                "parapet": b["parapet"],
             }
 
             # Orientation block: keep the numeric azimuth/tilt from the *first* source name if you like;
@@ -1684,6 +1704,39 @@ class ISO52016:
         f_H_c=1,
         f_C_c=1,
         delta_Theta_er=11,
+        **kwargs,
+    ):
+        """
+        Wrapper that runs the core calculation and surfaces any simulation error.
+        """
+        try:
+            return cls._Temperature_and_Energy_needs_calculation_core(
+                building_object,
+                nrHCmodes=nrHCmodes,
+                c_int_per_A_us=c_int_per_A_us,
+                f_int_c=f_int_c,
+                f_sol_c=f_sol_c,
+                f_H_c=f_H_c,
+                f_C_c=f_C_c,
+                delta_Theta_er=delta_Theta_er,
+                **kwargs,
+            )
+        except Exception as exc:
+            print(f"❌ Simulation error in Temperature_and_Energy_needs_calculation: {exc}")
+            raise
+
+    @classmethod
+    def _Temperature_and_Energy_needs_calculation_core(
+        cls,
+        building_object,
+        nrHCmodes=2,
+        c_int_per_A_us=10000,
+        f_int_c=0.4,
+        f_sol_c=0.1,
+        f_H_c=1,
+        f_C_c=1,
+        delta_Theta_er=11,
+        sankey_graph=False,
         **kwargs,
     ):
         """
@@ -1973,6 +2026,8 @@ class ISO52016:
             )    
             area_elements = np.array([float(s["area"]) for s in building_object["building_surface"]], dtype=float)
             area_elements_tot = float(np.sum(area_elements))
+
+            # W
 
             pbar.update(1)
 
@@ -2310,7 +2365,10 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = VentilationInternalGains(building_object).heat_transfer_coefficient_by_ventilation(building_object, Theta_old[ri], sim_df.iloc[Tstepi]["T2m"], sim_df.iloc[Tstepi]["WS10m"], type_ventilation="occupancy", flowrate_person=0.5)
+                    H_ve_nat_hour = VentilationInternalGains(building_object).heat_transfer_coefficient_by_ventilation(
+                        building_object, Theta_old[ri], sim_df.iloc[Tstepi]["T2m"], sim_df.iloc[Tstepi]["WS10m"], 
+                        type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
+                        custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
                     # sanifica
                     if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
                         H_ve_nat_hour = 0.0
@@ -2319,6 +2377,7 @@ class ISO52016:
                     if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
                         H_ve_nat = 0.0
                     H_ve_nat_all.append(H_ve_nat)
+                    
                     
                     
                     # ===========================================================================
@@ -2864,7 +2923,8 @@ class ISO52016:
         annual_results_df = pd.DataFrame([annual_results_dic])
 
         # Sankey
-        fig = plot_sankey_building(sankey_data)
-        fig.show()
+        if sankey_graph:
+            fig = plot_sankey_building(sankey_data)
+            fig.show()
 
-        return hourly_results, annual_results_df
+        return hourly_results, annual_results_df, sankey_data

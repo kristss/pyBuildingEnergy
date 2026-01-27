@@ -15,7 +15,7 @@ from .source.table_iso_16798_1 import *
 
 __author__ = """Daniele Antonucci, Ulrich Filippi Oberagger, Olga Somova"""
 __email__ = 'daniele.antonucci@eurac.edu'
-__version__ = '2.0.2'
+__version__ = '2.0.3'
 
 __all__ = [
     "check_heating_system_inputs",

@@ -4,6 +4,7 @@ create_archetype.py
 profiles.py
 test_lib.py
 result_test
+readme_dev.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

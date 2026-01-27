@@ -23,11 +23,13 @@ class VentilationInternalGains:
         self.building_object = building_object
 
     @staticmethod
+
+
     def heat_transfer_coefficient_by_ventilation(
-        building_object, Tz, Te, u_site, Rw_arg_i=None, c_air=1006, 
-        rho_air=1.204, C_wnd=0.001, C_st=0.0035, rho_a_ref=1.204, altitude=None, type_ventilation="temp_wind", 
-        flowrate_person=1.4
-    ) -> h_natural_vent:
+            building_object, Tz, Te, u_site, Rw_arg_i=None, c_air=1006,
+            rho_air=1.204, C_wnd=0.001, C_st=0.0035, rho_a_ref=1.204, altitude=None,
+            type_ventilation="temp_wind", flowrate_person=1.4, custom_Hve_k_t=3
+        ):
         """
         Calculate the heat transfer coefficient by ventilation  for air flow element K, Hve_k_t.
         (section 6.5.10.1 of ISO52016-1:2017)
@@ -41,11 +43,11 @@ class VentilationInternalGains:
         :param u_site: air velocity of wind in the building site [m/s] at time t
         :param altitude: altitude of the building [m]
         :param Rw_arg_i: ratio of window opening area to maximum window opening area [0-1], type List
-        :param type_ventilation: type of ventilation, "temp_wind" or "occupancy". Default: "temp_wind"
+        :param type_ventilation: type of ventilation, "temp_wind" or "occupancy" or "custom". Default: "temp_wind"
         :param flowrate_person: ventilation rate per person per m2 [l/(s m2)]
 
         : return 
-            * **Hve_k_t**: heat transfer coefficient by ventilation  for air flow element K, Hve_k_t.
+            * **Hve_k_t**: heat transfer coefficient by ventilation  for air flow element K, Hve_k_t. in W/K
 
         """
 
@@ -84,71 +86,172 @@ class VentilationInternalGains:
 
 
         """
+
         if type_ventilation == "temp_wind":
-            # 1) Get number of windows
-            n_windows = len([surface["name"] for surface in building_object["building_surface"] if surface.get("type") == "transparent"])
-            
-            # 2-3) Calculate hw_path_i and hw_fa_i
-            width_window = []
-            height_parapet = []
-            height_window = []
-            area_window = []
+            # --- Collect transparent surfaces as "windows"
+            windows = [s for s in building_object.get("building_surface", []) if s.get("type") == "transparent"]
+            n_windows = len(windows)
 
-            for surface in building_object["building_surface"]:
-                if surface.get("type") == "transparent":
-                    # collect if the key exists
-                    if "parapet" in surface:
-                        height_parapet.append(surface["parapet"])
-                    if "height" in surface:
-                        height_window.append(surface["height"])
-                    if "width" in surface:
-                        width_window.append(surface["width"])
-                    if "height" in surface and "width" in surface:
-                        area_window.append(surface["height"] * surface["width"])
+            if n_windows == 0:
+                return np.array(0.0)
 
-            hw_path_i = height_parapet + height_window/2
-            hw_fa_i = height_window/2
-        
-            # 4) Calculate hw_st
-            hw_st = float(np.max(hw_path_i + hw_fa_i/2) - np.min(hw_path_i - hw_fa_i/2))
-        
-            # 5) Adjust rho_a_ref for altitude
+            # Build per-window arrays (robust to missing keys)
+            parapet_list = []
+            height_list = []
+            width_list = []
+
+            for s in windows:
+                h = s.get("height", None)
+                w = s.get("width", None)
+
+                # Need height+width to compute area; if missing, skip and warn
+                if h is None or w is None:
+                    warnings.warn(
+                        f"Transparent surface '{s.get('name','<unnamed>')}' missing 'height' or 'width'. Skipped in ventilation calc."
+                    )
+                    continue
+
+                parapet_list.append(float(s.get("parapet", 0.0)))
+                height_list.append(float(h))
+                width_list.append(float(w))
+
+            # If all windows were skipped
+            if len(height_list) == 0:
+                return np.array(0.0)
+
+            parapet = np.asarray(parapet_list, dtype=float)
+            height = np.asarray(height_list, dtype=float)
+            width = np.asarray(width_list, dtype=float)
+
+            # ISO 16798-7: hw_path = center height from floor; hw_fa = opening height (use full height)
+            hw_path_i = parapet + 0.5 * height
+            hw_fa_i = height
+
+            # Useful height for stack effect
+            hw_st = float(np.max(hw_path_i + 0.5 * hw_fa_i) - np.min(hw_path_i - 0.5 * hw_fa_i))
+
+            # Adjust rho_a_ref for altitude (if provided)
             if altitude is not None:
-                rho_a_ref = round(1.204 * (1 - (0.00651 * altitude)/293)**4.255, 3)
-        
-            # 6) Density of air at external temperature
-            rho_a_e = (291.15/(273.15 + Te)) * rho_a_ref
-        
-            # 7) Effective window area
-            if Rw_arg_i is None:
-                Aw_i = area_window * 0.9
+                rho_a_ref_eff = round(1.204 * (1 - (0.00651 * altitude) / 293.0) ** 4.255, 3)
             else:
-                if len(Rw_arg_i) != n_windows:
-                    warnings.warn("Length of Rw_arg_i != number of windows. Using 0.9 for all.")
-                    Aw_i = area_window * 0.9
+                rho_a_ref_eff = float(rho_a_ref)
+
+            # Air density at external temperature
+            rho_a_e = (291.15 / (273.15 + float(Te))) * rho_a_ref_eff
+
+            # Max opening area per window
+            Aw_max = height * width  # [m2]
+
+            # Effective opening ratio
+            if Rw_arg_i is None:
+                Rw = np.full(Aw_max.shape, 0.9, dtype=float)
+            else:
+                Rw_arg_i = list(Rw_arg_i)
+                if len(Rw_arg_i) != Aw_max.size:
+                    warnings.warn("Length of Rw_arg_i != number of usable windows. Using 0.9 for all.")
+                    Rw = np.full(Aw_max.shape, 0.9, dtype=float)
                 else:
-                    Aw_i = area_window * np.array(Rw_arg_i)
-        
-            # 8) Total window area
+                    Rw = np.asarray(Rw_arg_i, dtype=float)
+
+            Aw_i = Aw_max * Rw
             Aw_tot = float(np.sum(Aw_i))
-        
-            # 9) Calculate flow rate (CORRECTED)
-            wind_term = C_wnd * (u_site**2)
-            stack_term = C_st * hw_st * np.abs(Tz - Te)
-            qv_arg_in = 3600 * rho_a_ref / rho_a_e * Aw_tot / 2 * (np.maximum(wind_term, stack_term)**0.5)
-        
-            # 10) Heat transfer coefficient
-            Hve_k_t = c_air * rho_air * qv_arg_in / 3600  # [W/K]
-        
+
+            # Airflow (kept consistent with your existing implementation: result in m3/h)
+            wind_term = C_wnd * (float(u_site) ** 2)
+            stack_term = C_st * hw_st * abs(float(Tz) - float(Te))
+            qv_arg_in_m3_h = 3600.0 * (rho_a_ref_eff / rho_a_e) * (Aw_tot / 2.0) * (max(wind_term, stack_term) ** 0.5)
+
+            # Heat transfer coefficient [W/K]
+            Hve_k_t = c_air * rho_air * (qv_arg_in_m3_h / 3600.0)
+
         elif type_ventilation == "occupancy":
-            zone_area = building_object["building"]['net_floor_area']
-            Hve_k_t = zone_area * (3.6 * flowrate_person) * rho_air * c_air / 3600
-        
+            # flowrate_person: [l/(s m2)]  -> convert to [m3/s] via /1000
+            zone_area = float(building_object["building"]["net_floor_area"])
+            qv_m3_s = zone_area * float(flowrate_person) / 1000.0
+            Hve_k_t = rho_air * c_air * qv_m3_s
+
+        elif type_ventilation == "custom":
+            Hve_k_t = float(custom_Hve_k_t)
+
+        else:
+            raise ValueError("type_ventilation must be one of: 'temp_wind', 'occupancy', 'custom'.")
+
         return np.array(Hve_k_t)
+
+    # def heat_transfer_coefficient_by_ventilation(
+    #     building_object, Tz, Te, u_site, Rw_arg_i=None, c_air=1006, 
+    #     rho_air=1.204, C_wnd=0.001, C_st=0.0035, rho_a_ref=1.204, altitude=None, type_ventilation="temp_wind", 
+    #     flowrate_person=1.4, custom_Hve_k_t=3
+    # ) -> h_natural_vent:
+        
+    #     if type_ventilation == "temp_wind":
+    #         # 1) Get number of windows
+    #         n_windows = len([surface["name"] for surface in building_object["building_surface"] if surface.get("type") == "transparent"])
+            
+    #         # 2-3) Calculate hw_path_i and hw_fa_i
+    #         width_window = []
+    #         height_parapet = []
+    #         height_window = []
+    #         area_window = []
+
+    #         for surface in building_object["building_surface"]:
+    #             if surface.get("type") == "transparent":
+    #                 # collect if the key exists
+    #                 if "parapet" in surface:
+    #                     height_parapet.append(surface["parapet"])
+    #                 if "height" in surface:
+    #                     height_window.append(surface["height"])
+    #                 if "width" in surface:
+    #                     width_window.append(surface["width"])
+    #                 if "height" in surface and "width" in surface:
+    #                     area_window.append(surface["height"] * surface["width"])
+
+    #         hw_path_i = height_parapet + height_window/2
+    #         hw_fa_i = height_window/2
+        
+    #         # 4) Calculate hw_st
+    #         hw_st = float(np.max(hw_path_i + hw_fa_i/2) - np.min(hw_path_i - hw_fa_i/2))
+        
+    #         # 5) Adjust rho_a_ref for altitude
+    #         if altitude is not None:
+    #             rho_a_ref = round(1.204 * (1 - (0.00651 * altitude)/293)**4.255, 3)
+        
+    #         # 6) Density of air at external temperature
+    #         rho_a_e = (291.15/(273.15 + Te)) * rho_a_ref
+        
+    #         # 7) Effective window area
+    #         if Rw_arg_i is None:
+    #             Aw_i = area_window * 0.9
+    #         else:
+    #             if len(Rw_arg_i) != n_windows:
+    #                 warnings.warn("Length of Rw_arg_i != number of windows. Using 0.9 for all.")
+    #                 Aw_i = area_window * 0.9
+    #             else:
+    #                 Aw_i = area_window * np.array(Rw_arg_i)
+        
+    #         # 8) Total window area
+    #         Aw_tot = float(np.sum(Aw_i))
+        
+    #         # 9) Calculate flow rate (CORRECTED)
+    #         wind_term = C_wnd * (u_site**2)
+    #         stack_term = C_st * hw_st * np.abs(Tz - Te)
+    #         qv_arg_in = 3600 * rho_a_ref / rho_a_e * Aw_tot / 2 * (np.maximum(wind_term, stack_term)**0.5)
+        
+    #         # 10) Heat transfer coefficient
+    #         Hve_k_t = c_air * rho_air * qv_arg_in / 3600  # [W/K]
+        
+    #     elif type_ventilation == "occupancy":
+    #         zone_area = building_object["building"]['net_floor_area']
+    #         Hve_k_t = zone_area * (3.6 * flowrate_person) * rho_air * c_air / 3600
+
+    #     elif type_ventilation == "custom":
+    #         Hve_k_t = custom_Hve_k_t
+        
+    #     return np.array(Hve_k_t)
 
 
     def internal_gains(
-        cls, building_type_class, a_use, unconditioned_zones_nearby=False, list_adj_zones=None, Fztc_ztu_m: float=1, b_ztu: float=1,
+        self, building_type_class, a_use, unconditioned_zones_nearby=False, list_adj_zones=None, Fztc_ztu_m: float=1, b_ztu: float=1,
         h_occup: float=1, h_app: float=1, h_light: float=1, h_dhw: float=1, h_hvac: float=1, h_proc: float=1
         ):
         """
@@ -175,7 +278,15 @@ class VentilationInternalGains:
             * Phi_int: internal gains [W]
         """
 
+        # Allow overriding occupants full load from BUI -> internal_gains -> occupants.full_load
         q_int_occ = internal_gains_occupants[building_type_class]['occupants']
+        building_object = getattr(self, "building_object", None)
+        if building_object:
+            for gain in building_object.get("internal_gains", []):
+                if gain.get("name") == "occupants" and "full_load" in gain:
+                    q_int_occ = gain["full_load"]
+                    break
+
         q_int_app = internal_gains_occupants[building_type_class]['appliances']
         # q_int_light = internal_gains_occupants[building_type_class]['lighting']
         Phi_int_z_t = (q_int_occ * h_occup + q_int_app * h_app) * a_use
