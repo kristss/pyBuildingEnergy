@@ -34,7 +34,7 @@ dependencies = [
     "nbformat==5.10.4",
     "numpy>=1.26",
     "openpyxl==3.1.5",
-    "packaging==25.0",
+    "packaging>=23.2,<26",
     "pandas==2.3.2",
     "parso==0.8.5",
     "platformdirs==4.4.0",
