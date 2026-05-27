@@ -3,9 +3,10 @@
 This script demonstrates the complete sequence:
 
 1. Calculate hourly space heating/cooling needs with ISO52016.
-2. Calculate a meaningful hourly DHW need with the DHW module.
-3. Run the EN 15316-4-2 heat-pump bin calculation.
-4. Save the intermediate loads, bin balance and summary outputs.
+2. Apply EN 15316-2 emitter/control effects and emission losses.
+3. Calculate a meaningful hourly DHW need with the DHW module.
+4. Run the EN 15316-4-2 heat-pump bin calculation.
+5. Save the intermediate loads, bin balance and summary outputs.
 
 Default weather uses PVGIS for the selected scenario. If network access is not
 available, run with ``--weather-source epw --path-weather-file path/to/weather.epw``.
@@ -14,6 +15,7 @@ available, run with ``--weather-source epw --path-weather-file path/to/weather.e
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 from pathlib import Path
 import sys
@@ -46,8 +48,11 @@ SCENARIO_DHW_COUNTRY = {
 }
 
 
-def default_output_dir(scenario: str) -> Path:
-    return REPO_ROOT / "examples" / "outputs" / f"heat_pump_15316_4_2_{scenario}"
+def default_output_dir(scenario: str, emission_method: str = "en15316-2") -> Path:
+    suffix = f"heat_pump_15316_4_2_{scenario}"
+    if emission_method == "simple":
+        suffix = f"{suffix}_simple"
+    return REPO_ROOT / "examples" / "outputs" / suffix
 
 
 def example_building(scenario: str = "athens") -> dict:
@@ -480,6 +485,113 @@ def heat_pump_config(
     return config
 
 
+def emission_system_config(scenario: str = "athens") -> dict:
+    """Scenario-specific EN 15316-2 emission assumptions.
+
+    The defaults represent water-based fan-coil emission with PI room control,
+    balanced hydraulics and stand-alone room automation. Values are taken from
+    EN 15316-2:2017 Annex B default tables where available.
+    """
+
+    config = {
+        "demand_unit": "kWh",
+        "cooling_solar_gain_temperature_C": 8.0,
+        "heating": {
+            "stratification_K": 0.35,
+            "control_K": 0.70,
+            "radiation_K": 0.0,
+            "hydraulic_balancing_K": 0.10,
+            "room_automation_K": -0.50,
+            "embedded_K": 0.0,
+            "nominal_power_kW": 10.0,
+            "fan_power_W": 10.0,
+            "fan_count": 4.0,
+            "control_power_W": 0.1,
+            "control_count": 4.0,
+            "convective_fraction": 0.95,
+        },
+        "cooling": {
+            "stratification_K": 0.40,
+            "control_K": 0.70,
+            "radiation_K": 0.0,
+            "hydraulic_balancing_K": 0.10,
+            "room_automation_K": -0.50,
+            "embedded_K": 0.0,
+            "nominal_power_kW": 8.0,
+            "fan_power_W": 10.0,
+            "fan_count": 4.0,
+            "control_power_W": 0.1,
+            "control_count": 4.0,
+            "convective_fraction": 0.95,
+        },
+    }
+
+    if scenario == "bolzano":
+        config["heating"]["nominal_power_kW"] = 11.0
+        config["cooling"]["nominal_power_kW"] = 6.5
+
+    return config
+
+
+def building_with_emission_setpoints(
+    building: dict,
+    emission_calc: pybui.EmissionSystemCalculator,
+) -> dict:
+    """Return a copy of the building with EN 15316-2 equivalent setpoints."""
+
+    adjusted = copy.deepcopy(building)
+    setpoints = adjusted["building_parameters"]["temperature_setpoints"]
+    h_delta = emission_calc.temperature_increase_K("H")
+    c_delta = emission_calc.temperature_increase_K("C")
+
+    for key in ["heating_setpoint", "heating_setback"]:
+        if key in setpoints:
+            setpoints[key] = float(setpoints[key]) + h_delta
+    for key in ["cooling_setpoint", "cooling_setback"]:
+        if key in setpoints:
+            setpoints[key] = float(setpoints[key]) - c_delta
+
+    return adjusted
+
+
+def prepare_emission_loads(
+    hourly_sim: pd.DataFrame,
+    hourly_sim_emission: pd.DataFrame,
+) -> pd.DataFrame:
+    """Prepare baseline and equivalent-setpoint loads for EN 15316-2."""
+
+    loads = pd.DataFrame(index=hourly_sim.index)
+    loads["T_ext"] = hourly_sim["T_ext"].astype(float)
+    loads["T_op"] = hourly_sim["T_op"].astype(float)
+
+    if "Q_H" in hourly_sim:
+        loads["Q_H_kWh"] = hourly_sim["Q_H"].astype(float) / 1000.0
+    else:
+        loads["Q_H_kWh"] = hourly_sim["Q_HC"].clip(lower=0).astype(float) / 1000.0
+
+    if "Q_C" in hourly_sim:
+        loads["Q_C_kWh"] = hourly_sim["Q_C"].astype(float) / 1000.0
+    else:
+        loads["Q_C_kWh"] = (-hourly_sim["Q_HC"].clip(upper=0)).astype(float) / 1000.0
+
+    emission_aligned = hourly_sim_emission.reindex(loads.index)
+    if "Q_H" in emission_aligned:
+        loads["Q_H_em_out_inc_kWh"] = emission_aligned["Q_H"].astype(float) / 1000.0
+    else:
+        loads["Q_H_em_out_inc_kWh"] = (
+            emission_aligned["Q_HC"].clip(lower=0).astype(float) / 1000.0
+        )
+
+    if "Q_C" in emission_aligned:
+        loads["Q_C_em_out_inc_kWh"] = emission_aligned["Q_C"].astype(float) / 1000.0
+    else:
+        loads["Q_C_em_out_inc_kWh"] = (
+            -emission_aligned["Q_HC"].clip(upper=0).astype(float) / 1000.0
+        )
+
+    return loads
+
+
 def prepare_heat_pump_loads(hourly_sim: pd.DataFrame, dhw_kWh: pd.Series) -> pd.DataFrame:
     """Convert ISO52016 Wh outputs to the heat-pump module kWh inputs."""
 
@@ -626,7 +738,11 @@ def create_iso52016_visuals(hourly_sim: pd.DataFrame, output_dir: Path, building
     return iso_dir / "iso52016_building_report.html"
 
 
-def plot_input_timeseries(loads: pd.DataFrame, output_dir: Path) -> Path:
+def plot_input_timeseries(
+    loads: pd.DataFrame,
+    output_dir: Path,
+    title: str = "Space Emission Loads and DHW Inputs Sent to the Heat Pump",
+) -> Path:
     daily_energy = loads[["Q_H_kWh", "Q_C_kWh", "Q_W_kWh"]].resample("D").sum()
     daily_temp = loads[["T_ext", "T_op"]].resample("D").mean()
     cumulative = daily_energy.cumsum()
@@ -655,8 +771,159 @@ def plot_input_timeseries(loads: pd.DataFrame, output_dir: Path) -> Path:
     fig.update_yaxes(title_text="kWh/day", row=1, col=1)
     fig.update_yaxes(title_text="degC", row=2, col=1)
     fig.update_yaxes(title_text="kWh", row=3, col=1)
-    fig.update_layout(title="ISO52016 and DHW Inputs Sent to the Heat Pump")
+    fig.update_layout(title=title)
     return _write_plot(fig, output_dir / "visuals" / "01_inputs_timeseries.html")
+
+
+def plot_emission_timeseries(
+    emission: pybui.EmissionSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = emission.timeseries
+    daily = hourly[
+        [
+            "Q_H_em_out_kWh",
+            "Q_H_em_ls_kWh",
+            "Q_H_em_in_kWh",
+            "Q_C_em_out_kWh",
+            "Q_C_em_ls_kWh",
+            "Q_C_em_in_kWh",
+            "W_H_em_aux_kWh",
+            "W_C_em_aux_kWh",
+        ]
+    ].resample("D").sum()
+    daily_temp = hourly[
+        [
+            "T_H_int_ini_C",
+            "theta_H_int_inc_C",
+            "T_C_int_ini_C",
+            "theta_C_int_inc_C",
+        ]
+    ].resample("D").mean()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily building needs and emission input loads",
+            "Daily emission losses and auxiliary electricity",
+            "Baseline and equivalent internal temperatures",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_em_out_kWh", "Heating building need", "#b23b3b"),
+        ("Q_H_em_in_kWh", "Heating emission input", "#7f1d1d"),
+        ("Q_C_em_out_kWh", "Cooling building need", "#2f78b7"),
+        ("Q_C_em_in_kWh", "Cooling emission input", "#1f4e79"),
+    ]:
+        fig.add_trace(go.Scatter(x=daily.index, y=daily[col], mode="lines", name=name, line=dict(color=color)), row=1, col=1)
+
+    for col, name, color in [
+        ("Q_H_em_ls_kWh", "Heating emission losses", "#d65f5f"),
+        ("Q_C_em_ls_kWh", "Cooling emission losses", "#6fa8dc"),
+        ("W_H_em_aux_kWh", "Heating emission auxiliaries", "#808080"),
+        ("W_C_em_aux_kWh", "Cooling emission auxiliaries", "#5b9bd5"),
+    ]:
+        fig.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=2, col=1)
+
+    for col, name, color, dash in [
+        ("T_H_int_ini_C", "Heating base internal temperature", "#b23b3b", "dot"),
+        ("theta_H_int_inc_C", "Heating equivalent internal temperature", "#7f1d1d", "solid"),
+        ("T_C_int_ini_C", "Cooling base internal temperature", "#2f78b7", "dot"),
+        ("theta_C_int_inc_C", "Cooling equivalent internal temperature", "#1f4e79", "solid"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=daily_temp.index,
+                y=daily_temp[col],
+                mode="lines",
+                name=name,
+                line=dict(color=color, dash=dash),
+            ),
+            row=3,
+            col=1,
+        )
+
+    fig.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/day", row=2, col=1)
+    fig.update_yaxes(title_text="degC", row=3, col=1)
+    fig.update_layout(title="EN 15316-2 Emission System Time Series")
+    return _write_plot(fig, output_dir / "visuals" / "02_emission_15316_2_timeseries.html")
+
+
+def plot_emission_monthly(
+    emission: pybui.EmissionSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = emission.timeseries
+    monthly = hourly[
+        [
+            "Q_H_em_out_kWh",
+            "Q_H_em_temp_effect_kWh",
+            "Q_H_emb_ls_kWh",
+            "Q_H_em_in_kWh",
+            "Q_C_em_out_kWh",
+            "Q_C_em_temp_effect_kWh",
+            "Q_C_emb_ls_kWh",
+            "Q_C_em_in_kWh",
+            "W_H_em_aux_kWh",
+            "W_C_em_aux_kWh",
+        ]
+    ].resample("ME").sum()
+    monthly["e_H_em_ls"] = monthly["Q_H_em_in_kWh"] / monthly["Q_H_em_out_kWh"].replace(0, np.nan)
+    monthly["e_C_em_ls"] = monthly["Q_C_em_in_kWh"] / monthly["Q_C_em_out_kWh"].replace(0, np.nan)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=[
+            "Monthly EN 15316-2 emission balance",
+            "Monthly emission expenditure factors",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_em_out_kWh", "Heating building need", "#b23b3b"),
+        ("Q_H_em_temp_effect_kWh", "Heating control/emitter effect", "#d65f5f"),
+        ("Q_H_emb_ls_kWh", "Heating embedded loss", "#a64242"),
+        ("Q_C_em_out_kWh", "Cooling building need", "#2f78b7"),
+        ("Q_C_em_temp_effect_kWh", "Cooling control/emitter effect", "#6fa8dc"),
+        ("Q_C_emb_ls_kWh", "Cooling embedded loss", "#1f4e79"),
+        ("W_H_em_aux_kWh", "Heating auxiliaries", "#808080"),
+        ("W_C_em_aux_kWh", "Cooling auxiliaries", "#5b9bd5"),
+    ]:
+        fig.add_trace(go.Bar(x=monthly.index, y=monthly[col], name=name, marker_color=color), row=1, col=1)
+
+    fig.add_trace(
+        go.Scatter(
+            x=monthly.index,
+            y=monthly["e_H_em_ls"],
+            mode="lines+markers",
+            name="Heating expenditure factor",
+            line=dict(color="#7f1d1d"),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=monthly.index,
+            y=monthly["e_C_em_ls"],
+            mode="lines+markers",
+            name="Cooling expenditure factor",
+            line=dict(color="#2f78b7"),
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_yaxes(title_text="kWh/month", row=1, col=1)
+    fig.update_yaxes(title_text="ratio", row=2, col=1)
+    fig.update_layout(title="Monthly EN 15316-2 Emission Summary", barmode="relative")
+    return _write_plot(fig, output_dir / "visuals" / "03_emission_15316_2_monthly.html")
 
 
 def plot_heat_pump_hourly(allocated: pd.DataFrame, output_dir: Path) -> Path:
@@ -928,6 +1195,7 @@ def create_inspection_index(
     summary: dict[str, float],
     plot_paths: list[Path],
     iso_report: Path | None,
+    emission_summary: dict[str, float] | None = None,
 ) -> Path:
     cards = {
         "Heating demand": summary.get("QH_gen_out_kWh", 0.0),
@@ -938,6 +1206,14 @@ def create_inspection_index(
         "SPF heating+DHW": summary.get("SPF_HW_gen", np.nan),
         "SEER cooling": summary.get("SEER_C_gen", np.nan),
     }
+    if emission_summary:
+        cards.update(
+            {
+                "EN 15316-2 heating losses": emission_summary.get("QH_em_ls_kWh", 0.0),
+                "EN 15316-2 cooling losses": emission_summary.get("QC_em_ls_kWh", 0.0),
+                "EN 15316-2 auxiliaries": emission_summary.get("W_em_aux_kWh", 0.0),
+            }
+        )
     list_items = []
     if iso_report is not None:
         list_items.append(f'<li><a href="{html.escape(str(iso_report.relative_to(output_dir)))}">ISO52016 existing building report</a></li>')
@@ -949,11 +1225,25 @@ def create_inspection_index(
         for name, value in cards.items()
         if value is not None and np.isfinite(value)
     )
+    page_title = (
+        "EN 15316-2 and EN 15316-4-2 Inspection"
+        if emission_summary
+        else "Heat Pump EN 15316-4-2 Inspection"
+    )
+    page_intro = (
+        "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
+        "emission effects, DHW profile, heat-pump bin method, electricity use, "
+        "backup energy, losses and seasonal performance."
+        if emission_summary
+        else "Open the plots below to inspect the direct ISO52016 and DHW inputs, "
+        "heat-pump bin method, electricity use, backup energy, losses and seasonal "
+        "performance."
+    )
     page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Heat Pump EN 15316-4-2 Inspection</title>
+  <title>{html.escape(page_title)}</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 32px; color: #1f2933; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 20px 0 28px; }}
@@ -964,8 +1254,8 @@ def create_inspection_index(
   </style>
 </head>
 <body>
-  <h1>Heat Pump EN 15316-4-2 Inspection</h1>
-  <p>Open the plots below to inspect the ISO52016 inputs, DHW profile, heat-pump bin method, electricity use, backup energy, losses and seasonal performance.</p>
+  <h1>{html.escape(page_title)}</h1>
+  <p>{html.escape(page_intro)}</p>
   <div class="grid">{card_html}</div>
   <h2>Interactive Outputs</h2>
   <ul>{"".join(list_items)}</ul>
@@ -983,26 +1273,53 @@ def create_visual_outputs(
     result: pybui.HeatPumpSimulationResult,
     output_dir: Path,
     building_area: float,
+    emission_result: pybui.EmissionSimulationResult | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
     allocated.to_csv(output_dir / "heat_pump_hourly_allocated_results.csv")
 
-    plot_paths = [
-        plot_input_timeseries(loads, output_dir),
-        plot_heat_pump_hourly(allocated, output_dir),
-        plot_monthly_summary(loads, allocated, output_dir),
-        plot_bin_balance(result.bins, output_dir),
-        plot_bin_performance(result.bins, output_dir),
-        plot_summary_sankey(result.summary, output_dir),
-    ]
-    return create_inspection_index(output_dir, result.summary, plot_paths, iso_report)
+    input_title = (
+        "Space Emission Loads and DHW Inputs Sent to the Heat Pump"
+        if emission_result is not None
+        else "ISO52016 and DHW Inputs Sent to the Heat Pump"
+    )
+    plot_paths = [plot_input_timeseries(loads, output_dir, title=input_title)]
+    if emission_result is not None:
+        plot_paths.extend(
+            [
+                plot_emission_timeseries(emission_result, output_dir),
+                plot_emission_monthly(emission_result, output_dir),
+            ]
+        )
+    plot_paths.extend(
+        [
+            plot_heat_pump_hourly(allocated, output_dir),
+            plot_monthly_summary(loads, allocated, output_dir),
+            plot_bin_balance(result.bins, output_dir),
+            plot_bin_performance(result.bins, output_dir),
+            plot_summary_sankey(result.summary, output_dir),
+        ]
+    )
+    emission_summary = emission_result.summary if emission_result is not None else None
+    return create_inspection_index(
+        output_dir,
+        result.summary,
+        plot_paths,
+        iso_report,
+        emission_summary=emission_summary,
+    )
 
 
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
+    emission_method = args.emission_method
     building = example_building(scenario)
-    output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(scenario)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else default_output_dir(scenario, emission_method)
+    )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1013,6 +1330,29 @@ def run_example(args: argparse.Namespace) -> None:
         country=dhw_country,
     )
     loads = prepare_heat_pump_loads(hourly_sim, dhw_kWh)
+
+    emission_result = None
+    if emission_method == "en15316-2":
+        emission_calc = pybui.EmissionSystemCalculator(emission_system_config(scenario))
+        emission_building = building_with_emission_setpoints(building, emission_calc)
+        hourly_sim_emission = run_iso52016(
+            emission_building,
+            args.weather_source,
+            args.path_weather_file,
+        )
+        emission_loads = prepare_emission_loads(hourly_sim, hourly_sim_emission)
+        emission_result = emission_calc.run_timeseries(emission_loads)
+        loads["Q_H_building_kWh"] = emission_result.timeseries["Q_H_em_out_kWh"]
+        loads["Q_C_building_kWh"] = emission_result.timeseries["Q_C_em_out_kWh"]
+        loads["Q_H_em_loss_kWh"] = emission_result.timeseries["Q_H_em_ls_kWh"]
+        loads["Q_C_em_loss_kWh"] = emission_result.timeseries["Q_C_em_ls_kWh"]
+        loads["W_H_em_aux_kWh"] = emission_result.timeseries["W_H_em_aux_kWh"]
+        loads["W_C_em_aux_kWh"] = emission_result.timeseries["W_C_em_aux_kWh"]
+        loads["Q_H_kWh"] = emission_result.timeseries["Q_H_em_in_kWh"]
+        loads["Q_C_kWh"] = emission_result.timeseries["Q_C_em_in_kWh"]
+    elif emission_method != "simple":
+        raise ValueError("--emission-method must be 'en15316-2' or 'simple'.")
+
     ensure_heating_and_cooling(loads)
 
     heating_map, cooling_map = heat_pump_maps(scenario)
@@ -1022,6 +1362,12 @@ def run_example(args: argparse.Namespace) -> None:
     result = calc.run_timeseries(loads)
 
     loads.to_csv(output_dir / "iso52016_loads_with_dhw.csv")
+    if emission_result is not None:
+        emission_result.timeseries.to_csv(output_dir / "emission_15316_2_hourly_results.csv")
+        pd.DataFrame([emission_result.summary]).to_csv(
+            output_dir / "emission_15316_2_summary.csv",
+            index=False,
+        )
     result.bins.to_csv(output_dir / "heat_pump_bin_results.csv", index=False)
     pd.DataFrame([result.summary]).to_csv(output_dir / "heat_pump_summary.csv", index=False)
     inspection_index = create_visual_outputs(
@@ -1030,13 +1376,24 @@ def run_example(args: argparse.Namespace) -> None:
         result=result,
         output_dir=output_dir,
         building_area=float(building["building"]["net_floor_area"]),
+        emission_result=emission_result,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
+    print(f"Emission calculation mode: {emission_method}")
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
-    print(f"Space heating demand: {loads['Q_H_kWh'].sum():,.1f} kWh")
-    print(f"Space cooling demand: {loads['Q_C_kWh'].sum():,.1f} kWh")
+    if emission_result is not None:
+        print(f"ISO52016 space heating need: {emission_result.summary['QH_em_out_kWh']:,.1f} kWh")
+        print(f"EN 15316-2 heating emission losses: {emission_result.summary['QH_em_ls_kWh']:,.1f} kWh")
+        print(f"Heat-pump space heating input load: {loads['Q_H_kWh'].sum():,.1f} kWh")
+        print(f"ISO52016 space cooling need: {emission_result.summary['QC_em_out_kWh']:,.1f} kWh")
+        print(f"EN 15316-2 cooling emission losses: {emission_result.summary['QC_em_ls_kWh']:,.1f} kWh")
+        print(f"Heat-pump space cooling input load: {loads['Q_C_kWh'].sum():,.1f} kWh")
+        print(f"EN 15316-2 emission auxiliaries: {emission_result.summary['W_em_aux_kWh']:,.1f} kWh")
+    else:
+        print(f"Space heating demand: {loads['Q_H_kWh'].sum():,.1f} kWh")
+        print(f"Space cooling demand: {loads['Q_C_kWh'].sum():,.1f} kWh")
     print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
     print(f"Heating+DHW electricity incl. backup: {result.summary['EHW_gen_in_kWh']:,.1f} kWh")
     print(f"Heating+DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
@@ -1070,11 +1427,22 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
         help="Workalendar country name for the DHW profile. Default: scenario-specific.",
     )
     parser.add_argument(
+        "--emission-method",
+        choices=["en15316-2", "simple"],
+        default="en15316-2",
+        help=(
+            "Space-emission calculation mode. 'en15316-2' applies emitter/control "
+            "effects before heat-pump generation; 'simple' uses the direct ISO52016 "
+            "loads as in the earlier example. Default: en15316-2."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help=(
             "Folder where CSV and visual outputs are written. "
-            "Default: examples/outputs/heat_pump_15316_4_2_<scenario>."
+            "Default: examples/outputs/heat_pump_15316_4_2_<scenario>; simple "
+            "mode adds a _simple suffix."
         ),
     )
     return parser.parse_args()

@@ -354,6 +354,60 @@ def test_heat_pump_system_calculator_heating_cooling_dhw():
     assert result.summary["SEER_C_gen"] > 1.0
 
 
+def test_emission_system_calculator_heating_cooling_effects():
+    """Test EN 15316-2 emission losses and auxiliary electricity."""
+    import pybuildingenergy as pybui
+
+    loads = pd.DataFrame(
+        {
+            "T_ext": [-5.0, 0.0, 30.0, 34.0],
+            "T_H_int_ini_C": [20.0, 20.0, 20.0, 20.0],
+            "T_C_int_ini_C": [26.0, 26.0, 26.0, 26.0],
+            "Q_H_kWh": [4.0, 2.0, 0.0, 0.0],
+            "Q_C_kWh": [0.0, 0.0, 2.0, 3.0],
+            "Q_H_em_out_inc_kWh": [4.2, 2.1, 0.0, 0.0],
+            "Q_C_em_out_inc_kWh": [0.0, 0.0, 2.15, 3.2],
+        },
+        index=pd.date_range("2026-01-01", periods=4, freq="h"),
+    )
+
+    calc = pybui.EmissionSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "heating": {
+                "stratification_K": 0.35,
+                "control_K": 0.70,
+                "hydraulic_balancing_K": 0.10,
+                "room_automation_K": -0.50,
+                "fan_power_W": 10.0,
+                "fan_count": 2.0,
+                "convective_fraction": 0.95,
+            },
+            "cooling": {
+                "stratification_K": 0.40,
+                "control_K": 0.70,
+                "hydraulic_balancing_K": 0.10,
+                "room_automation_K": -0.50,
+                "fan_power_W": 10.0,
+                "fan_count": 2.0,
+                "convective_fraction": 0.95,
+            },
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.timeseries["Q_H_em_in_kWh"].sum() > loads["Q_H_kWh"].sum()
+    assert result.timeseries["Q_C_em_in_kWh"].sum() > loads["Q_C_kWh"].sum()
+    assert result.summary["QH_em_ls_kWh"] == pytest.approx(0.3)
+    assert result.summary["QC_em_ls_kWh"] == pytest.approx(0.35)
+    assert result.summary["WH_em_aux_kWh"] > 0
+    assert result.summary["WC_em_aux_kWh"] > 0
+    assert result.summary["e_H_em_ls_an"] > 1.0
+    assert result.summary["e_C_em_ls_an"] > 1.0
+    assert pybui.EmissionSystemCalculator is not None
+
+
 @pytest.mark.parametrize("fix", [True, False])
 def test_sanitize_and_validate_bui(building_data, fix):
     """Test per la validazione dei dati dell'edificio"""

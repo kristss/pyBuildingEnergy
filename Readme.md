@@ -50,6 +50,16 @@ More details in the example folder.
 - [x] Calculation of volume and energy need for domestic hot water according to ISO 12831-3.
 - [ ] Assessment of thermal load based on the type of DHW system.
 
+## Space Emission Systems - EN 15316-2 **(New)**
+
+`EmissionSystemCalculator` evaluates space-heating and water-based space-cooling
+emission effects before generation. It can be used to account for emitter and
+control effects, equivalent internal-temperature changes, embedded emitter
+losses, emission auxiliary electricity and annual emission expenditure factors.
+
+For an audit trail between the standard, code and output files, open
+[Emission EN 15316-2 Implementation Audit](docs/emission_15316_2_audit.html).
+
 ## Heat Pump Generation - EN 15316-4-2 **(New)**
 
 `HeatPumpSystemCalculator` evaluates a reversible heat-pump generator for:
@@ -121,9 +131,11 @@ python examples/heat_pump_15316_4_2_bolzano_example.py
 
 The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed top-floor envelope and an air-to-water heat-pump map sized for a 120 m2 residential building.
 
-Each scenario runs ISO52016 for the example building, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
+Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects by default, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
 
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_hourly_allocated_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_bin_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_summary.csv`
@@ -133,11 +145,23 @@ Open `inspection_index.html` in a browser to inspect the visual outputs. The pag
 
 - the existing ISO52016 building report generated with `Graphs_and_report`;
 - daily input time series for heating, cooling, DHW and temperatures;
+- EN 15316-2 emission time series and monthly aggregate plots;
 - allocated heat-pump electricity time series;
 - monthly demand, electricity, SPF and SEER summaries;
 - bin-method energy balance plots;
 - bin COP/EER, capacity and runtime plots;
 - an annual energy-flow Sankey diagram.
+
+To reproduce the earlier simple calculation without EN 15316-2 emission effects,
+use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --emission-method simple
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --emission-method simple
+```
+
+Simple mode writes to `examples/outputs/heat_pump_15316_4_2_<scenario>_simple`
+unless `--output-dir` is specified.
 
 By default the script uses PVGIS weather for the selected scenario, so it needs internet access. To run with a local EPW file instead:
 
@@ -154,7 +178,7 @@ The EN 15316 series covers the calculation method for system energy requirements
 ## EN 15316 Modular Structure **(New)**
 
 - [x] EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
-- [ ] EN 15316-2: Emission systems (heating and cooling)
+- [x] EN 15316-2: Emission systems (heating and cooling)
 - [ ] EN 15316-3: Distribution systems (DHW, heating, cooling)
 - [ ] EN 15316-4-X: Heat generation systems:
   - 4-1: Combustion boilers
