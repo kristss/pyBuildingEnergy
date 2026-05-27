@@ -39,13 +39,14 @@ def get_calendar_by_name(nation_name: str):
     except Exception:
         # Fallback for common EU countries (extend as needed)
         try:
-            from workalendar.europe import Italy, Germany, France, Spain, Austria, Switzerland
+            from workalendar.europe import Austria, France, Germany, Greece, Italy, Spain, Switzerland
             fallback = {
-                "Italy": Italy,
-                "Germany": Germany,
-                "France": France,
-                "Spain": Spain,
                 "Austria": Austria,
+                "France": France,
+                "Germany": Germany,
+                "Greece": Greece,
+                "Italy": Italy,
+                "Spain": Spain,
                 "Switzerland": Switzerland,
             }
             return fallback[nation_name]()

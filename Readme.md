@@ -50,6 +50,103 @@ More details in the example folder.
 - [x] Calculation of volume and energy need for domestic hot water according to ISO 12831-3.
 - [ ] Assessment of thermal load based on the type of DHW system.
 
+## Heat Pump Generation - EN 15316-4-2 **(New)**
+
+`HeatPumpSystemCalculator` evaluates a reversible heat-pump generator for:
+
+- space heating,
+- domestic hot water (DHW),
+- and space cooling with a reversible EER map.
+
+The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, storage losses, backup energy and SPF outputs. Cooling is reported separately with the same bin/product-map approach using EER values.
+
+For a clause-by-clause audit trail between the standard, the implementation and the output files, open [Heat Pump EN 15316-4-2 Implementation Audit](docs/heat_pump_15316_4_2_audit.html).
+
+```python
+import pandas as pd
+import pybuildingenergy as pybui
+
+heating_map = pd.DataFrame({
+    "source_temperature_C": [-7, -7, 2, 2, 7, 7],
+    "sink_temperature_C": [35, 55, 35, 55, 35, 55],
+    "capacity_kW": [5.0, 4.0, 6.0, 5.0, 7.0, 6.0],
+    "cop": [3.2, 2.4, 3.8, 2.8, 4.2, 3.2],
+})
+
+cooling_map = pd.DataFrame({
+    "source_temperature_C": [25, 25, 35, 35],
+    "sink_temperature_C": [7, 18, 7, 18],
+    "capacity_kW": [5.0, 6.0, 4.0, 5.0],
+    "eer": [3.0, 3.6, 2.5, 3.1],
+})
+
+loads = pd.DataFrame({
+    "T_ext": [-5, 0, 5, 25],
+    "Q_H_kWh": [4.0, 3.0, 1.0, 0.0],
+    "Q_C_kWh": [0.0, 0.0, 0.0, 2.0],
+    "Q_W_kWh": [0.5, 0.5, 0.5, 0.5],
+})
+
+calc = pybui.HeatPumpSystemCalculator({
+    "heating_performance_map": heating_map,
+    "dhw_performance_map": heating_map,
+    "cooling_performance_map": cooling_map,
+    "source_type": "air",
+    "demand_unit": "kWh",
+    "dhw_target_temperature_C": 55,
+    "dhw_sink_temperature_C": 55,
+    "external_auxiliary_power_W": 100,
+})
+
+result = calc.run_timeseries(loads)
+print(result.summary["SPF_HW_gen"])
+print(result.summary["SEER_C_gen"])
+```
+
+### Run The Heat Pump Example
+
+The runnable examples are:
+
+```bash
+python -m pip install -r requirements.txt
+python examples/heat_pump_15316_4_2_example.py --scenario athens
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano
+```
+
+There is also a Bolzano convenience wrapper:
+
+```bash
+python examples/heat_pump_15316_4_2_bolzano_example.py
+```
+
+The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed top-floor envelope and an air-to-water heat-pump map sized for a 120 m2 residential building.
+
+Each scenario runs ISO52016 for the example building, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
+
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_hourly_allocated_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_bin_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/inspection_index.html`
+
+Open `inspection_index.html` in a browser to inspect the visual outputs. The page links to:
+
+- the existing ISO52016 building report generated with `Graphs_and_report`;
+- daily input time series for heating, cooling, DHW and temperatures;
+- allocated heat-pump electricity time series;
+- monthly demand, electricity, SPF and SEER summaries;
+- bin-method energy balance plots;
+- bin COP/EER, capacity and runtime plots;
+- an annual energy-flow Sankey diagram.
+
+By default the script uses PVGIS weather for the selected scenario, so it needs internet access. To run with a local EPW file instead:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --weather-source epw --path-weather-file path/to/weather.epw
+```
+
+The script checks that the ISO52016 run produces both heating and cooling demand and that DHW demand is non-zero before running the heat-pump calculation.
+
 ## Primary Energy - Heating System **(New)**
 
 The EN 15316 series covers the calculation method for system energy requirements and system efficiencies. This family of standards is an integral part of the EPB set and covers:

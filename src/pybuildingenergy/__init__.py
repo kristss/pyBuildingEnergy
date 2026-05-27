@@ -4,6 +4,7 @@ from .source.check_input import sanitize_and_validate_BUI
 from .source.utils import ISO52016
 from .source.graphs import Graphs_and_report
 from .source.iso_15316_1 import HeatingSystemCalculator
+from .source.heat_pump_15316_4_2 import HeatPumpSimulationResult, HeatPumpSystemCalculator
 from .source.check_input import check_heating_system_inputs
 from .source.generate_profile import HourlyProfileGenerator, get_country_code_from_latlon
 from .source.DHW import *
@@ -20,6 +21,8 @@ __version__ = '2.0.3'
 __all__ = [
     "check_heating_system_inputs",
     "HeatingSystemCalculator",
+    "HeatPumpSimulationResult",
+    "HeatPumpSystemCalculator",
     "Graphs_and_report",
     "ISO52016",
     "sanitize_and_validate_BUI",

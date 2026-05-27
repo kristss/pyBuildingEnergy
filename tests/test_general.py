@@ -303,6 +303,57 @@ def test_heating_system_calculator(hvac_system_config):
     assert calc is not None
 
 
+def test_heat_pump_system_calculator_heating_cooling_dhw():
+    """Test heat pump generation for heating, cooling and DHW demand."""
+    import pybuildingenergy as pybui
+
+    heating_map = pd.DataFrame({
+        "source_temperature_C": [-7, -7, 2, 2, 7, 7],
+        "sink_temperature_C": [35, 55, 35, 55, 35, 55],
+        "capacity_kW": [5.0, 4.0, 6.0, 5.0, 7.0, 6.0],
+        "cop": [3.2, 2.4, 3.8, 2.8, 4.2, 3.2],
+    })
+    cooling_map = pd.DataFrame({
+        "source_temperature_C": [25, 25, 35, 35],
+        "sink_temperature_C": [7, 18, 7, 18],
+        "capacity_kW": [5.0, 6.0, 4.0, 5.0],
+        "eer": [3.0, 3.6, 2.5, 3.1],
+    })
+    loads = pd.DataFrame({
+        "T_ext": [-5.0, 0.0, 5.0, 12.0, 25.0, 30.0],
+        "Q_H_kWh": [4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
+        "Q_C_kWh": [0.0, 0.0, 0.0, 0.0, 2.0, 3.0],
+        "Q_W_kWh": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+    }, index=pd.date_range("2026-01-01", periods=6, freq="h"))
+
+    calc = pybui.HeatPumpSystemCalculator({
+        "heating_performance_map": heating_map,
+        "dhw_performance_map": heating_map,
+        "cooling_performance_map": cooling_map,
+        "source_type": "air",
+        "time_step_hours": 1.0,
+        "demand_unit": "kWh",
+        "hp_operating_limit_C": 58.0,
+        "dhw_target_temperature_C": 55.0,
+        "dhw_sink_temperature_C": 55.0,
+        "external_auxiliary_power_W": 100.0,
+        "standby_power_W": 5.0,
+        "heating_storage_loss_kWh_per_day": 0.1,
+        "dhw_storage_loss_kWh_per_day": 0.2,
+    })
+
+    result = calc.run_timeseries(loads)
+
+    assert result.bins is not None
+    assert len(result.bins) > 0
+    assert result.summary["QH_gen_out_kWh"] == pytest.approx(10.0)
+    assert result.summary["QW_gen_out_kWh"] == pytest.approx(3.0)
+    assert result.summary["QC_gen_out_kWh"] == pytest.approx(5.0)
+    assert result.summary["E_total_electricity_kWh"] > 0
+    assert result.summary["SPF_HW_gen"] > 1.0
+    assert result.summary["SEER_C_gen"] > 1.0
+
+
 @pytest.mark.parametrize("fix", [True, False])
 def test_sanitize_and_validate_bui(building_data, fix):
     """Test per la validazione dei dati dell'edificio"""
