@@ -5,8 +5,9 @@ This script demonstrates the complete sequence:
 1. Calculate hourly space heating/cooling needs with ISO52016.
 2. Apply EN 15316-2 emitter/control effects and emission losses.
 3. Calculate a meaningful hourly DHW need with the DHW module.
-4. Run the EN 15316-4-2 heat-pump bin calculation.
-5. Save the intermediate loads, bin balance and summary outputs.
+4. Apply EN 15316-3 water-based distribution losses and pump auxiliaries.
+5. Run the EN 15316-4-2 heat-pump bin calculation.
+6. Save the intermediate loads, bin balance and summary outputs.
 
 Default weather uses PVGIS for the selected scenario. If network access is not
 available, run with ``--weather-source epw --path-weather-file path/to/weather.epw``.
@@ -48,10 +49,18 @@ SCENARIO_DHW_COUNTRY = {
 }
 
 
-def default_output_dir(scenario: str, emission_method: str = "en15316-2") -> Path:
+def default_output_dir(
+    scenario: str,
+    emission_method: str = "en15316-2",
+    distribution_method: str = "en15316-3",
+) -> Path:
     suffix = f"heat_pump_15316_4_2_{scenario}"
-    if emission_method == "simple":
+    if emission_method == "simple" and distribution_method == "simple":
         suffix = f"{suffix}_simple"
+    elif emission_method == "en15316-2" and distribution_method == "simple":
+        suffix = f"{suffix}_emission_only"
+    elif emission_method == "simple" and distribution_method == "en15316-3":
+        suffix = f"{suffix}_distribution_only"
     return REPO_ROOT / "examples" / "outputs" / suffix
 
 
@@ -592,6 +601,173 @@ def prepare_emission_loads(
     return loads
 
 
+def _distribution_geometry(building: dict) -> tuple[float, float, float, int]:
+    """Approximate rectangular Annex B dimensions from the example building."""
+
+    n_floors = max(int(building["building"].get("n_floors", 1)), 1)
+    floor_height = float(building["building"].get("height", 3.0)) / n_floors
+    footprint_area = max(float(building["building"]["net_floor_area"]) / n_floors, 1.0)
+    aspect_ratio = 1.4
+    width = float(np.sqrt(footprint_area / aspect_ratio))
+    length = footprint_area / width
+    return length, width, floor_height, n_floors
+
+
+def _pipe_psi_by_scenario(scenario: str) -> tuple[float, float, float]:
+    return 0.20, 0.30, 0.30
+
+
+def _space_distribution_sections(
+    scenario: str,
+    building: dict,
+    service: str,
+) -> tuple[list[dict], float]:
+    """Build Annex B two-pipe sections V, S and A for the example building."""
+
+    length, width, floor_height, n_floors = _distribution_geometry(building)
+    psi_v, psi_s, psi_a = _pipe_psi_by_scenario(scenario)
+    compact_routing_factor = 0.75
+    section_v = compact_routing_factor * (2.0 * length + 0.0325 * length * width + 6.0)
+    section_s = compact_routing_factor * (0.025 * length * width * floor_height * n_floors)
+    section_a = compact_routing_factor * (0.55 * length * width * n_floors)
+    ambient_v = 13.0 if service == "heating" else 26.0
+    ambient_zone = 20.0 if service == "heating" else 26.0
+    max_length = length + width + floor_height * n_floors + 10.0
+    return (
+        [
+            {
+                "name": "V base distributor",
+                "length_m": section_v,
+                "linear_thermal_transmittance_W_mK": psi_v,
+                "ambient_temperature_C": ambient_v,
+                "recoverable": False,
+            },
+            {
+                "name": "S vertical shafts",
+                "length_m": section_s,
+                "linear_thermal_transmittance_W_mK": psi_s,
+                "ambient_temperature_C": ambient_zone,
+                "recoverable": True,
+            },
+            {
+                "name": "A connection pipes",
+                "length_m": section_a,
+                "linear_thermal_transmittance_W_mK": psi_a,
+                "ambient_temperature_C": ambient_zone,
+                "recoverable": True,
+            },
+        ],
+        max_length,
+    )
+
+
+def _dhw_distribution_sections(scenario: str, building: dict) -> tuple[list[dict], float]:
+    """Build compact DHW distribution sections from EN 15316-3 Annex B."""
+
+    length, width, floor_height, n_floors = _distribution_geometry(building)
+    psi_v, psi_s, psi_a = _pipe_psi_by_scenario(scenario)
+    circulation_fraction = 0.25
+    section_v = circulation_fraction * (2.0 * length + 0.0125 * length * width)
+    section_s = circulation_fraction * (0.075 * length * width * n_floors * floor_height)
+    section_a = 0.075 * length * width * n_floors
+    max_length = length + floor_height * n_floors + 2.5
+    return (
+        [
+            {
+                "name": "V compact DHW loop",
+                "length_m": section_v,
+                "linear_thermal_transmittance_W_mK": psi_v,
+                "ambient_temperature_C": 13.0,
+                "recoverable": False,
+            },
+            {
+                "name": "S compact DHW shaft",
+                "length_m": section_s,
+                "linear_thermal_transmittance_W_mK": psi_s,
+                "ambient_temperature_C": 20.0,
+                "recoverable": True,
+            },
+            {
+                "name": "A DHW branch pipes",
+                "length_m": section_a,
+                "linear_thermal_transmittance_W_mK": psi_a,
+                "ambient_temperature_C": 20.0,
+                "recoverable": True,
+            },
+        ],
+        max_length,
+    )
+
+
+def distribution_system_config(scenario: str, building: dict) -> dict:
+    """Scenario-specific EN 15316-3 distribution assumptions."""
+
+    heating_sections, heating_max_length = _space_distribution_sections(
+        scenario,
+        building,
+        service="heating",
+    )
+    cooling_sections, cooling_max_length = _space_distribution_sections(
+        scenario,
+        building,
+        service="cooling",
+    )
+    dhw_sections, dhw_max_length = _dhw_distribution_sections(scenario, building)
+
+    config = {
+        "demand_unit": "kWh",
+        "heating": {
+            "pipe_sections": heating_sections,
+            "supply_temperature_C": 45.0,
+            "return_temperature_C": 35.0,
+            "design_deltaT_K": 10.0,
+            "nominal_power_kW": 10.0,
+            "max_length_m": heating_max_length,
+            "pressure_loss_per_m_kPa": 0.10,
+            "additional_pressure_kPa": 6.0,
+            "resistance_ratio": 0.30,
+            "pump_control_code": 4,
+            "eei": 0.23,
+            "recoverable_aux_fraction": 0.25,
+        },
+        "cooling": {
+            "pipe_sections": cooling_sections,
+            "supply_temperature_C": 7.0,
+            "return_temperature_C": 12.0,
+            "design_deltaT_K": 5.0,
+            "nominal_power_kW": 8.0,
+            "max_length_m": cooling_max_length,
+            "pressure_loss_per_m_kPa": 0.10,
+            "additional_pressure_kPa": 6.0,
+            "resistance_ratio": 0.30,
+            "pump_control_code": 3,
+            "eei": 0.23,
+            "recoverable_aux_fraction": 0.25,
+        },
+        "dhw": {
+            "pipe_sections": dhw_sections,
+            "dhw_temperature_C": 55.0,
+            "dhw_return_deltaT_K": 5.0,
+            "design_flow_m3_h": 0.12,
+            "max_length_m": dhw_max_length,
+            "pressure_loss_per_m_kPa": 0.10,
+            "additional_pressure_kPa": 6.0,
+            "resistance_ratio": 0.30,
+            "pump_control_code": 3,
+            "pump_label_power_kW": 0.020,
+            "part_load_mode": "constant_when_on",
+            "recoverable_aux_fraction": 0.25,
+        },
+    }
+
+    if scenario == "bolzano":
+        config["heating"]["nominal_power_kW"] = 11.0
+        config["cooling"]["nominal_power_kW"] = 6.5
+        config["dhw"]["dhw_temperature_C"] = 55.0
+
+    return config
+
+
 def prepare_heat_pump_loads(hourly_sim: pd.DataFrame, dhw_kWh: pd.Series) -> pd.DataFrame:
     """Convert ISO52016 Wh outputs to the heat-pump module kWh inputs."""
 
@@ -926,6 +1102,141 @@ def plot_emission_monthly(
     return _write_plot(fig, output_dir / "visuals" / "03_emission_15316_2_monthly.html")
 
 
+def plot_distribution_timeseries(
+    distribution: pybui.DistributionSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = distribution.timeseries
+    daily = hourly[
+        [
+            "Q_H_dis_out_kWh",
+            "Q_H_dis_ls_kWh",
+            "Q_H_dis_in_kWh",
+            "Q_C_dis_out_kWh",
+            "Q_C_dis_ls_kWh",
+            "Q_C_dis_in_kWh",
+            "Q_W_dis_out_kWh",
+            "Q_W_dis_ls_kWh",
+            "Q_W_dis_in_kWh",
+            "W_H_dis_aux_kWh",
+            "W_C_dis_aux_kWh",
+            "W_W_dis_aux_kWh",
+        ]
+    ].resample("D").sum()
+    temps = hourly[
+        ["theta_H_dis_mean_C", "theta_C_dis_mean_C", "theta_W_dis_mean_C"]
+    ].resample("D").mean()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily distribution output and generator-side input loads",
+            "Daily distribution thermal losses and pump electricity",
+            "Daily mean distribution water temperatures",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_dis_out_kWh", "Heating downstream output", "#b23b3b"),
+        ("Q_H_dis_in_kWh", "Heating generator-side input", "#7f1d1d"),
+        ("Q_C_dis_out_kWh", "Cooling downstream output", "#2f78b7"),
+        ("Q_C_dis_in_kWh", "Cooling generator-side input", "#1f4e79"),
+        ("Q_W_dis_out_kWh", "DHW downstream output", "#e09f3e"),
+        ("Q_W_dis_in_kWh", "DHW generator-side input", "#9c6500"),
+    ]:
+        fig.add_trace(go.Scatter(x=daily.index, y=daily[col], mode="lines", name=name, line=dict(color=color)), row=1, col=1)
+
+    for col, name, color in [
+        ("Q_H_dis_ls_kWh", "Heating pipe losses", "#d65f5f"),
+        ("Q_C_dis_ls_kWh", "Cooling pipe gains", "#6fa8dc"),
+        ("Q_W_dis_ls_kWh", "DHW pipe losses", "#f2bf6d"),
+        ("W_H_dis_aux_kWh", "Heating pump electricity", "#808080"),
+        ("W_C_dis_aux_kWh", "Cooling pump electricity", "#5b9bd5"),
+        ("W_W_dis_aux_kWh", "DHW pump electricity", "#b7b7b7"),
+    ]:
+        fig.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=2, col=1)
+
+    for col, name, color in [
+        ("theta_H_dis_mean_C", "Heating water", "#b23b3b"),
+        ("theta_C_dis_mean_C", "Cooling water", "#2f78b7"),
+        ("theta_W_dis_mean_C", "DHW water", "#e09f3e"),
+    ]:
+        fig.add_trace(go.Scatter(x=temps.index, y=temps[col], mode="lines", name=name, line=dict(color=color)), row=3, col=1)
+
+    fig.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/day", row=2, col=1)
+    fig.update_yaxes(title_text="degC", row=3, col=1)
+    fig.update_layout(title="EN 15316-3 Distribution System Time Series")
+    return _write_plot(fig, output_dir / "visuals" / "04_distribution_15316_3_timeseries.html")
+
+
+def plot_distribution_monthly(
+    distribution: pybui.DistributionSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = distribution.timeseries
+    monthly = hourly[
+        [
+            "Q_H_dis_out_kWh",
+            "Q_H_dis_ls_kWh",
+            "Q_H_dis_in_kWh",
+            "Q_C_dis_out_kWh",
+            "Q_C_dis_ls_kWh",
+            "Q_C_dis_in_kWh",
+            "Q_W_dis_out_kWh",
+            "Q_W_dis_ls_kWh",
+            "Q_W_dis_in_kWh",
+            "W_H_dis_aux_kWh",
+            "W_C_dis_aux_kWh",
+            "W_W_dis_aux_kWh",
+        ]
+    ].resample("ME").sum()
+    monthly["e_H_dis"] = monthly["Q_H_dis_in_kWh"] / monthly["Q_H_dis_out_kWh"].replace(0, np.nan)
+    monthly["e_C_dis"] = monthly["Q_C_dis_in_kWh"] / monthly["Q_C_dis_out_kWh"].replace(0, np.nan)
+    monthly["e_W_dis"] = monthly["Q_W_dis_in_kWh"] / monthly["Q_W_dis_out_kWh"].replace(0, np.nan)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=[
+            "Monthly EN 15316-3 distribution balance",
+            "Monthly distribution expenditure factors",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_dis_out_kWh", "Heating downstream output", "#b23b3b"),
+        ("Q_H_dis_ls_kWh", "Heating pipe losses", "#d65f5f"),
+        ("Q_C_dis_out_kWh", "Cooling downstream output", "#2f78b7"),
+        ("Q_C_dis_ls_kWh", "Cooling pipe gains", "#6fa8dc"),
+        ("Q_W_dis_out_kWh", "DHW downstream output", "#e09f3e"),
+        ("Q_W_dis_ls_kWh", "DHW pipe losses", "#f2bf6d"),
+        ("W_H_dis_aux_kWh", "Heating pump electricity", "#808080"),
+        ("W_C_dis_aux_kWh", "Cooling pump electricity", "#5b9bd5"),
+        ("W_W_dis_aux_kWh", "DHW pump electricity", "#b7b7b7"),
+    ]:
+        fig.add_trace(go.Bar(x=monthly.index, y=monthly[col], name=name, marker_color=color), row=1, col=1)
+
+    for col, name, color in [
+        ("e_H_dis", "Heating distribution factor", "#7f1d1d"),
+        ("e_C_dis", "Cooling distribution factor", "#2f78b7"),
+        ("e_W_dis", "DHW distribution factor", "#9c6500"),
+    ]:
+        fig.add_trace(
+            go.Scatter(x=monthly.index, y=monthly[col], mode="lines+markers", name=name, line=dict(color=color)),
+            row=2,
+            col=1,
+        )
+
+    fig.update_yaxes(title_text="kWh/month", row=1, col=1)
+    fig.update_yaxes(title_text="ratio", row=2, col=1)
+    fig.update_layout(title="Monthly EN 15316-3 Distribution Summary", barmode="relative")
+    return _write_plot(fig, output_dir / "visuals" / "05_distribution_15316_3_monthly.html")
+
+
 def plot_heat_pump_hourly(allocated: pd.DataFrame, output_dir: Path) -> Path:
     daily = allocated[
         [
@@ -1196,6 +1507,7 @@ def create_inspection_index(
     plot_paths: list[Path],
     iso_report: Path | None,
     emission_summary: dict[str, float] | None = None,
+    distribution_summary: dict[str, float] | None = None,
 ) -> Path:
     cards = {
         "Heating demand": summary.get("QH_gen_out_kWh", 0.0),
@@ -1214,6 +1526,14 @@ def create_inspection_index(
                 "EN 15316-2 auxiliaries": emission_summary.get("W_em_aux_kWh", 0.0),
             }
         )
+    if distribution_summary:
+        cards.update(
+            {
+                "EN 15316-3 pipe losses": distribution_summary.get("Q_dis_ls_kWh", 0.0),
+                "EN 15316-3 pump electricity": distribution_summary.get("W_dis_aux_kWh", 0.0),
+                "EN 15316-3 DHW losses": distribution_summary.get("QW_dis_ls_kWh", 0.0),
+            }
+        )
     list_items = []
     if iso_report is not None:
         list_items.append(f'<li><a href="{html.escape(str(iso_report.relative_to(output_dir)))}">ISO52016 existing building report</a></li>')
@@ -1226,11 +1546,19 @@ def create_inspection_index(
         if value is not None and np.isfinite(value)
     )
     page_title = (
-        "EN 15316-2 and EN 15316-4-2 Inspection"
+        "EN 15316-2, EN 15316-3 and EN 15316-4-2 Inspection"
+        if distribution_summary
+        else "EN 15316-2 and EN 15316-4-2 Inspection"
         if emission_summary
         else "Heat Pump EN 15316-4-2 Inspection"
     )
     page_intro = (
+        "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
+        "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
+        "DHW profile, heat-pump bin method, electricity use, backup energy, losses "
+        "and seasonal performance."
+        if distribution_summary
+        else
         "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
         "emission effects, DHW profile, heat-pump bin method, electricity use, "
         "backup energy, losses and seasonal performance."
@@ -1274,13 +1602,16 @@ def create_visual_outputs(
     output_dir: Path,
     building_area: float,
     emission_result: pybui.EmissionSimulationResult | None = None,
+    distribution_result: pybui.DistributionSimulationResult | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
     allocated.to_csv(output_dir / "heat_pump_hourly_allocated_results.csv")
 
     input_title = (
-        "Space Emission Loads and DHW Inputs Sent to the Heat Pump"
+        "Distribution-Adjusted Loads and DHW Inputs Sent to the Heat Pump"
+        if distribution_result is not None
+        else "Space Emission Loads and DHW Inputs Sent to the Heat Pump"
         if emission_result is not None
         else "ISO52016 and DHW Inputs Sent to the Heat Pump"
     )
@@ -1290,6 +1621,13 @@ def create_visual_outputs(
             [
                 plot_emission_timeseries(emission_result, output_dir),
                 plot_emission_monthly(emission_result, output_dir),
+            ]
+        )
+    if distribution_result is not None:
+        plot_paths.extend(
+            [
+                plot_distribution_timeseries(distribution_result, output_dir),
+                plot_distribution_monthly(distribution_result, output_dir),
             ]
         )
     plot_paths.extend(
@@ -1302,23 +1640,42 @@ def create_visual_outputs(
         ]
     )
     emission_summary = emission_result.summary if emission_result is not None else None
+    distribution_summary = (
+        distribution_result.summary if distribution_result is not None else None
+    )
     return create_inspection_index(
         output_dir,
         result.summary,
         plot_paths,
         iso_report,
         emission_summary=emission_summary,
+        distribution_summary=distribution_summary,
     )
+
+
+def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str]:
+    if args.calculation_path == "full":
+        return "en15316-2", "en15316-3"
+    if args.calculation_path == "emission-only":
+        return "en15316-2", "simple"
+    if args.calculation_path == "simple":
+        return "simple", "simple"
+
+    emission_method = args.emission_method or "en15316-2"
+    distribution_method = args.distribution_method
+    if distribution_method is None:
+        distribution_method = "simple" if emission_method == "simple" else "en15316-3"
+    return emission_method, distribution_method
 
 
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
-    emission_method = args.emission_method
+    emission_method, distribution_method = resolve_system_methods(args)
     building = example_building(scenario)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else default_output_dir(scenario, emission_method)
+        else default_output_dir(scenario, emission_method, distribution_method)
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1353,6 +1710,27 @@ def run_example(args: argparse.Namespace) -> None:
     elif emission_method != "simple":
         raise ValueError("--emission-method must be 'en15316-2' or 'simple'.")
 
+    distribution_result = None
+    if distribution_method == "en15316-3":
+        distribution_calc = pybui.DistributionSystemCalculator(
+            distribution_system_config(scenario, building)
+        )
+        distribution_result = distribution_calc.run_timeseries(loads)
+        loads["Q_H_distribution_out_kWh"] = distribution_result.timeseries["Q_H_dis_out_kWh"]
+        loads["Q_C_distribution_out_kWh"] = distribution_result.timeseries["Q_C_dis_out_kWh"]
+        loads["Q_W_distribution_out_kWh"] = distribution_result.timeseries["Q_W_dis_out_kWh"]
+        loads["Q_H_dis_loss_kWh"] = distribution_result.timeseries["Q_H_dis_ls_kWh"]
+        loads["Q_C_dis_loss_kWh"] = distribution_result.timeseries["Q_C_dis_ls_kWh"]
+        loads["Q_W_dis_loss_kWh"] = distribution_result.timeseries["Q_W_dis_ls_kWh"]
+        loads["W_H_dis_aux_kWh"] = distribution_result.timeseries["W_H_dis_aux_kWh"]
+        loads["W_C_dis_aux_kWh"] = distribution_result.timeseries["W_C_dis_aux_kWh"]
+        loads["W_W_dis_aux_kWh"] = distribution_result.timeseries["W_W_dis_aux_kWh"]
+        loads["Q_H_kWh"] = distribution_result.timeseries["Q_H_dis_in_kWh"]
+        loads["Q_C_kWh"] = distribution_result.timeseries["Q_C_dis_in_kWh"]
+        loads["Q_W_kWh"] = distribution_result.timeseries["Q_W_dis_in_kWh"]
+    elif distribution_method != "simple":
+        raise ValueError("--distribution-method must be 'en15316-3' or 'simple'.")
+
     ensure_heating_and_cooling(loads)
 
     heating_map, cooling_map = heat_pump_maps(scenario)
@@ -1368,6 +1746,14 @@ def run_example(args: argparse.Namespace) -> None:
             output_dir / "emission_15316_2_summary.csv",
             index=False,
         )
+    if distribution_result is not None:
+        distribution_result.timeseries.to_csv(
+            output_dir / "distribution_15316_3_hourly_results.csv"
+        )
+        pd.DataFrame([distribution_result.summary]).to_csv(
+            output_dir / "distribution_15316_3_summary.csv",
+            index=False,
+        )
     result.bins.to_csv(output_dir / "heat_pump_bin_results.csv", index=False)
     pd.DataFrame([result.summary]).to_csv(output_dir / "heat_pump_summary.csv", index=False)
     inspection_index = create_visual_outputs(
@@ -1377,10 +1763,12 @@ def run_example(args: argparse.Namespace) -> None:
         output_dir=output_dir,
         building_area=float(building["building"]["net_floor_area"]),
         emission_result=emission_result,
+        distribution_result=distribution_result,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
     print(f"Emission calculation mode: {emission_method}")
+    print(f"Distribution calculation mode: {distribution_method}")
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
     if emission_result is not None:
@@ -1394,6 +1782,11 @@ def run_example(args: argparse.Namespace) -> None:
     else:
         print(f"Space heating demand: {loads['Q_H_kWh'].sum():,.1f} kWh")
         print(f"Space cooling demand: {loads['Q_C_kWh'].sum():,.1f} kWh")
+    if distribution_result is not None:
+        print(f"EN 15316-3 heating distribution losses: {distribution_result.summary['QH_dis_ls_kWh']:,.1f} kWh")
+        print(f"EN 15316-3 cooling distribution losses: {distribution_result.summary['QC_dis_ls_kWh']:,.1f} kWh")
+        print(f"EN 15316-3 DHW distribution losses: {distribution_result.summary['QW_dis_ls_kWh']:,.1f} kWh")
+        print(f"EN 15316-3 distribution pump auxiliaries: {distribution_result.summary['W_dis_aux_kWh']:,.1f} kWh")
     print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
     print(f"Heating+DHW electricity incl. backup: {result.summary['EHW_gen_in_kWh']:,.1f} kWh")
     print(f"Heating+DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
@@ -1427,13 +1820,36 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
         help="Workalendar country name for the DHW profile. Default: scenario-specific.",
     )
     parser.add_argument(
+        "--calculation-path",
+        choices=["full", "emission-only", "simple"],
+        default=None,
+        help=(
+            "Shortcut for the subsystem chain. 'full' applies EN 15316-2 and "
+            "EN 15316-3 before heat-pump generation; 'emission-only' applies "
+            "EN 15316-2 but bypasses distribution; 'simple' uses the direct "
+            "ISO52016/DHW loads. Default: full."
+        ),
+    )
+    parser.add_argument(
         "--emission-method",
         choices=["en15316-2", "simple"],
-        default="en15316-2",
+        default=None,
         help=(
             "Space-emission calculation mode. 'en15316-2' applies emitter/control "
             "effects before heat-pump generation; 'simple' uses the direct ISO52016 "
-            "loads as in the earlier example. Default: en15316-2."
+            "loads as in the earlier example. Default: en15316-2 unless "
+            "--calculation-path is set."
+        ),
+    )
+    parser.add_argument(
+        "--distribution-method",
+        choices=["en15316-3", "simple"],
+        default=None,
+        help=(
+            "Water-based distribution calculation mode. 'en15316-3' applies pipe "
+            "losses and pump auxiliaries before heat-pump generation; 'simple' "
+            "bypasses distribution. Default: en15316-3 unless --emission-method "
+            "simple or --calculation-path is set."
         ),
     )
     parser.add_argument(
@@ -1441,8 +1857,8 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
         default=None,
         help=(
             "Folder where CSV and visual outputs are written. "
-            "Default: examples/outputs/heat_pump_15316_4_2_<scenario>; simple "
-            "mode adds a _simple suffix."
+            "Default: examples/outputs/heat_pump_15316_4_2_<scenario>; simplified "
+            "paths add descriptive suffixes."
         ),
     )
     return parser.parse_args()

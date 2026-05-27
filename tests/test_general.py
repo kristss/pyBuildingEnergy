@@ -408,6 +408,88 @@ def test_emission_system_calculator_heating_cooling_effects():
     assert pybui.EmissionSystemCalculator is not None
 
 
+def test_distribution_system_calculator_heating_cooling_dhw():
+    """Test EN 15316-3 distribution losses and pump auxiliaries."""
+    import pybuildingenergy as pybui
+
+    loads = pd.DataFrame(
+        {
+            "T_ext": [-5.0, 0.0, 30.0, 34.0],
+            "T_op": [20.0, 20.0, 26.0, 26.0],
+            "Q_H_kWh": [4.0, 2.0, 0.0, 0.0],
+            "Q_C_kWh": [0.0, 0.0, 2.0, 3.0],
+            "Q_W_kWh": [0.5, 0.5, 0.5, 0.5],
+            "theta_H_dis_supply_C": [50.0, 50.0, 50.0, 50.0],
+            "theta_H_dis_return_C": [40.0, 40.0, 40.0, 40.0],
+            "theta_C_dis_supply_C": [8.0, 8.0, 8.0, 8.0],
+            "theta_C_dis_return_C": [14.0, 14.0, 14.0, 14.0],
+            "theta_W_dis_hot_C": [58.0, 58.0, 58.0, 58.0],
+        },
+        index=pd.date_range("2026-01-01", periods=4, freq="h"),
+    )
+
+    common_section = {
+        "length_m": 20.0,
+        "equivalent_length_m": 0.0,
+        "linear_thermal_transmittance_W_mK": 0.30,
+        "ambient_temperature_C": 20.0,
+        "recoverable": True,
+    }
+    calc = pybui.DistributionSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "heating": {
+                "pipe_sections": [common_section],
+                "supply_temperature_C": 45.0,
+                "return_temperature_C": 35.0,
+                "nominal_power_kW": 8.0,
+                "design_flow_m3_h": 0.7,
+                "design_delta_pressure_kPa": 20.0,
+                "pump_control_code": 4,
+                "eei": 0.23,
+            },
+            "cooling": {
+                "pipe_sections": [{**common_section, "ambient_temperature_C": 26.0}],
+                "supply_temperature_C": 7.0,
+                "return_temperature_C": 12.0,
+                "nominal_power_kW": 6.0,
+                "design_flow_m3_h": 0.8,
+                "design_delta_pressure_kPa": 20.0,
+                "pump_control_code": 3,
+                "eei": 0.23,
+            },
+            "dhw": {
+                "pipe_sections": [common_section],
+                "dhw_temperature_C": 55.0,
+                "dhw_return_deltaT_K": 5.0,
+                "design_flow_m3_h": 0.12,
+                "design_delta_pressure_kPa": 15.0,
+                "pump_control_code": 3,
+                "pump_label_power_kW": 0.02,
+                "part_load_mode": "constant_when_on",
+            },
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.summary["QH_dis_ls_kWh"] > 0
+    assert result.summary["QC_dis_ls_kWh"] > 0
+    assert result.summary["QW_dis_ls_kWh"] > 0
+    assert result.summary["WH_dis_aux_kWh"] > 0
+    assert result.summary["WC_dis_aux_kWh"] > 0
+    assert result.summary["WW_dis_aux_kWh"] > 0
+    assert result.summary["QH_dis_in_kWh"] > loads["Q_H_kWh"].sum()
+    assert result.summary["QC_dis_in_kWh"] > loads["Q_C_kWh"].sum()
+    assert result.summary["QW_dis_in_kWh"] > loads["Q_W_kWh"].sum()
+    assert result.summary["QH_dis_rbl_kWh"] > 0
+    assert result.summary["QC_dis_rbl_kWh"] < 0
+    assert result.timeseries["theta_H_dis_mean_C"].iloc[0] == pytest.approx(45.0)
+    assert result.timeseries["theta_C_dis_mean_C"].iloc[0] == pytest.approx(11.0)
+    assert result.timeseries["theta_W_dis_mean_C"].iloc[0] == pytest.approx(55.5)
+    assert pybui.DistributionSystemCalculator is not None
+
+
 @pytest.mark.parametrize("fix", [True, False])
 def test_sanitize_and_validate_bui(building_data, fix):
     """Test per la validazione dei dati dell'edificio"""
