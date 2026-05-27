@@ -6,6 +6,7 @@ from .source.graphs import Graphs_and_report
 from .source.iso_15316_1 import HeatingSystemCalculator
 from .source.emission_15316_2 import EmissionSimulationResult, EmissionSystemCalculator
 from .source.distribution_15316_3 import DistributionSimulationResult, DistributionSystemCalculator
+from .source.storage_15316_5 import StorageSimulationResult, StorageSystemCalculator
 from .source.heat_pump_15316_4_2 import HeatPumpSimulationResult, HeatPumpSystemCalculator
 from .source.check_input import check_heating_system_inputs
 from .source.generate_profile import HourlyProfileGenerator, get_country_code_from_latlon
@@ -27,6 +28,8 @@ __all__ = [
     "EmissionSystemCalculator",
     "DistributionSimulationResult",
     "DistributionSystemCalculator",
+    "StorageSimulationResult",
+    "StorageSystemCalculator",
     "HeatPumpSimulationResult",
     "HeatPumpSystemCalculator",
     "Graphs_and_report",

@@ -70,6 +70,17 @@ heat and recovered pump heat in the fluid before the generator calculation.
 For the audit trail, open
 [Distribution EN 15316-3 Implementation Audit](docs/distribution_15316_3_audit.html).
 
+## Heating And DHW Storage Systems - EN 15316-5 **(New)**
+
+`StorageSystemCalculator` evaluates single-volume Method B storage systems for
+space heating and DHW. It calculates storage standing losses from product
+standby-loss data or a direct heat-loss coefficient, storage charging pump
+auxiliary electricity, recoverable storage losses and heat recovered in the
+medium before the generator calculation.
+
+For the audit trail, open
+[Storage EN 15316-5 Implementation Audit](docs/storage_15316_5_audit.html).
+
 ## Heat Pump Generation - EN 15316-4-2 **(New)**
 
 `HeatPumpSystemCalculator` evaluates a reversible heat-pump generator for:
@@ -78,7 +89,7 @@ For the audit trail, open
 - domestic hot water (DHW),
 - and space cooling with a reversible EER map.
 
-The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, storage losses, backup energy and SPF outputs. Cooling is reported separately with the same bin/product-map approach using EER values.
+The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, optional simplified storage losses, backup energy and SPF outputs. Cooling is reported separately with the same bin/product-map approach using EER values.
 
 For a clause-by-clause audit trail between the standard, the implementation and the output files, open [Heat Pump EN 15316-4-2 Implementation Audit](docs/heat_pump_15316_4_2_audit.html).
 
@@ -141,13 +152,15 @@ python examples/heat_pump_15316_4_2_bolzano_example.py
 
 The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed top-floor envelope and an air-to-water heat-pump map sized for a 120 m2 residential building.
 
-Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects and EN 15316-3 distribution effects by default, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
+Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects and EN 15316-5 heating/DHW storage effects by default, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
 
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_hourly_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_hourly_allocated_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_bin_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_summary.csv`
@@ -159,6 +172,7 @@ Open `inspection_index.html` in a browser to inspect the visual outputs. The pag
 - daily input time series for heating, cooling, DHW and temperatures;
 - EN 15316-2 emission time series and monthly aggregate plots;
 - EN 15316-3 distribution time series and monthly aggregate plots;
+- EN 15316-5 storage time series and monthly aggregate plots;
 - allocated heat-pump electricity time series;
 - monthly demand, electricity, SPF and SEER summaries;
 - bin-method energy balance plots;
@@ -172,14 +186,28 @@ python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-p
 python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path full
 ```
 
-To run EN 15316-2 emission effects but bypass EN 15316-3 distribution, use:
+To run the previous detailed path with EN 15316-2 and EN 15316-3 but without EN 15316-5 storage, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path emission-distribution
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path emission-distribution
+```
+
+To run only EN 15316-5 storage between direct ISO52016/DHW loads and the heat pump, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path storage-only
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path storage-only
+```
+
+To run EN 15316-2 emission effects but bypass EN 15316-3 distribution and EN 15316-5 storage, use:
 
 ```bash
 python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path emission-only
 python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path emission-only
 ```
 
-To reproduce the earlier simple calculation without EN 15316-2 or EN 15316-3 effects, use:
+To reproduce the earlier simple calculation without EN 15316-2, EN 15316-3 or EN 15316-5 effects, use:
 
 ```bash
 python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path simple
@@ -208,12 +236,12 @@ The EN 15316 series covers the calculation method for system energy requirements
 - [x] EN 15316-3: Distribution systems (DHW, heating, cooling)
 - [ ] EN 15316-4-X: Heat generation systems:
   - 4-1: Combustion boilers
-  - 4-2: Heat pumps
+  - [x] 4-2: Heat pumps
   - 4-3: Solar thermal and photovoltaic systems
   - 4-4: Cogeneration systems
   - 4-5: District heating
   - 4-7: Biomass
-- [ ] EN 15316-5: Storage systems
+- [x] EN 15316-5: Storage systems
 
 For space heating, applicable standards include EN 15316-1, EN 15316-2-1, EN 15316-2-3 and the appropriate parts of EN 15316-4 depending on the system type, including losses and control aspects.
 

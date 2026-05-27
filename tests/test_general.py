@@ -490,6 +490,65 @@ def test_distribution_system_calculator_heating_cooling_dhw():
     assert pybui.DistributionSystemCalculator is not None
 
 
+def test_storage_system_calculator_heating_dhw():
+    """Test EN 15316-5 storage losses and pump auxiliaries."""
+    import pybuildingenergy as pybui
+
+    loads = pd.DataFrame(
+        {
+            "T_ext": [-5.0, 0.0, 12.0, 14.0],
+            "Q_H_kWh": [4.0, 2.0, 0.0, 0.0],
+            "Q_W_kWh": [0.5, 0.5, 0.5, 0.5],
+            "theta_H_sto_set_C": [45.0, 45.0, 45.0, 45.0],
+            "theta_W_sto_set_C": [55.0, 55.0, 55.0, 55.0],
+            "storage_ambient_temperature_C": [20.0, 20.0, 20.0, 20.0],
+        },
+        index=pd.date_range("2026-01-01", periods=4, freq="h"),
+    )
+
+    calc = pybui.StorageSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "heating": {
+                "storage_volume_l": 80.0,
+                "standby_loss_coefficient_W_K": 2.0,
+                "set_temperature_C": 45.0,
+                "ambient_temperature_C": 20.0,
+                "input_pump_power_kW": 0.03,
+                "input_pump_flow_m3_h": 0.7,
+                "input_pump_deltaT_K": 10.0,
+                "thermal_loss_room_fraction": 0.75,
+                "auxiliary_to_medium_fraction": 0.25,
+            },
+            "dhw": {
+                "storage_volume_l": 180.0,
+                "standby_loss_kWh_per_day_ref": 0.84,
+                "standby_set_temperature_ref_C": 55.0,
+                "standby_ambient_temperature_ref_C": 20.0,
+                "set_temperature_C": 55.0,
+                "ambient_temperature_C": 20.0,
+                "input_pump_power_kW": 0.025,
+                "input_pump_flow_m3_h": 0.4,
+                "input_pump_deltaT_K": 5.0,
+            },
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.summary["QH_sto_ls_kWh"] == pytest.approx(0.2)
+    assert result.summary["QW_sto_ls_kWh"] == pytest.approx(0.14)
+    assert result.summary["WH_sto_aux_kWh"] > 0
+    assert result.summary["WW_sto_aux_kWh"] > 0
+    assert result.summary["QH_sto_in_kWh"] > loads["Q_H_kWh"].sum()
+    assert result.summary["QW_sto_in_kWh"] > loads["Q_W_kWh"].sum()
+    assert result.summary["QH_sto_ls_rbl_kWh"] == pytest.approx(0.15)
+    assert result.summary["QH_sto_ls_nrbl_kWh"] == pytest.approx(0.05)
+    assert result.timeseries["theta_H_sto_set_C"].iloc[0] == pytest.approx(45.0)
+    assert result.timeseries["theta_W_sto_set_C"].iloc[0] == pytest.approx(55.0)
+    assert pybui.StorageSystemCalculator is not None
+
+
 @pytest.mark.parametrize("fix", [True, False])
 def test_sanitize_and_validate_bui(building_data, fix):
     """Test per la validazione dei dati dell'edificio"""

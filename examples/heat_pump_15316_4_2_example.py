@@ -6,8 +6,9 @@ This script demonstrates the complete sequence:
 2. Apply EN 15316-2 emitter/control effects and emission losses.
 3. Calculate a meaningful hourly DHW need with the DHW module.
 4. Apply EN 15316-3 water-based distribution losses and pump auxiliaries.
-5. Run the EN 15316-4-2 heat-pump bin calculation.
-6. Save the intermediate loads, bin balance and summary outputs.
+5. Apply EN 15316-5 heating/DHW storage losses and auxiliaries.
+6. Run the EN 15316-4-2 heat-pump bin calculation.
+7. Save the intermediate loads, bin balance and summary outputs.
 
 Default weather uses PVGIS for the selected scenario. If network access is not
 available, run with ``--weather-source epw --path-weather-file path/to/weather.epw``.
@@ -53,14 +54,51 @@ def default_output_dir(
     scenario: str,
     emission_method: str = "en15316-2",
     distribution_method: str = "en15316-3",
+    storage_method: str = "en15316-5",
 ) -> Path:
     suffix = f"heat_pump_15316_4_2_{scenario}"
-    if emission_method == "simple" and distribution_method == "simple":
+    if (
+        emission_method == "simple"
+        and distribution_method == "simple"
+        and storage_method == "simple"
+    ):
         suffix = f"{suffix}_simple"
-    elif emission_method == "en15316-2" and distribution_method == "simple":
+    elif (
+        emission_method == "en15316-2"
+        and distribution_method == "simple"
+        and storage_method == "simple"
+    ):
         suffix = f"{suffix}_emission_only"
-    elif emission_method == "simple" and distribution_method == "en15316-3":
+    elif (
+        emission_method == "en15316-2"
+        and distribution_method == "en15316-3"
+        and storage_method == "simple"
+    ):
+        suffix = f"{suffix}_emission_distribution"
+    elif (
+        emission_method == "en15316-2"
+        and distribution_method == "simple"
+        and storage_method == "en15316-5"
+    ):
+        suffix = f"{suffix}_emission_storage"
+    elif (
+        emission_method == "simple"
+        and distribution_method == "en15316-3"
+        and storage_method == "simple"
+    ):
         suffix = f"{suffix}_distribution_only"
+    elif (
+        emission_method == "simple"
+        and distribution_method == "simple"
+        and storage_method == "en15316-5"
+    ):
+        suffix = f"{suffix}_storage_only"
+    elif (
+        emission_method == "simple"
+        and distribution_method == "en15316-3"
+        and storage_method == "en15316-5"
+    ):
+        suffix = f"{suffix}_distribution_storage"
     return REPO_ROOT / "examples" / "outputs" / suffix
 
 
@@ -448,6 +486,7 @@ def heat_pump_config(
     scenario: str,
     heating_map: pd.DataFrame,
     cooling_map: pd.DataFrame,
+    include_internal_storage_losses: bool = True,
 ) -> dict:
     """Scenario-specific generator assumptions for the example heat pump."""
 
@@ -490,6 +529,10 @@ def heat_pump_config(
                 "dhw_storage_loss_kWh_per_day": 0.95,
             }
         )
+
+    if not include_internal_storage_losses:
+        config["heating_storage_loss_kWh_per_day"] = 0.0
+        config["dhw_storage_loss_kWh_per_day"] = 0.0
 
     return config
 
@@ -764,6 +807,64 @@ def distribution_system_config(scenario: str, building: dict) -> dict:
         config["heating"]["nominal_power_kW"] = 11.0
         config["cooling"]["nominal_power_kW"] = 6.5
         config["dhw"]["dhw_temperature_C"] = 55.0
+
+    return config
+
+
+def storage_system_config(scenario: str) -> dict:
+    """Scenario-specific EN 15316-5 storage assumptions.
+
+    The example keeps EN 15316-5 connection losses at 1.0 because pipe and valve
+    losses are already represented explicitly in the EN 15316-3 distribution
+    module. Declared daily standby losses are converted internally to H_sto_ls.
+    """
+
+    config = {
+        "demand_unit": "kWh",
+        "heating": {
+            "storage_volume_l": 80.0,
+            "set_temperature_C": 45.0,
+            "output_temperature_C": 45.0,
+            "ambient_temperature_C": 16.0,
+            "standby_loss_kWh_per_day_ref": 0.15,
+            "standby_set_temperature_ref_C": 45.0,
+            "standby_ambient_temperature_ref_C": 20.0,
+            "connection_loss_factor": 1.0,
+            "standby_loss_adaptation_factor": 1.0,
+            "thermal_loss_room_fraction": 0.75,
+            "auxiliary_to_medium_fraction": 0.25,
+            "input_pump_power_kW": 0.025,
+            "input_pump_flow_m3_h": 0.90,
+            "input_pump_deltaT_K": 10.0,
+        },
+        "dhw": {
+            "storage_volume_l": 180.0,
+            "set_temperature_C": 55.0,
+            "output_temperature_C": 55.0,
+            "ambient_temperature_C": 16.0,
+            "standby_loss_kWh_per_day_ref": 0.90,
+            "standby_set_temperature_ref_C": 55.0,
+            "standby_ambient_temperature_ref_C": 20.0,
+            "connection_loss_factor": 1.0,
+            "standby_loss_adaptation_factor": 1.0,
+            "thermal_loss_room_fraction": 0.75,
+            "auxiliary_to_medium_fraction": 0.25,
+            "input_pump_power_kW": 0.025,
+            "input_pump_flow_m3_h": 0.50,
+            "input_pump_deltaT_K": 5.0,
+        },
+    }
+
+    if scenario == "bolzano":
+        config["heating"].update(
+            {
+                "storage_volume_l": 100.0,
+                "standby_loss_kWh_per_day_ref": 0.20,
+                "input_pump_power_kW": 0.030,
+                "input_pump_flow_m3_h": 1.00,
+            }
+        )
+        config["dhw"]["standby_loss_kWh_per_day_ref"] = 0.95
 
     return config
 
@@ -1237,6 +1338,131 @@ def plot_distribution_monthly(
     return _write_plot(fig, output_dir / "visuals" / "05_distribution_15316_3_monthly.html")
 
 
+def plot_storage_timeseries(
+    storage: pybui.StorageSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = storage.timeseries
+    daily = hourly[
+        [
+            "Q_H_sto_out_kWh",
+            "Q_H_sto_ls_kWh",
+            "Q_H_sto_in_kWh",
+            "Q_W_sto_out_kWh",
+            "Q_W_sto_ls_kWh",
+            "Q_W_sto_in_kWh",
+            "W_H_sto_aux_kWh",
+            "W_W_sto_aux_kWh",
+        ]
+    ].resample("D").sum()
+    temps = hourly[
+        ["theta_H_sto_set_C", "theta_W_sto_set_C", "theta_H_sto_amb_C", "theta_W_sto_amb_C"]
+    ].resample("D").mean()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily storage output and generator-side input loads",
+            "Daily storage standing losses and pump electricity",
+            "Daily storage setpoint and ambient temperatures",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_sto_out_kWh", "Heating storage output", "#b23b3b"),
+        ("Q_H_sto_in_kWh", "Heating generator-side input", "#7f1d1d"),
+        ("Q_W_sto_out_kWh", "DHW storage output", "#e09f3e"),
+        ("Q_W_sto_in_kWh", "DHW generator-side input", "#9c6500"),
+    ]:
+        fig.add_trace(go.Scatter(x=daily.index, y=daily[col], mode="lines", name=name, line=dict(color=color)), row=1, col=1)
+
+    for col, name, color in [
+        ("Q_H_sto_ls_kWh", "Heating tank losses", "#d65f5f"),
+        ("Q_W_sto_ls_kWh", "DHW tank losses", "#f2bf6d"),
+        ("W_H_sto_aux_kWh", "Heating storage pump electricity", "#808080"),
+        ("W_W_sto_aux_kWh", "DHW storage pump electricity", "#b7b7b7"),
+    ]:
+        fig.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=2, col=1)
+
+    for col, name, color in [
+        ("theta_H_sto_set_C", "Heating storage setpoint", "#b23b3b"),
+        ("theta_W_sto_set_C", "DHW storage setpoint", "#e09f3e"),
+        ("theta_H_sto_amb_C", "Heating storage ambient", "#7f7f7f"),
+        ("theta_W_sto_amb_C", "DHW storage ambient", "#a6a6a6"),
+    ]:
+        fig.add_trace(go.Scatter(x=temps.index, y=temps[col], mode="lines", name=name, line=dict(color=color)), row=3, col=1)
+
+    fig.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/day", row=2, col=1)
+    fig.update_yaxes(title_text="degC", row=3, col=1)
+    fig.update_layout(title="EN 15316-5 Storage System Time Series")
+    return _write_plot(fig, output_dir / "visuals" / "06_storage_15316_5_timeseries.html")
+
+
+def plot_storage_monthly(
+    storage: pybui.StorageSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = storage.timeseries
+    monthly = hourly[
+        [
+            "Q_H_sto_out_kWh",
+            "Q_H_sto_ls_kWh",
+            "Q_H_sto_ls_rbl_kWh",
+            "Q_H_sto_ls_nrbl_kWh",
+            "Q_H_sto_in_kWh",
+            "Q_W_sto_out_kWh",
+            "Q_W_sto_ls_kWh",
+            "Q_W_sto_ls_rbl_kWh",
+            "Q_W_sto_ls_nrbl_kWh",
+            "Q_W_sto_in_kWh",
+            "W_H_sto_aux_kWh",
+            "W_W_sto_aux_kWh",
+        ]
+    ].resample("ME").sum()
+    monthly["e_H_sto"] = monthly["Q_H_sto_in_kWh"] / monthly["Q_H_sto_out_kWh"].replace(0, np.nan)
+    monthly["e_W_sto"] = monthly["Q_W_sto_in_kWh"] / monthly["Q_W_sto_out_kWh"].replace(0, np.nan)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=[
+            "Monthly EN 15316-5 storage balance",
+            "Monthly storage expenditure factors",
+        ],
+    )
+    for col, name, color in [
+        ("Q_H_sto_out_kWh", "Heating storage output", "#b23b3b"),
+        ("Q_H_sto_ls_rbl_kWh", "Heating recoverable loss", "#d65f5f"),
+        ("Q_H_sto_ls_nrbl_kWh", "Heating non-recoverable loss", "#7f1d1d"),
+        ("Q_W_sto_out_kWh", "DHW storage output", "#e09f3e"),
+        ("Q_W_sto_ls_rbl_kWh", "DHW recoverable loss", "#f2bf6d"),
+        ("Q_W_sto_ls_nrbl_kWh", "DHW non-recoverable loss", "#9c6500"),
+        ("W_H_sto_aux_kWh", "Heating storage pump electricity", "#808080"),
+        ("W_W_sto_aux_kWh", "DHW storage pump electricity", "#b7b7b7"),
+    ]:
+        fig.add_trace(go.Bar(x=monthly.index, y=monthly[col], name=name, marker_color=color), row=1, col=1)
+
+    for col, name, color in [
+        ("e_H_sto", "Heating storage factor", "#7f1d1d"),
+        ("e_W_sto", "DHW storage factor", "#9c6500"),
+    ]:
+        fig.add_trace(
+            go.Scatter(x=monthly.index, y=monthly[col], mode="lines+markers", name=name, line=dict(color=color)),
+            row=2,
+            col=1,
+        )
+
+    fig.update_yaxes(title_text="kWh/month", row=1, col=1)
+    fig.update_yaxes(title_text="ratio", row=2, col=1)
+    fig.update_layout(title="Monthly EN 15316-5 Storage Summary", barmode="relative")
+    return _write_plot(fig, output_dir / "visuals" / "07_storage_15316_5_monthly.html")
+
+
 def plot_heat_pump_hourly(allocated: pd.DataFrame, output_dir: Path) -> Path:
     daily = allocated[
         [
@@ -1508,6 +1734,7 @@ def create_inspection_index(
     iso_report: Path | None,
     emission_summary: dict[str, float] | None = None,
     distribution_summary: dict[str, float] | None = None,
+    storage_summary: dict[str, float] | None = None,
 ) -> Path:
     cards = {
         "Heating demand": summary.get("QH_gen_out_kWh", 0.0),
@@ -1534,6 +1761,14 @@ def create_inspection_index(
                 "EN 15316-3 DHW losses": distribution_summary.get("QW_dis_ls_kWh", 0.0),
             }
         )
+    if storage_summary:
+        cards.update(
+            {
+                "EN 15316-5 storage losses": storage_summary.get("Q_sto_ls_kWh", 0.0),
+                "EN 15316-5 storage pump electricity": storage_summary.get("W_sto_aux_kWh", 0.0),
+                "EN 15316-5 DHW storage losses": storage_summary.get("QW_sto_ls_kWh", 0.0),
+            }
+        )
     list_items = []
     if iso_report is not None:
         list_items.append(f'<li><a href="{html.escape(str(iso_report.relative_to(output_dir)))}">ISO52016 existing building report</a></li>')
@@ -1546,7 +1781,13 @@ def create_inspection_index(
         if value is not None and np.isfinite(value)
     )
     page_title = (
-        "EN 15316-2, EN 15316-3 and EN 15316-4-2 Inspection"
+        "EN 15316-2, EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
+        if storage_summary and distribution_summary and emission_summary
+        else "EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
+        if storage_summary and distribution_summary
+        else "EN 15316-5 and EN 15316-4-2 Inspection"
+        if storage_summary
+        else "EN 15316-2, EN 15316-3 and EN 15316-4-2 Inspection"
         if distribution_summary
         else "EN 15316-2 and EN 15316-4-2 Inspection"
         if emission_summary
@@ -1554,6 +1795,21 @@ def create_inspection_index(
     )
     page_intro = (
         "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
+        "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
+        "EN 15316-5 heating/DHW storage losses and auxiliaries, DHW profile, "
+        "heat-pump bin method, electricity use, backup energy, losses and "
+        "seasonal performance."
+        if storage_summary and distribution_summary and emission_summary
+        else "Open the plots below to inspect the ISO52016 inputs, EN 15316-3 "
+        "distribution losses and pump auxiliaries, EN 15316-5 heating/DHW "
+        "storage losses and auxiliaries, DHW profile, heat-pump bin method, "
+        "electricity use, backup energy, losses and seasonal performance."
+        if storage_summary and distribution_summary
+        else "Open the plots below to inspect the ISO52016 and DHW inputs, "
+        "EN 15316-5 heating/DHW storage losses and auxiliaries, heat-pump bin "
+        "method, electricity use, backup energy, losses and seasonal performance."
+        if storage_summary
+        else "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
         "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
         "DHW profile, heat-pump bin method, electricity use, backup energy, losses "
         "and seasonal performance."
@@ -1603,13 +1859,16 @@ def create_visual_outputs(
     building_area: float,
     emission_result: pybui.EmissionSimulationResult | None = None,
     distribution_result: pybui.DistributionSimulationResult | None = None,
+    storage_result: pybui.StorageSimulationResult | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
     allocated.to_csv(output_dir / "heat_pump_hourly_allocated_results.csv")
 
     input_title = (
-        "Distribution-Adjusted Loads and DHW Inputs Sent to the Heat Pump"
+        "Storage-Adjusted Loads Sent to the Heat Pump"
+        if storage_result is not None
+        else "Distribution-Adjusted Loads and DHW Inputs Sent to the Heat Pump"
         if distribution_result is not None
         else "Space Emission Loads and DHW Inputs Sent to the Heat Pump"
         if emission_result is not None
@@ -1630,6 +1889,13 @@ def create_visual_outputs(
                 plot_distribution_monthly(distribution_result, output_dir),
             ]
         )
+    if storage_result is not None:
+        plot_paths.extend(
+            [
+                plot_storage_timeseries(storage_result, output_dir),
+                plot_storage_monthly(storage_result, output_dir),
+            ]
+        )
     plot_paths.extend(
         [
             plot_heat_pump_hourly(allocated, output_dir),
@@ -1643,6 +1909,7 @@ def create_visual_outputs(
     distribution_summary = (
         distribution_result.summary if distribution_result is not None else None
     )
+    storage_summary = storage_result.summary if storage_result is not None else None
     return create_inspection_index(
         output_dir,
         result.summary,
@@ -1650,32 +1917,48 @@ def create_visual_outputs(
         iso_report,
         emission_summary=emission_summary,
         distribution_summary=distribution_summary,
+        storage_summary=storage_summary,
     )
 
 
-def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str]:
+def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str, str]:
     if args.calculation_path == "full":
-        return "en15316-2", "en15316-3"
+        return "en15316-2", "en15316-3", "en15316-5"
+    if args.calculation_path == "emission-distribution":
+        return "en15316-2", "en15316-3", "simple"
+    if args.calculation_path == "emission-storage":
+        return "en15316-2", "simple", "en15316-5"
+    if args.calculation_path == "distribution-storage":
+        return "simple", "en15316-3", "en15316-5"
+    if args.calculation_path == "storage-only":
+        return "simple", "simple", "en15316-5"
     if args.calculation_path == "emission-only":
-        return "en15316-2", "simple"
+        return "en15316-2", "simple", "simple"
     if args.calculation_path == "simple":
-        return "simple", "simple"
+        return "simple", "simple", "simple"
 
     emission_method = args.emission_method or "en15316-2"
     distribution_method = args.distribution_method
     if distribution_method is None:
         distribution_method = "simple" if emission_method == "simple" else "en15316-3"
-    return emission_method, distribution_method
+    storage_method = args.storage_method
+    if storage_method is None:
+        storage_method = (
+            "simple"
+            if emission_method == "simple" and distribution_method == "simple"
+            else "en15316-5"
+        )
+    return emission_method, distribution_method, storage_method
 
 
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
-    emission_method, distribution_method = resolve_system_methods(args)
+    emission_method, distribution_method, storage_method = resolve_system_methods(args)
     building = example_building(scenario)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else default_output_dir(scenario, emission_method, distribution_method)
+        else default_output_dir(scenario, emission_method, distribution_method, storage_method)
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1731,11 +2014,31 @@ def run_example(args: argparse.Namespace) -> None:
     elif distribution_method != "simple":
         raise ValueError("--distribution-method must be 'en15316-3' or 'simple'.")
 
+    storage_result = None
+    if storage_method == "en15316-5":
+        storage_calc = pybui.StorageSystemCalculator(storage_system_config(scenario))
+        storage_result = storage_calc.run_timeseries(loads)
+        loads["Q_H_storage_out_kWh"] = storage_result.timeseries["Q_H_sto_out_kWh"]
+        loads["Q_W_storage_out_kWh"] = storage_result.timeseries["Q_W_sto_out_kWh"]
+        loads["Q_H_sto_loss_kWh"] = storage_result.timeseries["Q_H_sto_ls_kWh"]
+        loads["Q_W_sto_loss_kWh"] = storage_result.timeseries["Q_W_sto_ls_kWh"]
+        loads["W_H_sto_aux_kWh"] = storage_result.timeseries["W_H_sto_aux_kWh"]
+        loads["W_W_sto_aux_kWh"] = storage_result.timeseries["W_W_sto_aux_kWh"]
+        loads["Q_H_kWh"] = storage_result.timeseries["Q_H_sto_in_kWh"]
+        loads["Q_W_kWh"] = storage_result.timeseries["Q_W_sto_in_kWh"]
+    elif storage_method != "simple":
+        raise ValueError("--storage-method must be 'en15316-5' or 'simple'.")
+
     ensure_heating_and_cooling(loads)
 
     heating_map, cooling_map = heat_pump_maps(scenario)
     calc = pybui.HeatPumpSystemCalculator(
-        heat_pump_config(scenario, heating_map, cooling_map)
+        heat_pump_config(
+            scenario,
+            heating_map,
+            cooling_map,
+            include_internal_storage_losses=storage_method == "simple",
+        )
     )
     result = calc.run_timeseries(loads)
 
@@ -1754,6 +2057,12 @@ def run_example(args: argparse.Namespace) -> None:
             output_dir / "distribution_15316_3_summary.csv",
             index=False,
         )
+    if storage_result is not None:
+        storage_result.timeseries.to_csv(output_dir / "storage_15316_5_hourly_results.csv")
+        pd.DataFrame([storage_result.summary]).to_csv(
+            output_dir / "storage_15316_5_summary.csv",
+            index=False,
+        )
     result.bins.to_csv(output_dir / "heat_pump_bin_results.csv", index=False)
     pd.DataFrame([result.summary]).to_csv(output_dir / "heat_pump_summary.csv", index=False)
     inspection_index = create_visual_outputs(
@@ -1764,11 +2073,13 @@ def run_example(args: argparse.Namespace) -> None:
         building_area=float(building["building"]["net_floor_area"]),
         emission_result=emission_result,
         distribution_result=distribution_result,
+        storage_result=storage_result,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
     print(f"Emission calculation mode: {emission_method}")
     print(f"Distribution calculation mode: {distribution_method}")
+    print(f"Storage calculation mode: {storage_method}")
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
     if emission_result is not None:
@@ -1780,14 +2091,26 @@ def run_example(args: argparse.Namespace) -> None:
         print(f"Heat-pump space cooling input load: {loads['Q_C_kWh'].sum():,.1f} kWh")
         print(f"EN 15316-2 emission auxiliaries: {emission_result.summary['W_em_aux_kWh']:,.1f} kWh")
     else:
-        print(f"Space heating demand: {loads['Q_H_kWh'].sum():,.1f} kWh")
-        print(f"Space cooling demand: {loads['Q_C_kWh'].sum():,.1f} kWh")
+        load_label = (
+            "Heat-pump input load"
+            if distribution_result is not None or storage_result is not None
+            else "Demand"
+        )
+        print(f"Space heating {load_label.lower()}: {loads['Q_H_kWh'].sum():,.1f} kWh")
+        print(f"Space cooling {load_label.lower()}: {loads['Q_C_kWh'].sum():,.1f} kWh")
     if distribution_result is not None:
         print(f"EN 15316-3 heating distribution losses: {distribution_result.summary['QH_dis_ls_kWh']:,.1f} kWh")
         print(f"EN 15316-3 cooling distribution losses: {distribution_result.summary['QC_dis_ls_kWh']:,.1f} kWh")
         print(f"EN 15316-3 DHW distribution losses: {distribution_result.summary['QW_dis_ls_kWh']:,.1f} kWh")
         print(f"EN 15316-3 distribution pump auxiliaries: {distribution_result.summary['W_dis_aux_kWh']:,.1f} kWh")
-    print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
+    if storage_result is not None:
+        print(f"EN 15316-5 heating storage losses: {storage_result.summary['QH_sto_ls_kWh']:,.1f} kWh")
+        print(f"EN 15316-5 DHW storage losses: {storage_result.summary['QW_sto_ls_kWh']:,.1f} kWh")
+        print(f"EN 15316-5 storage pump auxiliaries: {storage_result.summary['W_sto_aux_kWh']:,.1f} kWh")
+        print(f"DHW storage output demand: {storage_result.summary['QW_sto_out_kWh']:,.1f} kWh")
+        print(f"Heat-pump DHW input load: {loads['Q_W_kWh'].sum():,.1f} kWh")
+    else:
+        print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
     print(f"Heating+DHW electricity incl. backup: {result.summary['EHW_gen_in_kWh']:,.1f} kWh")
     print(f"Heating+DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
     print(f"Cooling electricity: {result.summary['EC_gen_in_kWh']:,.1f} kWh")
@@ -1821,13 +2144,25 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
     )
     parser.add_argument(
         "--calculation-path",
-        choices=["full", "emission-only", "simple"],
+        choices=[
+            "full",
+            "emission-distribution",
+            "emission-storage",
+            "distribution-storage",
+            "storage-only",
+            "emission-only",
+            "simple",
+        ],
         default=None,
         help=(
-            "Shortcut for the subsystem chain. 'full' applies EN 15316-2 and "
-            "EN 15316-3 before heat-pump generation; 'emission-only' applies "
-            "EN 15316-2 but bypasses distribution; 'simple' uses the direct "
-            "ISO52016/DHW loads. Default: full."
+            "Shortcut for the subsystem chain. 'full' applies EN 15316-2, "
+            "EN 15316-3 and EN 15316-5 before heat-pump generation; "
+            "'emission-distribution' applies EN 15316-2 and EN 15316-3 but "
+            "uses the simple storage treatment inside the heat-pump module; "
+            "'emission-storage', 'distribution-storage' and 'storage-only' "
+            "isolate selected subsystems; 'emission-only' applies EN 15316-2 "
+            "only; 'simple' uses the earlier direct ISO52016/DHW loads and "
+            "simple heat-pump storage losses. Default: full."
         ),
     )
     parser.add_argument(
@@ -1850,6 +2185,18 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
             "losses and pump auxiliaries before heat-pump generation; 'simple' "
             "bypasses distribution. Default: en15316-3 unless --emission-method "
             "simple or --calculation-path is set."
+        ),
+    )
+    parser.add_argument(
+        "--storage-method",
+        choices=["en15316-5", "simple"],
+        default=None,
+        help=(
+            "Heating/DHW storage calculation mode. 'en15316-5' applies storage "
+            "standing losses and storage pump auxiliaries before heat-pump "
+            "generation; 'simple' keeps the earlier simplified storage losses "
+            "inside the heat-pump module. Default: en15316-5 unless all upstream "
+            "methods are simple or --calculation-path is set."
         ),
     )
     parser.add_argument(

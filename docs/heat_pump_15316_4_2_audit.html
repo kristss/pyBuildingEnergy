@@ -672,7 +672,7 @@
           <tr>
             <td>Storage losses</td>
             <td><code>heating_storage_loss_kWh_per_day</code>, <code>dhw_storage_loss_kWh_per_day</code>, <code>storage_test_deltaT_K</code>, <code>storage_ambient_temperature_C</code>, <code>storage_location_b_factor</code></td>
-            <td>Calculates simplified storage losses and recoverable fractions for heating and DHW.</td>
+            <td>Calculates simplified storage losses and recoverable fractions for heating and DHW. In the full example chain these internal losses are set to zero because EN 15316-5 is calculated explicitly before generation.</td>
           </tr>
         </tbody>
       </table>
@@ -705,7 +705,10 @@
       <div class="formula">Q_gen_ls = loss_kWh_per_day * max(T_storage_avg - T_ambient, 0) / storage_test_deltaT_K * hours / 24</div>
       <div class="formula">Q_total_required = Q_gen_out + Q_gen_ls</div>
       <p class="small">
-        For cooling, storage losses are zero in the current implementation.
+        For cooling, storage losses are zero in the current implementation. In
+        the full example path, heating and DHW storage losses are handled by
+        <code>StorageSystemCalculator</code> according to EN 15316-5 before the
+        loads reach this generator module.
       </p>
 
       <h3>4. Split Load Above Heat-Pump Operating Limit</h3>
