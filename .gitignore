@@ -1,7 +1,3 @@
-examples/*
-!examples/new_building.py
-!examples/heat_pump_15316_4_2_example.py
-!examples/heat_pump_15316_4_2_bolzano_example.py
 src/pybuildingenergy/data
 create_archetype.py
 profiles.py
