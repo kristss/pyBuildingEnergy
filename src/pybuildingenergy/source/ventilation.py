@@ -28,7 +28,8 @@ class VentilationInternalGains:
     def heat_transfer_coefficient_by_ventilation(
             building_object, Tz, Te, u_site, Rw_arg_i=None, c_air=1006,
             rho_air=1.204, C_wnd=0.001, C_st=0.0035, rho_a_ref=1.204, altitude=None,
-            type_ventilation="temp_wind", flowrate_person=1.4, custom_Hve_k_t=3
+            type_ventilation="temp_wind", flowrate_per_area=1.4, custom_Hve_k_t=3,
+            flowrate_person=None
         ):
         """
         Calculate the heat transfer coefficient by ventilation  for air flow element K, Hve_k_t.
@@ -43,8 +44,11 @@ class VentilationInternalGains:
         :param u_site: air velocity of wind in the building site [m/s] at time t
         :param altitude: altitude of the building [m]
         :param Rw_arg_i: ratio of window opening area to maximum window opening area [0-1], type List
-        :param type_ventilation: type of ventilation, "temp_wind" or "occupancy" or "custom". Default: "temp_wind"
-        :param flowrate_person: ventilation rate per person per m2 [l/(s m2)]
+        :param type_ventilation: type of ventilation, "temp_wind", "occupancy",
+            "custom", "eplus_infiltration_ext_area", or
+            "sherman_grimsrud_like". Default: "temp_wind"
+        :param flowrate_per_area: ventilation rate per unit area [l/(s m2)]
+        :param flowrate_person: backward-compatible alias of flowrate_per_area.
 
         : return 
             * **Hve_k_t**: heat transfer coefficient by ventilation  for air flow element K, Hve_k_t. in W/K
@@ -87,7 +91,42 @@ class VentilationInternalGains:
 
         """
 
+        # Backward compatibility: older call sites use `flowrate_person`.
+        if flowrate_person is not None:
+            flowrate_per_area = flowrate_person
+
+        # Parameter lookup precedence:
+        # 1) top-level keys on provided dict (zone-like object)
+        # 2) building_parameters.ventilation (building/global object)
+        def _vent_param(key, default):
+            if isinstance(building_object, dict):
+                if key in building_object and building_object.get(key) is not None:
+                    return building_object.get(key)
+                vent = building_object.get("building_parameters", {}).get("ventilation", {})
+                if isinstance(vent, dict) and key in vent and vent.get(key) is not None:
+                    return vent.get(key)
+            return default
+
         if type_ventilation == "temp_wind":
+            c_wnd_eff = float(_vent_param("temp_wind_c_wnd", C_wnd))
+            if not np.isfinite(c_wnd_eff):
+                c_wnd_eff = float(C_wnd)
+            c_wnd_eff = max(0.0, c_wnd_eff)
+
+            c_st_eff = float(_vent_param("temp_wind_c_st", C_st))
+            if not np.isfinite(c_st_eff):
+                c_st_eff = float(C_st)
+            c_st_eff = max(0.0, c_st_eff)
+
+            rho_a_ref_cfg = float(_vent_param("temp_wind_rho_a_ref", rho_a_ref))
+            if not np.isfinite(rho_a_ref_cfg) or rho_a_ref_cfg <= 0.0:
+                rho_a_ref_cfg = float(rho_a_ref)
+
+            rw_default = float(_vent_param("temp_wind_opening_ratio", 0.9))
+            if not np.isfinite(rw_default):
+                rw_default = 0.9
+            rw_default = min(1.0, max(0.0, rw_default))
+
             # --- Collect transparent surfaces as "windows"
             windows = [s for s in building_object.get("building_surface", []) if s.get("type") == "transparent"]
             n_windows = len(windows)
@@ -132,56 +171,216 @@ class VentilationInternalGains:
 
             # Adjust rho_a_ref for altitude (if provided)
             if altitude is not None:
-                rho_a_ref_eff = round(1.204 * (1 - (0.00651 * altitude) / 293.0) ** 4.255, 3)
+                rho_a_ref_eff = round(rho_a_ref_cfg * (1 - (0.00651 * altitude) / 293.0) ** 4.255, 3)
             else:
-                rho_a_ref_eff = float(rho_a_ref)
+                rho_a_ref_eff = float(rho_a_ref_cfg)
 
             # Air density at external temperature
-            rho_a_e = (291.15 / (273.15 + float(Te))) * rho_a_ref_eff
+            rho_a_e = (293.15 / (273.15 + float(Te))) * rho_a_ref_eff
 
             # Max opening area per window
             Aw_max = height * width  # [m2]
 
             # Effective opening ratio
             if Rw_arg_i is None:
-                Rw = np.full(Aw_max.shape, 0.9, dtype=float)
+                Rw = np.full(Aw_max.shape, rw_default, dtype=float)
             else:
                 Rw_arg_i = list(Rw_arg_i)
                 if len(Rw_arg_i) != Aw_max.size:
-                    warnings.warn("Length of Rw_arg_i != number of usable windows. Using 0.9 for all.")
-                    Rw = np.full(Aw_max.shape, 0.9, dtype=float)
+                    warnings.warn(
+                        "Length of Rw_arg_i != number of usable windows. "
+                        f"Using {rw_default:.3f} for all."
+                    )
+                    Rw = np.full(Aw_max.shape, rw_default, dtype=float)
                 else:
                     Rw = np.asarray(Rw_arg_i, dtype=float)
+            Rw = np.clip(Rw, 0.0, 1.0)
 
             Aw_i = Aw_max * Rw
             Aw_tot = float(np.sum(Aw_i))
 
             # Airflow (kept consistent with your existing implementation: result in m3/h)
-            wind_term = C_wnd * (float(u_site) ** 2)
-            stack_term = C_st * hw_st * abs(float(Tz) - float(Te))
-            qv_arg_in_m3_h = 3600.0 * (rho_a_ref_eff / rho_a_e) * (Aw_tot / 2.0) * (max(wind_term, stack_term) ** 0.5)
+            wind_term = c_wnd_eff * (float(u_site) ** 2)
+            stack_term = c_st_eff * hw_st * abs(float(Tz) - float(Te))
+            qv_m3_s = (rho_a_ref_eff / rho_a_e) * (Aw_tot / 2.0) * (max(wind_term, stack_term) ** 0.5)
 
             # Heat transfer coefficient [W/K]
-            Hve_k_t = c_air * rho_air * (qv_arg_in_m3_h / 3600.0)
+            Hve_k_t = c_air * rho_air * qv_m3_s
 
         elif type_ventilation == "occupancy":
-            # flowrate_person: [l/(s m2)]  -> convert to [m3/s] via /1000
+            # Legacy naming: flow_rate_per_person is used as an area-based
+            # specific airflow [L/(s m2)] in this branch.
+            flowrate_per_area = float(_vent_param("flow_rate_per_person", flowrate_per_area))
+            if not np.isfinite(flowrate_per_area):
+                flowrate_per_area = 0.0
+            flowrate_per_area = max(0.0, flowrate_per_area)
             zone_area = float(building_object["building"]["net_floor_area"])
-            qv_m3_s = zone_area * float(flowrate_person) / 1000.0
+            if not np.isfinite(zone_area):
+                zone_area = 0.0
+            zone_area = max(0.0, zone_area)
+            if altitude is not None:
+                rho_air_eff = 1.204 * (1 - (0.00651 * altitude) / 293.0) ** 4.255
+            else:
+                rho_air_eff = rho_air
+            qv_m3_s = flowrate_per_area * zone_area / 1000.0
+            Hve_k_t = rho_air_eff * c_air * qv_m3_s
+
+        elif type_ventilation == "eplus_infiltration_ext_area":
+            # Emulates EnergyPlus ZoneInfiltration:DesignFlowRate (Flow/ExteriorArea)
+            # q = q_design * (A + B*|Tz-Te| + C*V + D*V^2)
+            q_per_ext = float(_vent_param("infiltration_flow_per_exterior_area_m3_s_m2", 0.0))
+            coef_a = float(_vent_param("infiltration_coeff_constant", 0.0))
+            coef_b = float(_vent_param("infiltration_coeff_temperature", 0.0))
+            coef_c = float(_vent_param("infiltration_coeff_velocity", 0.0))
+            coef_d = float(_vent_param("infiltration_coeff_velocity_squared", 0.0))
+            include_transparent = bool(_vent_param("infiltration_include_transparent_area", True))
+            wind_reduction_factor = float(_vent_param("infiltration_wind_reduction_factor", 1.0))
+            if not np.isfinite(wind_reduction_factor):
+                wind_reduction_factor = 1.0
+            wind_reduction_factor = max(0.0, wind_reduction_factor)
+            ext_area_mode_raw = _vent_param("infiltration_exterior_area_mode", "outdoors_only")
+            ext_area_mode = str(ext_area_mode_raw).strip().lower()
+            if ext_area_mode in ("", "default", "solver_default", "outdoors"):
+                ext_area_mode = "outdoors_only"
+            elif ext_area_mode in ("energyplus", "energyplus_like", "include_ground_like"):
+                ext_area_mode = "energyplus_like"
+            elif ext_area_mode != "outdoors_only":
+                warnings.warn(
+                    "Unknown infiltration_exterior_area_mode="
+                    f"{ext_area_mode_raw!r}; falling back to 'outdoors_only'."
+                )
+                ext_area_mode = "outdoors_only"
+            schedule_mult = float(_vent_param("infiltration_schedule_multiplier", 1.0))
+            if not np.isfinite(schedule_mult):
+                schedule_mult = 1.0
+            schedule_mult = max(0.0, schedule_mult)
+
+            # Optional zone scoping (defensive):
+            # when available, restrict exterior area to the requested thermal zone.
+            target_zone = building_object.get("zone_name", None)
+            if target_zone is None:
+                target_zone = building_object.get("building", {}).get("zone_name", None)
+            target_zone = None if target_zone is None else str(target_zone)
+
+            surfaces = building_object.get("building_surface", [])
+            zones_in_surfaces = sorted(
+                {
+                    str(s.get("zone"))
+                    for s in surfaces
+                    if isinstance(s, dict) and s.get("zone") is not None
+                }
+            )
+            if target_zone is None and len(zones_in_surfaces) == 1:
+                # If the provided object already contains one zone only, scope automatically.
+                target_zone = zones_in_surfaces[0]
+            elif target_zone is None and len(zones_in_surfaces) > 1:
+                warnings.warn(
+                    "eplus_infiltration_ext_area called without zone_name on a multi-zone "
+                    "surface set; using building-level exterior area. Pass zone_name (or a "
+                    "zone-filtered building_surface) for per-zone infiltration."
+                )
+
+            ext_area = 0.0
+            allowed_boundaries = {"OUTDOORS"}
+            if ext_area_mode == "energyplus_like":
+                allowed_boundaries.update(
+                    {
+                        "GROUND",
+                        "FOUNDATION",
+                        "OTHERSIDECONDITIONSMODEL",
+                        "GROUNDFCFACTORMETHOD",
+                        "GROUNDSLABPREPROCESSORAVERAGE",
+                        "GROUNDSLABPREPROCESSORCORE",
+                        "GROUNDSLABPREPROCESSORPERIMETER",
+                        "GROUNDBASEMENTPREPROCESSORAVERAGEWALL",
+                        "GROUNDBASEMENTPREPROCESSORAVERAGEFLOOR",
+                        "GROUNDBASEMENTPREPROCESSORUPPERWALL",
+                        "GROUNDBASEMENTPREPROCESSORLOWERWALL",
+                    }
+                )
+            for surf in surfaces:
+                if target_zone is not None:
+                    surf_zone = surf.get("zone", None)
+                    if surf_zone is not None and str(surf_zone) != target_zone:
+                        continue
+                boundary = str(surf.get("boundary", "")).upper().replace(" ", "")
+                if boundary not in allowed_boundaries:
+                    continue
+                if (not include_transparent) and str(surf.get("type", "")).lower() == "transparent":
+                    continue
+                try:
+                    ext_area += max(0.0, float(surf.get("area", 0.0)))
+                except Exception:
+                    continue
+
+            q_design_m3_s = q_per_ext * ext_area
+            u_site_eff = float(u_site) * wind_reduction_factor
+            multiplier = (
+                coef_a
+                + coef_b * abs(float(Tz) - float(Te))
+                + coef_c * u_site_eff
+                + coef_d * (u_site_eff ** 2)
+            )
+            if not np.isfinite(multiplier):
+                multiplier = 0.0
+            qv_m3_s = max(0.0, q_design_m3_s * multiplier * schedule_mult)
             Hve_k_t = rho_air * c_air * qv_m3_s
 
+        elif type_ventilation in ("sherman_grimsrud_like", "sherman_grimsrud", "ela_stack_wind"):
+            # Sherman-Grimsrud-like leakage model:
+            #   Vdot_inf = F(t) * ELA * sqrt(Cs * |Tz-Te| + Cw * WS^2)
+            # Units must be coherent so that Vdot_inf is in m3/s.
+            ela_m2 = float(_vent_param("infiltration_effective_leakage_area_m2", 0.0))
+            if not np.isfinite(ela_m2):
+                ela_m2 = 0.0
+            ela_m2 = max(0.0, ela_m2)
+
+            c_stack = float(_vent_param("infiltration_stack_coefficient", 0.0))
+            if not np.isfinite(c_stack):
+                c_stack = 0.0
+            c_stack = max(0.0, c_stack)
+
+            c_wind = float(_vent_param("infiltration_wind_coefficient", 0.0))
+            if not np.isfinite(c_wind):
+                c_wind = 0.0
+            c_wind = max(0.0, c_wind)
+
+            f_t = float(_vent_param("infiltration_schedule_multiplier", 1.0))
+            if not np.isfinite(f_t):
+                f_t = 1.0
+            f_t = max(0.0, f_t)
+
+            delta_t = abs(float(Tz) - float(Te))
+            ws = max(0.0, float(u_site))
+            root_term = c_stack * delta_t + c_wind * (ws ** 2)
+            if not np.isfinite(root_term):
+                root_term = 0.0
+            root_term = max(0.0, root_term)
+
+            qv_m3_s = f_t * ela_m2 * (root_term ** 0.5)
+            Hve_k_t = rho_air * c_air * max(0.0, qv_m3_s)
+
         elif type_ventilation == "custom":
-            Hve_k_t = float(custom_Hve_k_t)
+            custom_h_ve = float(
+                _vent_param("custom_heat_transfer_coefficient_ventilation", custom_Hve_k_t)
+            )
+            if not np.isfinite(custom_h_ve):
+                custom_h_ve = 0.0
+            Hve_k_t = max(0.0, custom_h_ve)
 
         else:
-            raise ValueError("type_ventilation must be one of: 'temp_wind', 'occupancy', 'custom'.")
+            raise ValueError(
+                "type_ventilation must be one of: 'temp_wind', 'occupancy', "
+                "'custom', 'eplus_infiltration_ext_area', "
+                "'sherman_grimsrud_like'."
+            )
 
         return np.array(Hve_k_t)
 
     # def heat_transfer_coefficient_by_ventilation(
     #     building_object, Tz, Te, u_site, Rw_arg_i=None, c_air=1006, 
     #     rho_air=1.204, C_wnd=0.001, C_st=0.0035, rho_a_ref=1.204, altitude=None, type_ventilation="temp_wind", 
-    #     flowrate_person=1.4, custom_Hve_k_t=3
+    #     flowrate_per_area=1.4, custom_Hve_k_t=3
     # ) -> h_natural_vent:
         
     #     if type_ventilation == "temp_wind":
@@ -242,7 +441,7 @@ class VentilationInternalGains:
         
     #     elif type_ventilation == "occupancy":
     #         zone_area = building_object["building"]['net_floor_area']
-    #         Hve_k_t = zone_area * (3.6 * flowrate_person) * rho_air * c_air / 3600
+    #         Hve_k_t = zone_area * (3.6 * flowrate_per_area) * rho_air * c_air / 3600
 
     #     elif type_ventilation == "custom":
     #         Hve_k_t = custom_Hve_k_t
@@ -278,21 +477,46 @@ class VentilationInternalGains:
             * Phi_int: internal gains [W]
         """
 
-        # Allow overriding occupants full load from BUI -> internal_gains -> occupants.full_load
-        q_int_occ = internal_gains_occupants[building_type_class]['occupants']
+        # Default full-load gains [W/m2] from ISO table
+        gains_row = internal_gains_occupants[building_type_class]
+        q_int_occ = float(gains_row.get("occupants", 0.0))
+        q_int_app = float(gains_row.get("appliances", 0.0))
+        q_int_light = float(gains_row.get("lighting", 0.0))
+
+        # Safety against NaN values in the source table
+        if not np.isfinite(q_int_occ):
+            q_int_occ = 0.0
+        if not np.isfinite(q_int_app):
+            q_int_app = 0.0
+        if not np.isfinite(q_int_light):
+            q_int_light = 0.0
+
+        # Optional full-load overrides from BUI -> internal_gains
         building_object = getattr(self, "building_object", None)
         if building_object:
             for gain in building_object.get("internal_gains", []):
-                if gain.get("name") == "occupants" and "full_load" in gain:
-                    q_int_occ = gain["full_load"]
-                    break
+                gname = gain.get("name")
+                full_load = gain.get("full_load")
+                if full_load is None:
+                    continue
+                try:
+                    full_load = float(full_load)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(full_load):
+                    continue
+                if gname == "occupants":
+                    q_int_occ = full_load
+                elif gname == "appliances":
+                    q_int_app = full_load
+                elif gname == "lighting":
+                    q_int_light = full_load
 
-        q_int_app = internal_gains_occupants[building_type_class]['appliances']
-        # q_int_light = internal_gains_occupants[building_type_class]['lighting']
-        Phi_int_z_t = (q_int_occ * h_occup + q_int_app * h_app) * a_use
+        q_int_total = q_int_occ * h_occup + q_int_app * h_app + q_int_light * h_light
+        Phi_int_z_t = q_int_total * a_use
 
         if unconditioned_zones_nearby:
-            Phi_int_dir_z_t = (q_int_occ * h_occup + q_int_app * h_app) * a_use
+            Phi_int_dir_z_t = q_int_total * a_use
             for zones in range(list_adj_zones):
                 Phi_int_z_t +=Phi_int_dir_z_t + (1-b_ztu)*Fztc_ztu_m * Phi_int_dir_z_t
         

@@ -1,8 +1,17 @@
-import os
 import sys
+from pathlib import Path
+
 # Ensure local package import works when running the script directly
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-# import pybuildingenergy as pybui
+# (package sources live in ../src).
+EXAMPLES_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = EXAMPLES_DIR.parent
+SRC_DIR = PROJECT_ROOT / "src"
+for _p in (SRC_DIR, PROJECT_ROOT):
+    _ps = str(_p)
+    if _ps not in sys.path:
+        sys.path.insert(0, _ps)
+
+import pybuildingenergy as pybui
 import numpy as np
 import pandas as pd 
 import plotly.express as px 
@@ -15,6 +24,27 @@ from pybuildingenergy.source.generate_profile import HourlyProfileGenerator, get
 from pybuildingenergy.source.DHW import *
 from pybuildingenergy.source.ventilation import *
 from pybuildingenergy.source.table_iso_16798_1 import *
+
+WEATHER_CANDIDATES = [
+    EXAMPLES_DIR / "2050_Athens.epw",
+    EXAMPLES_DIR / "2020_Milan.epw",
+]
+# WEATHER_FILE = next((p for p in WEATHER_CANDIDATES if p.exists()), None)
+WEATHER_FILE = None
+WEATHER_SOURCE = "epw" if WEATHER_FILE is not None else "pvgis"
+print(WEATHER_FILE)
+
+def _run_iso52016(building_obj):
+    kwargs = {"weather_source": WEATHER_SOURCE}
+    if WEATHER_SOURCE == "epw":
+        kwargs["path_weather_file"] = str(WEATHER_FILE)
+
+    out = ISO52016.Temperature_and_Energy_needs_calculation(building_obj, **kwargs)
+    if isinstance(out, tuple) and len(out) == 3:
+        return out
+    if isinstance(out, tuple) and len(out) == 2:
+        return out[0], out[1], {}
+    raise RuntimeError("Unexpected output format from Temperature_and_Energy_needs_calculation")
 
 # BUI = {
 #     "building": {
@@ -536,11 +566,11 @@ BUI = {
             "units": "W"
         },
         "ventilation": {
-            "ventilation_type": "temp_wind",
-            "flow_rate_per_person": 0.5,
+            "ventilation_type": "occupancy",
+            "flow_rate_per_person": 0.3,
             "units": "l/(s m2)",
             "custom_heat_transfer_coefficient_ventilation": None,
-            "info": "ventilation type could be: 1) Occupancy 2) temp_wind 3)custom. If custum the value of custom_heat_transfer_coefficient_ventilation is used"
+            "info": "ventilation type could be: 1) Occupancy 2) occupancy 3)custom. If custum the value of custom_heat_transfer_coefficient_ventilation is used"
         },
         "internal_gains": [
             {
@@ -1004,10 +1034,8 @@ def process_building(building_archetype, output_dir="result_test"):
         (
             hourly_sim,
             annual_results_df,
-        ) = ISO52016.Temperature_and_Energy_needs_calculation(
-            building_archetype,
-            weather_source="pvgis",
-        )
+            _,
+        ) = _run_iso52016(building_archetype)
 
         # Generate unique filenames for each building
         building_name = building_archetype["building"].get("name", "unknown")
@@ -1049,9 +1077,13 @@ if errors:
     raise ValueError("Invalid BUI input: correct the data and retry.")
 else:
     print("✅ BUI valid — starting ISO52016 simulation...\n")
+    if WEATHER_SOURCE == "epw":
+        print(f"[info] Weather source: epw ({WEATHER_FILE})")
+    else:
+        print("[info] Weather source: pvgis (no local EPW found)")
     file_dir = "/Users/dantonucci/Documents/GitHub/pybuildingenergy/result_test"
-    # hourly_sim,annual_results_df = pybui.ISO52016.Temperature_and_Energy_needs_calculation(bui_checked,weather_source="pvgis", path_weather_file= '/Users/dantonucci/Downloads/2050_Athens.epw' )
-    hourly_sim,annual_results_df, sankey_data = ISO52016.Temperature_and_Energy_needs_calculation(bui_checked,weather_source="pvgis", path_weather_file= '2050_Athens.epw' )
+    # hourly_sim,annual_results_df = pybui.ISO52016.Temperature_and_Energy_needs_calculation(bui_checked, weather_source="epw", path_weather_file=str(WEATHER_FILE))
+    hourly_sim, annual_results_df, sankey_data = _run_iso52016(bui_checked)
     path_hourly_sim_result = file_dir + "/hourly_sim__arch.csv"
     path_annual_sim_result = file_dir + "/annual_sim__arch.csv"
     hourly_sim.to_csv(path_hourly_sim_result)
