@@ -357,6 +357,99 @@ def test_heat_pump_system_calculator_heating_cooling_dhw():
     assert result.summary["SEER_C_gen"] > 1.0
 
 
+def test_heat_pump_performance_data_14511_14825_part_load():
+    """Test EN 14511 rating normalization and EN 14825 water-side correction."""
+    import pybuildingenergy as pybui
+
+    result = pybui.HeatPumpPerformanceDataCalculator(
+        {
+            "unit_type": "air-to-water",
+            "capacity_control": "fixed",
+            "heating_design_load_kW": 8.0,
+            "cooling_design_load_kW": 6.0,
+            "heating_degradation_coefficient": 0.9,
+            "cooling_degradation_coefficient": 0.9,
+            "heating_rating_points": [
+                {
+                    "rating_condition": "EN 14511 A7/W35",
+                    "source_temperature_C": 7.0,
+                    "sink_temperature_C": 35.0,
+                    "capacity_kW": 10.0,
+                    "cop": 4.5,
+                    "part_load_ratio": 0.5,
+                }
+            ],
+            "cooling_rating_points": [
+                {
+                    "rating_condition": "EN 14511 A35/W7",
+                    "source_temperature_C": 35.0,
+                    "sink_temperature_C": 7.0,
+                    "capacity_kW": 8.0,
+                    "eer": 3.5,
+                    "part_load_ratio": 0.5,
+                }
+            ],
+        }
+    ).run()
+
+    assert pybui.en14825_part_load_factor(1.0, 0.9, "air-to-water") == pytest.approx(1.0)
+    assert pybui.en14825_part_load_factor(0.5, 0.9, "air-to-water") < 1.0
+    assert result.heating_map["cop"].iloc[0] == pytest.approx(4.5)
+    assert result.cooling_map["eer"].iloc[0] == pytest.approx(3.5)
+    assert result.rating_points["performance_at_part_load"].min() < 4.5
+    assert result.summary["rating_point_count"] == pytest.approx(2.0)
+    assert pybui.HeatPumpPerformanceDataCalculator is not None
+
+
+def test_heat_pump_uses_en14825_part_load_correction():
+    """Test optional EN 14825 part-load correction in heat-pump generation."""
+    import pybuildingenergy as pybui
+
+    heating_map = pd.DataFrame(
+        {
+            "source_temperature_C": [7.0],
+            "sink_temperature_C": [35.0],
+            "capacity_kW": [10.0],
+            "cop": [4.0],
+        }
+    )
+    loads = pd.DataFrame(
+        {
+            "T_ext": [7.0],
+            "Q_H_kWh": [2.0],
+            "Q_C_kWh": [0.0],
+            "Q_W_kWh": [0.0],
+            "T_H_sink_C": [35.0],
+        },
+        index=pd.date_range("2026-01-01", periods=1, freq="h"),
+    )
+    calc = pybui.HeatPumpSystemCalculator(
+        {
+            "heating_performance_map": heating_map,
+            "dhw_performance_map": heating_map,
+            "source_type": "air",
+            "time_step_hours": 1.0,
+            "demand_unit": "kWh",
+            "hp_operating_limit_C": 58.0,
+            "part_load_performance_method": "en14825",
+            "part_load_unit_type": "air-to-water",
+            "part_load_degradation_coefficient": 0.9,
+            "external_auxiliary_power_W": 0.0,
+            "standby_power_W": 0.0,
+            "heating_storage_loss_kWh_per_day": 0.0,
+            "dhw_storage_loss_kWh_per_day": 0.0,
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+    row = result.bins.iloc[0]
+
+    assert row["H_part_load_ratio"] == pytest.approx(0.2)
+    assert row["H_part_load_factor"] < 1.0
+    assert row["H_performance"] < row["H_performance_full_load"]
+    assert result.summary["EH_hp_in_kWh"] > 2.0 / 4.0
+
+
 def test_emission_system_calculator_heating_cooling_effects():
     """Test EN 15316-2 emission losses and auxiliary electricity."""
     import pybuildingenergy as pybui
@@ -661,6 +754,45 @@ def test_cooling_generation_system_calculator_16798_13():
     assert result.summary["SEER_C_gen"] > 2.5
     assert result.summary["QC_gen_out_kWh"] > result.summary["QC_gen_in_kWh"]
     assert pybui.CoolingGenerationSystemCalculator is not None
+
+
+def test_cooling_generation_uses_en14825_part_load_correction():
+    """Test optional EN 14825 part-load correction in cooling generation."""
+    import pybuildingenergy as pybui
+
+    cooling_map = pd.DataFrame(
+        {
+            "source_temperature_C": [30.0],
+            "sink_temperature_C": [7.0],
+            "capacity_kW": [10.0],
+            "eer": [4.0],
+        }
+    )
+    loads = pd.DataFrame(
+        {
+            "T_ext": [30.0],
+            "Q_C_kWh": [2.0],
+            "T_C_sink_C": [7.0],
+        },
+        index=pd.date_range("2026-07-01", periods=1, freq="h"),
+    )
+    calc = pybui.CoolingGenerationSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "cooling_performance_map": cooling_map,
+            "part_load_performance_method": "en14825",
+            "part_load_unit_type": "air-to-water",
+            "part_load_degradation_coefficient": 0.9,
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+    row = result.timeseries.iloc[0]
+
+    assert row["f_C_PL"] == pytest.approx(0.2)
+    assert row["f_C_PLF"] < 1.0
+    assert row["EER_C_gen"] < row["EER_C_gen_full_load"]
+    assert result.summary["EC_gen_el_in_kWh"] > 2.0 / 4.0
 
 
 @pytest.mark.parametrize("fix", [True, False])

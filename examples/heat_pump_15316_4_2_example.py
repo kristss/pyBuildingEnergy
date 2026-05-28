@@ -60,6 +60,7 @@ def default_output_dir(
     cooling_system_method: str = "en16798-9",
     cooling_storage_method: str = "en16798-15",
     cooling_generation_method: str = "en16798-13",
+    performance_data_method: str = "en14511-14825",
 ) -> Path:
     suffix = f"heat_pump_15316_4_2_{scenario}"
     if (
@@ -111,6 +112,8 @@ def default_output_dir(
         suffix = f"{suffix}_heat_pump_cooling"
     elif cooling_storage_method == "simple" and cooling_generation_method == "en16798-13":
         suffix = f"{suffix}_no_cooling_storage"
+    if performance_data_method == "simple" and not suffix.endswith("_simple"):
+        suffix = f"{suffix}_simple_performance"
     return REPO_ROOT / "examples" / "outputs" / suffix
 
 
@@ -494,12 +497,114 @@ def heat_pump_maps(scenario: str = "athens") -> tuple[pd.DataFrame, pd.DataFrame
     return pd.DataFrame(heating_rows), pd.DataFrame(cooling_rows)
 
 
+def heat_pump_performance_data(
+    scenario: str = "athens",
+) -> pybui.HeatPumpPerformanceDataResult:
+    """Build example maps from EN 14511/EN 14825 style rating rows."""
+
+    if scenario == "bolzano":
+        heating_design_load_kW = 8.0
+        cooling_design_load_kW = 5.8
+        heating_capacity_a7w35 = 8.9
+        heating_cop_a7w35 = 4.55
+        cooling_capacity_a35w7 = 6.2
+        cooling_eer_a35w7 = 3.45
+    else:
+        heating_design_load_kW = 6.7
+        cooling_design_load_kW = 7.6
+        heating_capacity_a7w35 = 8.8
+        heating_cop_a7w35 = 4.60
+        cooling_capacity_a35w7 = 8.0
+        cooling_eer_a35w7 = 3.25
+
+    heating_part_load_ratios = {
+        -7: 0.8846,
+        2: 0.5385,
+        7: 0.3462,
+        12: 0.1538,
+    }
+    cooling_part_load_ratios = {
+        35: 1.0000,
+        30: 0.7368,
+        25: 0.4737,
+        20: 0.2105,
+    }
+
+    heating_rows = []
+    for source in [-15, -7, 2, 7, 12, 20]:
+        for sink in [35, 45, 55]:
+            capacity = (
+                heating_capacity_a7w35
+                + 0.11 * (source - 7.0)
+                - 0.055 * (sink - 35.0)
+            )
+            cop = heating_cop_a7w35 + 0.055 * (source - 7.0) - 0.045 * (sink - 35.0)
+            if source == 7:
+                condition = f"EN 14511-2 standard A7/W{sink}; EN 14825 C"
+            elif source in heating_part_load_ratios:
+                condition = f"EN 14825 heating point at {source:+g}C/W{sink}"
+            else:
+                condition = f"EN 14511-2 application A{source:+g}/W{sink}"
+            heating_rows.append(
+                {
+                    "rating_condition": condition,
+                    "source_temperature_C": source,
+                    "sink_temperature_C": sink,
+                    "capacity_kW": max(capacity, 2.5),
+                    "cop": max(cop, 1.6),
+                    "part_load_ratio": heating_part_load_ratios.get(source, 1.0),
+                    "test_standard": "EN 14511-2:2022 / EN 14825:2022",
+                }
+            )
+
+    cooling_rows = []
+    for source in [20, 25, 27, 30, 35, 40, 46]:
+        for sink in [7, 12, 18]:
+            capacity = (
+                cooling_capacity_a35w7
+                - 0.07 * (source - 35.0)
+                + 0.035 * (sink - 7.0)
+            )
+            eer = cooling_eer_a35w7 - 0.055 * (source - 35.0) + 0.045 * (sink - 7.0)
+            if source == 35:
+                condition = f"EN 14511-2 standard A35/W{sink}; EN 14825 A"
+            elif source in cooling_part_load_ratios:
+                condition = f"EN 14825 cooling point at {source:g}C/W{sink}"
+            else:
+                condition = f"EN 14511-2 application A{source:g}/W{sink}"
+            cooling_rows.append(
+                {
+                    "rating_condition": condition,
+                    "source_temperature_C": source,
+                    "sink_temperature_C": sink,
+                    "capacity_kW": max(capacity, 2.5),
+                    "eer": max(eer, 1.7),
+                    "part_load_ratio": cooling_part_load_ratios.get(source, 1.0),
+                    "test_standard": "EN 14511-2:2022 / EN 14825:2022",
+                }
+            )
+
+    return pybui.HeatPumpPerformanceDataCalculator(
+        {
+            "unit_type": "air-to-water",
+            "capacity_control": "fixed",
+            "heating_design_load_kW": heating_design_load_kW,
+            "cooling_design_load_kW": cooling_design_load_kW,
+            "heating_degradation_coefficient": 0.9,
+            "cooling_degradation_coefficient": 0.9,
+            "heating_rating_points": heating_rows,
+            "cooling_rating_points": cooling_rows,
+        }
+    ).run()
+
+
 def heat_pump_config(
     scenario: str,
     heating_map: pd.DataFrame,
     cooling_map: pd.DataFrame,
     include_internal_storage_losses: bool = True,
     cooling_enabled: bool = True,
+    performance_data_method: str = "en14511-14825",
 ) -> dict:
     """Scenario-specific generator assumptions for the example heat pump."""
 
@@ -530,6 +635,22 @@ def heat_pump_config(
         "storage_test_deltaT_K": 45.0,
         "storage_ambient_temperature_C": 20.0,
     }
+    if performance_data_method == "en14511-14825":
+        config.update(
+            {
+                "part_load_performance_method": "en14825",
+                "part_load_unit_type": "air-to-water",
+                "part_load_degradation_coefficient": 0.9,
+                "heating_part_load_degradation_coefficient": 0.9,
+                "dhw_part_load_degradation_coefficient": 0.9,
+                "cooling_part_load_degradation_coefficient": 0.9,
+                "heating_part_load_minimum_capacity_ratio": 0.1538,
+                "dhw_part_load_minimum_capacity_ratio": 0.1538,
+                "cooling_part_load_minimum_capacity_ratio": 0.2105,
+            }
+        )
+    else:
+        config["part_load_performance_method"] = "simple"
 
     if scenario == "bolzano":
         config.update(
@@ -952,11 +1073,12 @@ def cooling_storage_system_config(scenario: str) -> dict:
 def cooling_generation_system_config(
     scenario: str,
     cooling_map: pd.DataFrame,
+    performance_data_method: str = "en14511-14825",
 ) -> dict:
     """Scenario-specific EN 16798-13 compression-cooling assumptions."""
 
     nominal_capacity = 6.2 if scenario == "bolzano" else 8.0
-    return {
+    config = {
         "demand_unit": "kWh",
         "cooling_performance_map": cooling_map,
         "nominal_capacity_kW": nominal_capacity,
@@ -971,6 +1093,18 @@ def cooling_generation_system_config(
         "heat_recovery_fraction": 0.0,
         "minimum_part_load_ratio": 0.0,
     }
+    if performance_data_method == "en14511-14825":
+        config.update(
+            {
+                "part_load_performance_method": "en14825",
+                "part_load_unit_type": "air-to-water",
+                "part_load_degradation_coefficient": 0.9,
+                "part_load_minimum_capacity_ratio": 0.2105,
+            }
+        )
+    else:
+        config["part_load_performance_method"] = "simple"
+    return config
 
 
 def prepare_heat_pump_loads(hourly_sim: pd.DataFrame, dhw_kWh: pd.Series) -> pd.DataFrame:
@@ -1744,7 +1878,11 @@ def plot_cooling_generation_16798_13(
             "W_C_aux_gen_kWh",
         ]
     ].resample("D").sum()
-    perf = hourly[["EER_C_gen", "f_C_PL", "theta_C_gen_out_C", "theta_cond_in_C"]].resample("D").mean()
+    perf_cols = ["EER_C_gen", "f_C_PL", "theta_C_gen_out_C", "theta_cond_in_C"]
+    for optional_col in ["EER_C_gen_full_load", "f_C_PLF"]:
+        if optional_col in hourly:
+            perf_cols.append(optional_col)
+    perf = hourly[perf_cols].resample("D").mean()
 
     fig_ts = make_subplots(
         rows=3,
@@ -1771,7 +1909,11 @@ def plot_cooling_generation_16798_13(
     ]:
         fig_ts.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=2, col=1)
     fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["EER_C_gen"], mode="lines", name="EER", line=dict(color="#2f78b7")), row=3, col=1, secondary_y=False)
+    if "EER_C_gen_full_load" in perf:
+        fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["EER_C_gen_full_load"], mode="lines", name="Full-load EER", line=dict(color="#2f78b7", dash="dot")), row=3, col=1, secondary_y=False)
     fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["f_C_PL"], mode="lines", name="Part-load ratio", line=dict(color="#70ad47")), row=3, col=1, secondary_y=False)
+    if "f_C_PLF" in perf:
+        fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["f_C_PLF"], mode="lines", name="Part-load factor", line=dict(color="#44546a", dash="dash")), row=3, col=1, secondary_y=False)
     fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["theta_C_gen_out_C"], mode="lines", name="Evaporator outlet", line=dict(color="#1f4e79", dash="dot")), row=3, col=1, secondary_y=True)
     fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["theta_cond_in_C"], mode="lines", name="Condenser inlet", line=dict(color="#44546a", dash="dash")), row=3, col=1, secondary_y=True)
     fig_ts.update_yaxes(title_text="kWh/day", row=1, col=1)
@@ -1791,6 +1933,8 @@ def plot_cooling_generation_16798_13(
         w_aux=("W_C_aux_gen_kWh", "sum"),
         eer=("EER_C_gen", "mean"),
         plr=("f_C_PL", "mean"),
+        plf=("f_C_PLF", "mean") if "f_C_PLF" in bins else ("f_C_PL", "mean"),
+        eer_full=("EER_C_gen_full_load", "mean") if "EER_C_gen_full_load" in bins else ("EER_C_gen", "mean"),
         capacity=("Q_C_gen_capacity_kW", "mean"),
     ).reset_index()
     fig_bin = make_subplots(
@@ -1808,7 +1952,9 @@ def plot_cooling_generation_16798_13(
     fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["q_supplied"], name="Cooling removed", marker_color="#2f78b7"), row=1, col=1)
     fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["e_el"] + grouped["w_aux"], name="Cooling electricity + auxiliaries", marker_color="#5b9bd5"), row=1, col=1)
     fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["eer"], mode="lines+markers", name="EER", line=dict(color="#2f78b7")), row=2, col=1, secondary_y=False)
+    fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["eer_full"], mode="lines+markers", name="Full-load EER", line=dict(color="#2f78b7", dash="dot")), row=2, col=1, secondary_y=False)
     fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["plr"], mode="lines+markers", name="Part-load ratio", line=dict(color="#70ad47")), row=2, col=1, secondary_y=True)
+    fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["plf"], mode="lines+markers", name="Part-load factor", line=dict(color="#44546a", dash="dash")), row=2, col=1, secondary_y=True)
     fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["capacity"], mode="lines+markers", name="Capacity", line=dict(color="#1f4e79")), row=3, col=1, secondary_y=False)
     fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["hours"], name="Hours", marker_color="#b7b7b7", opacity=0.55), row=3, col=1, secondary_y=True)
     fig_bin.update_xaxes(title_text="Outdoor-temperature bin center [degC]", row=3, col=1)
@@ -1820,6 +1966,142 @@ def plot_cooling_generation_16798_13(
     fig_bin.update_layout(title="EN 16798-13 Cooling Generation Bin Performance", barmode="group")
     bin_path = _write_plot(fig_bin, output_dir / "visuals" / "11_cooling_generation_16798_13_bins.html")
     return [ts_path, bin_path]
+
+
+def plot_performance_data_14511_14825(
+    performance_data: pybui.HeatPumpPerformanceDataResult,
+    output_dir: Path,
+) -> Path:
+    rating = performance_data.rating_points
+    heating = rating[rating["mode"] == "heating"]
+    cooling = rating[rating["mode"] == "cooling"]
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "EN 14511 declared heating COP and EN 14825 COPbin",
+            "EN 14511 declared cooling EER and EN 14825 EERbin",
+            "Declared capacity at rating points",
+            "EN 14825 capacity ratio and part-load factor",
+        ],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+    )
+    for sink in sorted(heating["sink_temperature_C"].unique()):
+        data = heating[heating["sink_temperature_C"].eq(sink)].sort_values(
+            "source_temperature_C"
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["cop"],
+                mode="lines+markers",
+                name=f"COPd W{sink:g}",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["performance_at_part_load"],
+                mode="lines+markers",
+                name=f"COPbin W{sink:g}",
+                line=dict(dash="dot"),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["capacity_kW"],
+                mode="lines+markers",
+                name=f"Heating capacity W{sink:g}",
+            ),
+            row=3,
+            col=1,
+        )
+
+    for sink in sorted(cooling["sink_temperature_C"].unique()):
+        data = cooling[cooling["sink_temperature_C"].eq(sink)].sort_values(
+            "source_temperature_C"
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["eer"],
+                mode="lines+markers",
+                name=f"EERd W{sink:g}",
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["performance_at_part_load"],
+                mode="lines+markers",
+                name=f"EERbin W{sink:g}",
+                line=dict(dash="dot"),
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["source_temperature_C"],
+                y=data["capacity_kW"],
+                mode="lines+markers",
+                name=f"Cooling capacity W{sink:g}",
+                line=dict(dash="dash"),
+            ),
+            row=3,
+            col=1,
+        )
+
+    part_load = rating.sort_values(["mode", "source_temperature_C", "sink_temperature_C"])
+    fig.add_trace(
+        go.Scatter(
+            x=part_load["source_temperature_C"],
+            y=part_load["capacity_ratio"],
+            mode="markers",
+            name="Capacity ratio CR",
+            marker=dict(color="#70ad47"),
+            text=part_load["rating_condition"],
+        ),
+        row=4,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=part_load["source_temperature_C"],
+            y=part_load["part_load_factor"],
+            mode="markers",
+            name="Part-load factor",
+            marker=dict(color="#44546a", symbol="diamond"),
+            text=part_load["rating_condition"],
+        ),
+        row=4,
+        col=1,
+        secondary_y=True,
+    )
+    fig.update_xaxes(title_text="Source / outdoor temperature [degC]", row=1, col=1)
+    fig.update_xaxes(title_text="Source / outdoor temperature [degC]", row=2, col=1)
+    fig.update_xaxes(title_text="Source / outdoor temperature [degC]", row=3, col=1)
+    fig.update_xaxes(title_text="Source / outdoor temperature [degC]", row=4, col=1)
+    fig.update_yaxes(title_text="COP [-]", row=1, col=1)
+    fig.update_yaxes(title_text="EER [-]", row=2, col=1)
+    fig.update_yaxes(title_text="kW", row=3, col=1)
+    fig.update_yaxes(title_text="CR [-]", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="factor [-]", row=4, col=1, secondary_y=True)
+    fig.update_layout(
+        title="EN 14511 Rating Data and EN 14825 Part-Load Inspection",
+        height=1120,
+    )
+    return _write_plot(fig, output_dir / "visuals" / "00_performance_14511_14825.html")
 
 
 def plot_heat_pump_hourly(allocated: pd.DataFrame, output_dir: Path) -> Path:
@@ -1966,16 +2248,18 @@ def plot_bin_balance(bins: pd.DataFrame, output_dir: Path) -> Path:
 def plot_bin_performance(bins: pd.DataFrame, output_dir: Path) -> Path:
     x = bins["bin_center_C"]
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.07,
+        vertical_spacing=0.06,
         subplot_titles=[
-            "Direct heating and DHW COP by bin",
-            "Direct cooling EER by bin",
+            "Heating and DHW COP by bin",
+            "Cooling EER by bin",
+            "EN 14825 part-load ratio and correction factor",
             "Capacity by bin",
             "Runtime and effective hours",
         ],
+        specs=[[{}], [{}], [{"secondary_y": True}], [{}], [{}]],
     )
     for prefix, label, color in [
         ("H", "Heating", "#b23b3b"),
@@ -1984,17 +2268,61 @@ def plot_bin_performance(bins: pd.DataFrame, output_dir: Path) -> Path:
     ]:
         performance_row = 2 if prefix == "C" else 1
         performance_name = f"{label} EER" if prefix == "C" else f"{label} COP"
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=bins[f"{prefix}_performance"],
-                mode="lines+markers",
-                name=performance_name,
-                line=dict(color=color),
-            ),
-            row=performance_row,
-            col=1,
-        )
+        if f"{prefix}_performance" in bins:
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=bins[f"{prefix}_performance"],
+                    mode="lines+markers",
+                    name=performance_name,
+                    line=dict(color=color),
+                ),
+                row=performance_row,
+                col=1,
+            )
+        if f"{prefix}_performance_full_load" in bins:
+            full_name = (
+                f"{label} full-load EER"
+                if prefix == "C"
+                else f"{label} full-load COP"
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=bins[f"{prefix}_performance_full_load"],
+                    mode="lines",
+                    name=full_name,
+                    line=dict(color=color, dash="dot"),
+                ),
+                row=performance_row,
+                col=1,
+            )
+        if f"{prefix}_part_load_ratio" in bins:
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=bins[f"{prefix}_part_load_ratio"],
+                    mode="lines+markers",
+                    name=f"{label} CR",
+                    line=dict(color=color),
+                ),
+                row=3,
+                col=1,
+                secondary_y=False,
+            )
+        if f"{prefix}_part_load_factor" in bins:
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=bins[f"{prefix}_part_load_factor"],
+                    mode="lines",
+                    name=f"{label} part-load factor",
+                    line=dict(color=color, dash="dash"),
+                ),
+                row=3,
+                col=1,
+                secondary_y=True,
+            )
         fig.add_trace(
             go.Scatter(
                 x=x,
@@ -2003,7 +2331,7 @@ def plot_bin_performance(bins: pd.DataFrame, output_dir: Path) -> Path:
                 name=f"{label} capacity",
                 line=dict(color=color),
             ),
-            row=3,
+            row=4,
             col=1,
         )
         fig.add_trace(
@@ -2013,7 +2341,7 @@ def plot_bin_performance(bins: pd.DataFrame, output_dir: Path) -> Path:
                 name=f"{label} HP runtime",
                 marker_color=color,
             ),
-            row=4,
+            row=5,
             col=1,
         )
 
@@ -2025,17 +2353,19 @@ def plot_bin_performance(bins: pd.DataFrame, output_dir: Path) -> Path:
             name="Effective bin hours",
             line=dict(color="#404040", dash="dash"),
         ),
-        row=4,
+        row=5,
         col=1,
     )
-    fig.update_xaxes(title_text="Outdoor-temperature bin center [degC]", row=4, col=1)
+    fig.update_xaxes(title_text="Outdoor-temperature bin center [degC]", row=5, col=1)
     fig.update_yaxes(title_text="COP [-]", row=1, col=1)
     fig.update_yaxes(title_text="EER [-]", row=2, col=1)
-    fig.update_yaxes(title_text="kW", row=3, col=1)
-    fig.update_yaxes(title_text="hours", row=4, col=1)
+    fig.update_yaxes(title_text="CR [-]", row=3, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="factor [-]", row=3, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="kW", row=4, col=1)
+    fig.update_yaxes(title_text="hours", row=5, col=1)
     fig.update_layout(
         title="Heat-Pump Product Map and Runtime Inspection",
-        height=980,
+        height=1180,
     )
     return _write_plot(fig, output_dir / "visuals" / "05_bin_performance.html")
 
@@ -2091,6 +2421,7 @@ def create_inspection_index(
     summary: dict[str, float],
     plot_paths: list[Path],
     iso_report: Path | None,
+    performance_data_summary: dict[str, float] | None = None,
     emission_summary: dict[str, float] | None = None,
     distribution_summary: dict[str, float] | None = None,
     storage_summary: dict[str, float] | None = None,
@@ -2107,6 +2438,23 @@ def create_inspection_index(
         "SPF heating+DHW": summary.get("SPF_HW_gen", np.nan),
         "SEER cooling": summary.get("SEER_C_gen", np.nan),
     }
+    if performance_data_summary:
+        cards.update(
+            {
+                "EN 14511 heating rating points": performance_data_summary.get(
+                    "heating_rating_point_count", 0.0
+                ),
+                "EN 14511 cooling rating points": performance_data_summary.get(
+                    "cooling_rating_point_count", 0.0
+                ),
+                "EN 14825 heating Cd": performance_data_summary.get(
+                    "heating_degradation_coefficient", np.nan
+                ),
+                "EN 14825 cooling Cd": performance_data_summary.get(
+                    "cooling_degradation_coefficient", np.nan
+                ),
+            }
+        )
     if emission_summary:
         cards.update(
             {
@@ -2165,6 +2513,9 @@ def create_inspection_index(
     )
     page_title = (
         "EN 15316 and EN 16798 Heat-Pump System Inspection"
+        if performance_data_summary
+        and (cooling_generation_summary or cooling_storage_summary or cooling_system_summary)
+        else "EN 15316 and EN 16798 Heat-Pump System Inspection"
         if cooling_generation_summary or cooling_storage_summary or cooling_system_summary
         else "EN 15316-2, EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
         if storage_summary and distribution_summary and emission_summary
@@ -2179,6 +2530,15 @@ def create_inspection_index(
         else "Heat Pump EN 15316-4-2 Inspection"
     )
     page_intro = (
+        "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
+        "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
+        "EN 15316-5 heating/DHW storage, EN 16798-9 cooling operating "
+        "conditions, EN 16798-15 chilled storage, EN 16798-13 cooling "
+        "generation, EN 14511/EN 14825 product data, heat-pump heating/DHW "
+        "bin method, electricity use and seasonal performance."
+        if performance_data_summary
+        and (cooling_generation_summary or cooling_storage_summary or cooling_system_summary)
+        else
         "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
         "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
         "EN 15316-5 heating/DHW storage, EN 16798-9 cooling operating "
@@ -2256,6 +2616,7 @@ def create_visual_outputs(
     cooling_system_result: pybui.CoolingSystemSimulationResult | None = None,
     cooling_storage_result: pybui.CoolingStorageSimulationResult | None = None,
     cooling_generation_result: pybui.CoolingGenerationSimulationResult | None = None,
+    performance_data_result: pybui.HeatPumpPerformanceDataResult | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
@@ -2273,7 +2634,10 @@ def create_visual_outputs(
         if emission_result is not None
         else "ISO52016 and DHW Inputs Sent to the Heat Pump"
     )
-    plot_paths = [plot_input_timeseries(loads, output_dir, title=input_title)]
+    plot_paths = []
+    if performance_data_result is not None:
+        plot_paths.append(plot_performance_data_14511_14825(performance_data_result, output_dir))
+    plot_paths.append(plot_input_timeseries(loads, output_dir, title=input_title))
     if emission_result is not None:
         plot_paths.extend(
             [
@@ -2330,6 +2694,9 @@ def create_visual_outputs(
         combined_summary,
         plot_paths,
         iso_report,
+        performance_data_summary=(
+            performance_data_result.summary if performance_data_result is not None else None
+        ),
         emission_summary=emission_summary,
         distribution_summary=distribution_summary,
         storage_summary=storage_summary,
@@ -2377,6 +2744,14 @@ def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str, str, str
     return tuple(methods)  # type: ignore[return-value]
 
 
+def resolve_performance_data_method(args: argparse.Namespace) -> str:
+    if args.performance_data_method is not None:
+        return args.performance_data_method
+    if args.calculation_path == "simple":
+        return "simple"
+    return "en14511-14825"
+
+
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
     (
@@ -2387,6 +2762,7 @@ def run_example(args: argparse.Namespace) -> None:
         cooling_storage_method,
         cooling_generation_method,
     ) = resolve_system_methods(args)
+    performance_data_method = resolve_performance_data_method(args)
     building = example_building(scenario)
     output_dir = (
         Path(args.output_dir)
@@ -2399,6 +2775,7 @@ def run_example(args: argparse.Namespace) -> None:
             cooling_system_method,
             cooling_storage_method,
             cooling_generation_method,
+            performance_data_method,
         )
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
@@ -2518,13 +2895,28 @@ def run_example(args: argparse.Namespace) -> None:
 
     ensure_heating_and_cooling(loads)
 
-    heating_map, cooling_map = heat_pump_maps(scenario)
+    performance_data_result = None
+    if performance_data_method == "en14511-14825":
+        performance_data_result = heat_pump_performance_data(scenario)
+        heating_map = performance_data_result.heating_map
+        cooling_map = performance_data_result.cooling_map
+    elif performance_data_method == "simple":
+        heating_map, cooling_map = heat_pump_maps(scenario)
+    else:
+        raise ValueError(
+            "--performance-data-method must be 'en14511-14825' or 'simple'."
+        )
+
     cooling_generation_result = None
     hp_loads = loads.copy()
     cooling_enabled_for_heat_pump = True
     if cooling_generation_method == "en16798-13":
         cooling_generation_calc = pybui.CoolingGenerationSystemCalculator(
-            cooling_generation_system_config(scenario, cooling_map)
+            cooling_generation_system_config(
+                scenario,
+                cooling_map,
+                performance_data_method=performance_data_method,
+            )
         )
         cooling_generation_result = cooling_generation_calc.run_timeseries(loads)
         hp_loads["Q_C_kWh"] = 0.0
@@ -2541,6 +2933,7 @@ def run_example(args: argparse.Namespace) -> None:
             cooling_map,
             include_internal_storage_losses=storage_method == "simple",
             cooling_enabled=cooling_enabled_for_heat_pump,
+            performance_data_method=performance_data_method,
         )
     )
     result = calc.run_timeseries(hp_loads)
@@ -2590,6 +2983,23 @@ def run_example(args: argparse.Namespace) -> None:
             output_dir / "cooling_generation_16798_13_summary.csv",
             index=False,
         )
+    if performance_data_result is not None:
+        performance_data_result.rating_points.to_csv(
+            output_dir / "performance_14511_14825_rating_points.csv",
+            index=False,
+        )
+        performance_data_result.heating_map.to_csv(
+            output_dir / "performance_14511_14825_heating_map.csv",
+            index=False,
+        )
+        performance_data_result.cooling_map.to_csv(
+            output_dir / "performance_14511_14825_cooling_map.csv",
+            index=False,
+        )
+        pd.DataFrame([performance_data_result.summary]).to_csv(
+            output_dir / "performance_14511_14825_summary.csv",
+            index=False,
+        )
     result.bins.to_csv(output_dir / "heat_pump_bin_results.csv", index=False)
     pd.DataFrame([result.summary]).to_csv(output_dir / "heat_pump_summary.csv", index=False)
     combined_summary = combined_generation_summary(result.summary, cooling_generation_result)
@@ -2609,6 +3019,7 @@ def run_example(args: argparse.Namespace) -> None:
         cooling_system_result=cooling_system_result,
         cooling_storage_result=cooling_storage_result,
         cooling_generation_result=cooling_generation_result,
+        performance_data_result=performance_data_result,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
@@ -2618,8 +3029,14 @@ def run_example(args: argparse.Namespace) -> None:
     print(f"Cooling operating-condition mode: {cooling_system_method}")
     print(f"Cooling storage mode: {cooling_storage_method}")
     print(f"Cooling generation mode: {cooling_generation_method}")
+    print(f"Performance data mode: {performance_data_method}")
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
+    if performance_data_result is not None:
+        print(
+            "EN 14511/EN 14825 rating points: "
+            f"{int(performance_data_result.summary['rating_point_count'])}"
+        )
     if emission_result is not None:
         cooling_input_label = (
             "EN 16798-13 cooling generator input load"
@@ -2787,6 +3204,19 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
             "generation module M4-8; 'heat-pump-simple' keeps the earlier "
             "reversible heat-pump cooling treatment. Default: en16798-13 unless "
             "--calculation-path overrides it."
+        ),
+    )
+    parser.add_argument(
+        "--performance-data-method",
+        choices=["en14511-14825", "simple"],
+        default=None,
+        help=(
+            "Heat-pump product performance data mode. 'en14511-14825' builds "
+            "capacity/COP/EER maps from EN 14511 rating points and applies "
+            "EN 14825 part-load correction in the generation calculators; "
+            "'simple' keeps the earlier synthetic maps and no part-load "
+            "correction. Default: en14511-14825, except --calculation-path "
+            "simple defaults to simple."
         ),
     )
     parser.add_argument(

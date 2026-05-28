@@ -453,7 +453,8 @@
         <tr><td>Cooling demand to generator</td><td><code>Q_C_kWh</code>, <code>Q_C_sto_in_kWh</code>, <code>Q_C_gen_in_req_kWh</code></td><td>Cooling energy that must be removed by the generator.</td></tr>
         <tr><td>Required evaporator outlet</td><td><code>theta_C_gen_out_req_C</code>, <code>T_C_sink_C</code></td><td>Cooling performance-map sink temperature.</td></tr>
         <tr><td>Heat rejection/source temperature</td><td><code>T_ext</code>, <code>T_C_source_C</code>, <code>heat_rejection_type</code></td><td>Cooling performance-map source temperature and heat-rejection audit output.</td></tr>
-        <tr><td>Product performance map</td><td><code>cooling_performance_map</code> with <code>source_temperature_C</code>, <code>sink_temperature_C</code>, <code>capacity_kW</code>, <code>eer</code></td><td>Cooling capacity and EER interpolation.</td></tr>
+        <tr><td>Product performance map</td><td><code>cooling_performance_map</code> with <code>source_temperature_C</code>, <code>sink_temperature_C</code>, <code>capacity_kW</code>, <code>eer</code></td><td>Cooling capacity and EER interpolation. The examples build this map from EN 14511/EN 14825 rating data by default; see <code>docs/performance_14511_14825_audit.html</code>.</td></tr>
+        <tr><td>Part-load correction</td><td><code>part_load_performance_method</code>, <code>part_load_degradation_coefficient</code></td><td>Optional EN 14825 correction from full-load EER to EERbin for air-to-water operation.</td></tr>
         <tr><td>Fallback product data</td><td><code>nominal_capacity_kW</code>, <code>nominal_eer</code></td><td>Used only when a performance map is not provided.</td></tr>
         <tr><td>Auxiliary inputs</td><td><code>control_power_kW</code>, <code>additional_auxiliary_power_kW</code>, <code>p_hr_el_dry</code>, <code>p_hr_el_wet</code></td><td>Cooling generator auxiliary electricity.</td></tr>
       </table>
@@ -491,6 +492,7 @@
       <div class="formula">Q_C_gen_in = Q_C_free + Q_C_mechanical + Q_C_backup</div>
       <div class="formula">f_C_PL = Q_C_mechanical / Q_C_gen_in_max</div>
       <div class="formula">E_C_gen_el_in = Q_C_mechanical / EER(theta_cond_in, theta_C_gen_out)</div>
+      <div class="formula">EN 14825 active: EER_C_gen = EER_C_gen_full_load * CR / (Cd * CR + (1 - Cd))</div>
       <div class="formula">Q_C_gen_out = Q_C_gen_in + E_C_gen_el_in</div>
       <div class="formula">E_C_total = E_C_gen_el_in + E_C_backup_in + W_C_aux_gen</div>
       <div class="formula">SEER_C_gen = Q_C_gen_in / E_C_total</div>
@@ -505,7 +507,7 @@
         <tbody>
           <tr><td><code>CoolingSystemSimulationResult.timeseries</code></td><td><code>Q_C_dis_out_tot_req_kWh</code>, <code>theta_C_gen_out_req_C</code>, <code>theta_C_dis_in_flw_req_C</code>, <code>theta_C_dis_out_ret_req_C</code>, <code>q_V_C_dis_m3_h</code>, <code>Q_C_gen_in_req_kWh</code></td><td>Check EN 16798-9 handoff and operating temperatures hour by hour.</td></tr>
           <tr><td><code>CoolingStorageSimulationResult.timeseries</code></td><td><code>Q_C_sto_out_kWh</code>, <code>Q_C_sto_ls_tot_kWh</code>, <code>W_C_sto_aux_kWh</code>, <code>Q_C_sto_in_kWh</code>, storage temperatures and recoverable terms</td><td>Check cooling storage heat gains and pump energy.</td></tr>
-          <tr><td><code>CoolingGenerationSimulationResult.timeseries</code></td><td><code>Q_C_gen_in_req_kWh</code>, <code>Q_C_gen_in_kWh</code>, <code>E_C_gen_el_in_kWh</code>, <code>W_C_aux_gen_kWh</code>, <code>E_C_total_kWh</code>, <code>EER_C_gen</code>, <code>f_C_PL</code></td><td>Check cooling capacity, part-load operation, EER, electricity and unmet load.</td></tr>
+          <tr><td><code>CoolingGenerationSimulationResult.timeseries</code></td><td><code>Q_C_gen_in_req_kWh</code>, <code>Q_C_gen_in_kWh</code>, <code>E_C_gen_el_in_kWh</code>, <code>W_C_aux_gen_kWh</code>, <code>E_C_total_kWh</code>, <code>EER_C_gen</code>, <code>EER_C_gen_full_load</code>, <code>f_C_PL</code>, <code>f_C_PLF</code></td><td>Check cooling capacity, EN 14825 part-load operation, EER, electricity and unmet load.</td></tr>
           <tr><td><code>cooling_16798_9_summary.csv</code></td><td>Annual cooling request, mean chilled-water temperatures and mean flow.</td><td>Check annual EN 16798-9 outputs.</td></tr>
           <tr><td><code>cooling_storage_16798_15_summary.csv</code></td><td>Annual storage heat gains, pump electricity, generator-side cooling input and storage expenditure factor.</td><td>Check annual EN 16798-15 outputs.</td></tr>
           <tr><td><code>cooling_generation_16798_13_summary.csv</code></td><td>Annual cooling removed, electricity, rejected heat, auxiliaries, SEER, mean EER and part load.</td><td>Check annual EN 16798-13 outputs.</td></tr>
@@ -519,7 +521,7 @@
         <tr><td><code>visuals/08_cooling_16798_9_operating_conditions.html</code></td><td>Cooling request, generator-side request, flow and return temperatures, volume flow.</td></tr>
         <tr><td><code>visuals/09_cooling_storage_16798_15.html</code></td><td>Cooling storage output/input balance, heat gains, storage pump electricity, storage/ambient temperature.</td></tr>
         <tr><td><code>visuals/10_cooling_generation_16798_13_timeseries.html</code></td><td>Daily cooling generation balance, electricity, EER, part-load and heat-rejection temperature.</td></tr>
-        <tr><td><code>visuals/11_cooling_generation_16798_13_bins.html</code></td><td>Cooling generation by outdoor-temperature bin, EER, part load and capacity.</td></tr>
+        <tr><td><code>visuals/11_cooling_generation_16798_13_bins.html</code></td><td>Cooling generation by outdoor-temperature bin, full-load EER, part-load-corrected EER, part-load factor and capacity.</td></tr>
       </table>
     </section>
 

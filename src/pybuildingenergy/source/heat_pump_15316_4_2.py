@@ -21,6 +21,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .performance_14511_14825 import en14825_part_load_factor
+
 
 _KWH_EPS = 1e-12
 
@@ -153,6 +155,39 @@ class HeatPumpSystemCalculator:
             "dhw_backup_efficiency",
         )
         self.cooling_backup_eer = _optional_float(cfg.get("cooling_backup_eer"))
+
+        self.part_load_performance_method = str(
+            cfg.get("part_load_performance_method", "simple")
+        ).lower()
+        if self.part_load_performance_method not in {"simple", "en14825"}:
+            raise ValueError("part_load_performance_method must be 'simple' or 'en14825'.")
+        self.part_load_unit_type = str(cfg.get("part_load_unit_type", "air-to-water")).lower()
+        default_cd = cfg.get("part_load_degradation_coefficient", 0.9)
+        self.heating_part_load_degradation_coefficient = _fraction(
+            cfg.get("heating_part_load_degradation_coefficient", default_cd),
+            "heating_part_load_degradation_coefficient",
+        )
+        self.dhw_part_load_degradation_coefficient = _fraction(
+            cfg.get("dhw_part_load_degradation_coefficient", default_cd),
+            "dhw_part_load_degradation_coefficient",
+        )
+        self.cooling_part_load_degradation_coefficient = _fraction(
+            cfg.get("cooling_part_load_degradation_coefficient", default_cd),
+            "cooling_part_load_degradation_coefficient",
+        )
+        default_min_cr = cfg.get("part_load_minimum_capacity_ratio", 0.0)
+        self.heating_part_load_minimum_capacity_ratio = _fraction(
+            cfg.get("heating_part_load_minimum_capacity_ratio", default_min_cr),
+            "heating_part_load_minimum_capacity_ratio",
+        )
+        self.dhw_part_load_minimum_capacity_ratio = _fraction(
+            cfg.get("dhw_part_load_minimum_capacity_ratio", default_min_cr),
+            "dhw_part_load_minimum_capacity_ratio",
+        )
+        self.cooling_part_load_minimum_capacity_ratio = _fraction(
+            cfg.get("cooling_part_load_minimum_capacity_ratio", default_min_cr),
+            "cooling_part_load_minimum_capacity_ratio",
+        )
 
         self.combined_operation = str(cfg.get("combined_operation", "alternative")).lower()
         if self.combined_operation not in {"alternative", "independent"}:
@@ -517,6 +552,7 @@ class HeatPumpSystemCalculator:
             perf_col = "eer"
 
         demand = float(group[demand_col].sum())
+        load_hours = float(group.loc[group[demand_col] > _KWH_EPS, "hours"].sum())
         if service == "H" and demand > _KWH_EPS:
             storage_loss = self._storage_loss(
                 group,
@@ -572,7 +608,9 @@ class HeatPumpSystemCalculator:
             required_runtime_h = np.inf if hp_requested_kWh > _KWH_EPS else 0.0
 
         return {
+            "service": service,
             "Q_gen_out_kWh": demand,
+            "load_hours": load_hours,
             "Q_gen_ls_kWh": storage_loss,
             "Q_total_required_kWh": load_with_losses,
             "Q_backup_operating_kWh": backup_operating_kWh,
@@ -581,8 +619,13 @@ class HeatPumpSystemCalculator:
             "T_sink_C": sink,
             "T_return_or_cold_C": return_or_cold,
             "performance": performance,
+            "performance_full_load": performance,
             "capacity_kW": capacity_kW,
             "required_runtime_h": required_runtime_h,
+            "part_load_ratio": 0.0,
+            "part_load_ratio_for_performance": 0.0,
+            "part_load_factor": 1.0,
+            "part_load_degradation_coefficient": self._part_load_degradation_coefficient(service),
             "hp_available": 1.0 if available else 0.0,
             "hp_runtime_h": 0.0,
             "Q_hp_out_kWh": 0.0,
@@ -647,6 +690,11 @@ class HeatPumpSystemCalculator:
         initial_unmet = service_result.get("Q_unmet_operating_kWh", 0.0)
         service_result["hp_runtime_h"] = runtime
         service_result["Q_hp_out_kWh"] = hp_out
+        part_load_hours = self._part_load_reference_hours(service_result, available_hours, runtime)
+        service_result["part_load_ratio"] = _ratio(
+            hp_out,
+            capacity * part_load_hours,
+        )
         service_result["Q_backup_capacity_kWh"] = backup_capacity
         service_result["Q_backup_out_kWh"] += backup_capacity
         service_result["Q_unmet_kWh"] = initial_unmet + unmet
@@ -655,6 +703,7 @@ class HeatPumpSystemCalculator:
     def _finalize_heating_service(
         self, service_result: dict[str, float], backup_efficiency: float
     ) -> None:
+        self._apply_part_load_performance(service_result)
         perf = service_result["performance"]
         hp_out = service_result["Q_hp_out_kWh"]
         service_result["E_hp_in_kWh"] = hp_out / perf if hp_out > _KWH_EPS and perf > 0 else 0.0
@@ -692,9 +741,15 @@ class HeatPumpSystemCalculator:
 
         cooling["hp_runtime_h"] = runtime
         cooling["Q_hp_out_kWh"] = hp_out
+        part_load_hours = self._part_load_reference_hours(cooling, effective_hours, runtime)
+        cooling["part_load_ratio"] = _ratio(
+            hp_out,
+            capacity * part_load_hours,
+        )
         cooling["Q_backup_capacity_kWh"] = backup_capacity
         cooling["Q_backup_out_kWh"] += backup_capacity
         cooling["Q_unmet_kWh"] = unmet
+        self._apply_part_load_performance(cooling)
         perf = cooling["performance"]
         cooling["E_hp_in_kWh"] = hp_out / perf if hp_out > _KWH_EPS and perf > 0 else 0.0
         cooling["E_backup_in_kWh"] = (
@@ -703,6 +758,58 @@ class HeatPumpSystemCalculator:
             else 0.0
         )
         cooling["Q_rejected_kWh"] = cooling["Q_hp_out_kWh"] + cooling["E_hp_in_kWh"]
+
+    def _part_load_reference_hours(
+        self,
+        service_result: dict[str, float],
+        available_hours: float,
+        runtime: float,
+    ) -> float:
+        demand_hours = max(service_result.get("load_hours", 0.0), 0.0)
+        if demand_hours > _KWH_EPS:
+            return max(min(demand_hours, max(available_hours, 0.0)), runtime, _KWH_EPS)
+        return max(runtime, _KWH_EPS)
+
+    def _part_load_degradation_coefficient(self, service: str) -> float:
+        if service == "C":
+            return self.cooling_part_load_degradation_coefficient
+        if service == "W":
+            return self.dhw_part_load_degradation_coefficient
+        return self.heating_part_load_degradation_coefficient
+
+    def _apply_part_load_performance(self, service_result: dict[str, float]) -> None:
+        full_load_performance = service_result.get("performance_full_load", np.nan)
+        service_result["performance"] = full_load_performance
+        service_result["part_load_factor"] = 1.0
+        service_result["part_load_ratio_for_performance"] = service_result.get(
+            "part_load_ratio", 0.0
+        )
+        if self.part_load_performance_method != "en14825":
+            return
+        if not np.isfinite(full_load_performance) or full_load_performance <= 0:
+            return
+        if service_result.get("Q_hp_out_kWh", 0.0) <= _KWH_EPS:
+            return
+        part_load_ratio = service_result.get("part_load_ratio", 1.0)
+        minimum_ratio = self._part_load_minimum_capacity_ratio(service_result)
+        performance_ratio = max(part_load_ratio, minimum_ratio)
+        coefficient = service_result.get("part_load_degradation_coefficient", 0.9)
+        factor = en14825_part_load_factor(
+            capacity_ratio=performance_ratio,
+            degradation_coefficient=coefficient,
+            unit_type=self.part_load_unit_type,
+        )
+        service_result["part_load_ratio_for_performance"] = performance_ratio
+        service_result["part_load_factor"] = factor
+        service_result["performance"] = max(full_load_performance * factor, _KWH_EPS)
+
+    def _part_load_minimum_capacity_ratio(self, service_result: dict[str, float]) -> float:
+        service = service_result.get("service")
+        if service == "C":
+            return self.cooling_part_load_minimum_capacity_ratio
+        if service == "W":
+            return self.dhw_part_load_minimum_capacity_ratio
+        return self.heating_part_load_minimum_capacity_ratio
 
     def _storage_loss(
         self, group: pd.DataFrame, loss_kWh_per_day: float, temperature_col: str
@@ -823,6 +930,15 @@ class HeatPumpSystemCalculator:
             "SPF_HW_hp": spf_hw_hp,
             "e_HW_gen": _ratio(1.0, spf_hw_gen),
             "SEER_C_gen": seer_c_gen,
+            "H_part_load_factor_mean": _weighted_mean(
+                bins["H_part_load_factor"], bins["H_Q_hp_out_kWh"] + _KWH_EPS
+            ),
+            "W_part_load_factor_mean": _weighted_mean(
+                bins["W_part_load_factor"], bins["W_Q_hp_out_kWh"] + _KWH_EPS
+            ),
+            "C_part_load_factor_mean": _weighted_mean(
+                bins["C_part_load_factor"], bins["C_Q_hp_out_kWh"] + _KWH_EPS
+            ),
         }
 
 
@@ -1002,7 +1118,11 @@ def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
 
 
 def _prefix_dict(values: dict[str, float], prefix: str) -> dict[str, float]:
-    return {f"{prefix}_{key}": value for key, value in values.items()}
+    return {
+        f"{prefix}_{key}": value
+        for key, value in values.items()
+        if key != "service"
+    }
 
 
 def _positive_float(value: Any, name: str) -> float:

@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from .heat_pump_15316_4_2 import _coerce_performance_map, _interpolate_performance
+from .performance_14511_14825 import en14825_part_load_factor
 
 
 _KWH_EPS = 1e-12
@@ -126,6 +127,20 @@ class CoolingGenerationSystemCalculator:
         self.minimum_part_load_ratio = max(
             float(cfg.get("minimum_part_load_ratio", cfg.get("f_C_PL_min", 0.0))),
             0.0,
+        )
+        self.part_load_performance_method = str(
+            cfg.get("part_load_performance_method", "simple")
+        ).lower()
+        if self.part_load_performance_method not in {"simple", "en14825"}:
+            raise ValueError("part_load_performance_method must be 'simple' or 'en14825'.")
+        self.part_load_unit_type = str(cfg.get("part_load_unit_type", "air-to-water")).lower()
+        self.part_load_degradation_coefficient = _fraction(
+            cfg.get("part_load_degradation_coefficient", 0.9),
+            "part_load_degradation_coefficient",
+        )
+        self.part_load_minimum_capacity_ratio = _fraction(
+            cfg.get("part_load_minimum_capacity_ratio", 0.0),
+            "part_load_minimum_capacity_ratio",
         )
         self.cooling_backup_eer = _optional_positive_float(cfg.get("cooling_backup_eer"))
         self.heat_recovery_fraction = _fraction(
@@ -286,6 +301,33 @@ class CoolingGenerationSystemCalculator:
         out.loc[:, "Q_C_gen_in_kWh"] = q_free + q_mechanical + q_backup
 
         out.loc[:, "f_C_PL"] = _safe_divide(q_mechanical, max_available).clip(0.0, 1.0)
+        out.loc[:, "EER_C_gen_full_load"] = out["EER_C_gen"]
+        if self.part_load_performance_method == "en14825":
+            factors = [
+                en14825_part_load_factor(
+                    capacity_ratio=max(plr, self.part_load_minimum_capacity_ratio),
+                    degradation_coefficient=self.part_load_degradation_coefficient,
+                    unit_type=self.part_load_unit_type,
+                )
+                if load > _KWH_EPS
+                else 1.0
+                for plr, load in zip(out["f_C_PL"], q_mechanical)
+            ]
+            out.loc[:, "f_C_PLF"] = factors
+            out.loc[:, "f_C_PL_for_performance"] = out["f_C_PL"].clip(
+                lower=self.part_load_minimum_capacity_ratio,
+                upper=1.0,
+            )
+            out.loc[:, "part_load_degradation_coefficient"] = (
+                self.part_load_degradation_coefficient
+            )
+            out.loc[:, "EER_C_gen"] = (
+                out["EER_C_gen_full_load"] * out["f_C_PLF"]
+            ).clip(lower=_KWH_EPS)
+        else:
+            out.loc[:, "f_C_PLF"] = 1.0
+            out.loc[:, "f_C_PL_for_performance"] = out["f_C_PL"]
+            out.loc[:, "part_load_degradation_coefficient"] = 0.0
         out.loc[:, "t_C_gen_runtime_h"] = _safe_divide(
             q_mechanical,
             out["Q_C_gen_capacity_kW"].replace(0.0, np.nan),
@@ -402,7 +444,15 @@ class CoolingGenerationSystemCalculator:
             "EC_total_kWh": e_total,
             "SEER_C_gen": _ratio(q_in, e_total),
             "EER_C_gen_mean": _weighted_mean(results["EER_C_gen"], weights),
+            "EER_C_gen_full_load_mean": _weighted_mean(
+                results["EER_C_gen_full_load"], weights
+            )
+            if "EER_C_gen_full_load" in results
+            else _weighted_mean(results["EER_C_gen"], weights),
             "f_C_PL_mean": _weighted_mean(results["f_C_PL"], weights),
+            "f_C_PLF_mean": _weighted_mean(results["f_C_PLF"], weights)
+            if "f_C_PLF" in results
+            else 1.0,
             "theta_C_gen_out_mean_C": _weighted_mean(results["theta_C_gen_out_C"], weights),
             "theta_cond_in_mean_C": _weighted_mean(results["theta_cond_in_C"], weights),
             "t_C_gen_runtime_h": float(results["t_C_gen_runtime_h"].sum()),

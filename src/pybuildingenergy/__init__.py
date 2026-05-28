@@ -16,6 +16,11 @@ from .source.cooling_generation_16798_13 import (
     CoolingGenerationSimulationResult,
     CoolingGenerationSystemCalculator,
 )
+from .source.performance_14511_14825 import (
+    HeatPumpPerformanceDataCalculator,
+    HeatPumpPerformanceDataResult,
+    en14825_part_load_factor,
+)
 from .source.heat_pump_15316_4_2 import HeatPumpSimulationResult, HeatPumpSystemCalculator
 from .source.check_input import check_heating_system_inputs
 from .source.generate_profile import HourlyProfileGenerator, get_country_code_from_latlon
@@ -45,6 +50,9 @@ __all__ = [
     "CoolingStorageSystemCalculator",
     "CoolingGenerationSimulationResult",
     "CoolingGenerationSystemCalculator",
+    "HeatPumpPerformanceDataCalculator",
+    "HeatPumpPerformanceDataResult",
+    "en14825_part_load_factor",
     "HeatPumpSimulationResult",
     "HeatPumpSystemCalculator",
     "Graphs_and_report",
