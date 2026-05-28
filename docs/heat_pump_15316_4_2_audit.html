@@ -328,9 +328,10 @@
           <h3>Cooling Treatment</h3>
           <p>
             EN 15316-4-2:2008 is a heating and DHW generation standard. The
-            code adds reversible space cooling as an explicit extension using
-            the same bin and product-map pattern, with EER and SEER outputs
-            reported separately.
+            default examples therefore use EN 16798-9, EN 16798-15 and
+            EN 16798-13 for space cooling. The older reversible EER-bin
+            extension remains available as a comparison path with
+            <code>--calculation-path heat-pump-cooling</code>.
           </p>
         </div>
         <div class="card">
@@ -512,15 +513,17 @@
           </tr>
           <tr>
             <td>Outside EN 15316-4-2:2008 heating/DHW scope</td>
-            <td>Reversible cooling with EER map.</td>
+            <td>Simplified reversible cooling with EER map.</td>
             <td>
               <code>_allocate_cooling_runtime()</code><br>
               <code>cooling_performance_map</code>
             </td>
             <td>
-              Cooling is handled by the same bin mechanics but is explicitly
-              separated in outputs as <code>QC...</code>, <code>EC...</code> and
-              <code>SEER_C_gen</code>.
+              This is retained for the <code>heat-pump-cooling</code> and
+              <code>simple</code> example paths. The default <code>full</code>
+              path calculates cooling generation with
+              <code>CoolingGenerationSystemCalculator</code> according to
+              EN 16798-13.
             </td>
             <td><span class="status extension">extension</span></td>
           </tr>
@@ -619,7 +622,7 @@
           <tr>
             <td><code>cooling_performance_map</code></td>
             <td><code>source_temperature_C</code>, <code>sink_temperature_C</code>, <code>capacity_kW</code>, <code>eer</code></td>
-            <td>Cooling extension capacity, EER, runtime and compressor electricity.</td>
+            <td>Cooling extension capacity, EER, runtime and compressor electricity in the simplified reversible heat-pump cooling path. The default examples reuse this map in the EN 16798-13 cooling generator.</td>
           </tr>
         </tbody>
       </table>
@@ -749,6 +752,12 @@
       <div class="formula">Heating/DHW: Q_environment_in = max(Q_hp_out - E_hp_in, 0)</div>
       <div class="formula">Cooling: E_hp_in = Q_hp_out / EER</div>
       <div class="formula">Cooling: Q_rejected = Q_hp_out + E_hp_in</div>
+      <p class="small">
+        The cooling formulas above apply to the simplified reversible heat-pump
+        branch. In the default example path, cooling generation is calculated
+        by <code>CoolingGenerationSystemCalculator</code> according to
+        EN 16798-13; see <code>docs/cooling_16798_audit.html</code>.
+      </p>
 
       <h3>8. Calculate Auxiliary Energy And Recoverable Losses</h3>
       <p>Function: <code>_simulate_one_bin()</code>.</p>
@@ -834,7 +843,7 @@
           <tr><td><code>QHW_environment_in_kWh</code></td><td>Environmental/source heat absorbed by the heat pump in heating/DHW mode.</td></tr>
           <tr><td><code>QC_rejected_kWh</code></td><td>Heat rejected in cooling mode, equal to cooling useful extraction plus compressor input.</td></tr>
           <tr><td><code>SPF_HW_gen</code>, <code>SPF_HW_hp</code></td><td>Seasonal performance factors for heating+DHW generator boundary and HP-only output boundary.</td></tr>
-          <tr><td><code>SEER_C_gen</code></td><td>Cooling seasonal efficiency for the reversible cooling extension.</td></tr>
+          <tr><td><code>SEER_C_gen</code></td><td>Cooling seasonal efficiency. In <code>heat_pump_summary.csv</code> this belongs to the simplified reversible cooling branch; in <code>combined_generation_summary.csv</code> for the default examples it comes from EN 16798-13.</td></tr>
           <tr><td><code>e_HW_gen</code></td><td>Inverse of <code>SPF_HW_gen</code>.</td></tr>
         </tbody>
       </table>
@@ -861,6 +870,14 @@
             <td>Summary outputs listed above.</td>
           </tr>
           <tr>
+            <td><code>cooling_16798_9_summary.csv</code>, <code>cooling_storage_16798_15_summary.csv</code>, <code>cooling_generation_16798_13_summary.csv</code></td>
+            <td>Default-path cooling operating conditions, cooling storage and cooling generation outputs. See <code>cooling_16798_audit.html</code> for the standard crosswalk.</td>
+          </tr>
+          <tr>
+            <td><code>combined_generation_summary.csv</code></td>
+            <td>Heating/DHW heat-pump outputs combined with EN 16798-13 cooling generation outputs for the visual index and Sankey.</td>
+          </tr>
+          <tr>
             <td><code>heat_pump_hourly_allocated_results.csv</code></td>
             <td>Visualization helper. Bin totals are allocated back to hours for inspection only; this is not the calculation basis.</td>
           </tr>
@@ -882,6 +899,11 @@
       <pre><code>python examples/heat_pump_15316_4_2_example.py --scenario athens
 python examples/heat_pump_15316_4_2_example.py --scenario bolzano
 python examples/heat_pump_15316_4_2_bolzano_example.py</code></pre>
+      <p>
+        The default path uses EN 16798 cooling-side modules. To compare against
+        the earlier reversible heat-pump cooling extension, run:
+      </p>
+      <pre><code>python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path heat-pump-cooling</code></pre>
       <p>
         Output folders:
       </p>

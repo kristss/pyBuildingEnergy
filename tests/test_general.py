@@ -552,6 +552,117 @@ def test_storage_system_calculator_heating_dhw():
     assert pybui.StorageSystemCalculator is not None
 
 
+def test_cooling_system_calculator_16798_9_operating_conditions():
+    """Test EN 16798-9 cooling operating temperatures and flow."""
+    import pybuildingenergy as pybui
+
+    loads = pd.DataFrame(
+        {
+            "T_ext": [24.0, 30.0, 35.0],
+            "Q_C_kWh": [0.0, 2.0, 4.0],
+        },
+        index=pd.date_range("2026-07-01", periods=3, freq="h"),
+    )
+    calc = pybui.CoolingSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "distribution_temperature_control": "CONST",
+            "distribution_flow_control": "VARIABLE",
+            "theta_C_dis_flw_set_C": 7.0,
+            "design_deltaT_K": 5.0,
+            "design_cooling_load_kW": 8.0,
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.summary["QC_dis_out_tot_req_kWh"] == pytest.approx(6.0)
+    assert result.timeseries["theta_C_dis_supply_C"].dropna().iloc[-1] == pytest.approx(7.0)
+    assert result.timeseries["theta_C_dis_return_C"].iloc[-1] > result.timeseries["theta_C_dis_supply_C"].iloc[-1]
+    assert result.summary["q_V_C_dis_max_m3_h"] > 0
+    assert pybui.CoolingSystemCalculator is not None
+
+
+def test_cooling_storage_system_calculator_16798_15():
+    """Test EN 16798-15 chilled storage heat gains and auxiliaries."""
+    import pybuildingenergy as pybui
+
+    loads = pd.DataFrame(
+        {
+            "T_ext": [30.0, 31.0, 32.0],
+            "Q_C_kWh": [2.0, 3.0, 0.0],
+            "T_C_sink_C": [7.0, 7.0, 7.0],
+            "theta_C_dis_return_C": [12.0, 12.0, 12.0],
+        },
+        index=pd.date_range("2026-07-01", periods=3, freq="h"),
+    )
+    calc = pybui.CoolingStorageSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "storage_volume_l": 80.0,
+            "H_C_sto_tot_ls_W_K": 0.8,
+            "generator_loop_loss_coefficient_W_K": 0.2,
+            "distribution_loop_loss_coefficient_W_K": 0.2,
+            "ambient_temperature_C": 20.0,
+            "input_pump_power_kW": 0.02,
+            "input_pump_flow_m3_h": 0.8,
+            "input_pump_deltaT_K": 5.0,
+            "output_pump_power_kW": 0.02,
+            "output_pump_flow_m3_h": 0.8,
+            "output_pump_deltaT_K": 5.0,
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.summary["QC_sto_out_kWh"] == pytest.approx(5.0)
+    assert result.summary["QC_sto_ls_tot_kWh"] > 0
+    assert result.summary["WC_sto_aux_kWh"] > 0
+    assert result.summary["QC_sto_in_kWh"] > result.summary["QC_sto_out_kWh"]
+    assert result.summary["QC_sto_ls_tot_rbl_kWh"] < 0
+    assert pybui.CoolingStorageSystemCalculator is not None
+
+
+def test_cooling_generation_system_calculator_16798_13():
+    """Test EN 16798-13 compression cooling generation."""
+    import pybuildingenergy as pybui
+
+    cooling_map = pd.DataFrame(
+        {
+            "source_temperature_C": [25.0, 35.0, 25.0, 35.0],
+            "sink_temperature_C": [7.0, 7.0, 12.0, 12.0],
+            "capacity_kW": [8.0, 7.0, 8.5, 7.5],
+            "eer": [4.0, 3.3, 4.2, 3.5],
+        }
+    )
+    loads = pd.DataFrame(
+        {
+            "T_ext": [25.0, 35.0, 30.0],
+            "Q_C_kWh": [2.0, 4.0, 0.0],
+            "T_C_sink_C": [7.0, 7.0, 7.0],
+        },
+        index=pd.date_range("2026-07-01", periods=3, freq="h"),
+    )
+    calc = pybui.CoolingGenerationSystemCalculator(
+        {
+            "demand_unit": "kWh",
+            "cooling_performance_map": cooling_map,
+            "nominal_capacity_kW": 8.0,
+            "control_power_kW": 0.01,
+        }
+    )
+
+    result = calc.run_timeseries(loads)
+
+    assert result.summary["QC_gen_in_req_kWh"] == pytest.approx(6.0)
+    assert result.summary["QC_gen_in_kWh"] == pytest.approx(6.0)
+    assert result.summary["EC_gen_el_in_kWh"] > 0
+    assert result.summary["WC_aux_gen_kWh"] > 0
+    assert result.summary["SEER_C_gen"] > 2.5
+    assert result.summary["QC_gen_out_kWh"] > result.summary["QC_gen_in_kWh"]
+    assert pybui.CoolingGenerationSystemCalculator is not None
+
+
 @pytest.mark.parametrize("fix", [True, False])
 def test_sanitize_and_validate_bui(building_data, fix):
     """Test per la validazione dei dati dell'edificio"""

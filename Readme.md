@@ -83,15 +83,25 @@ For the audit trail, open
 
 ## Heat Pump Generation - EN 15316-4-2 **(New)**
 
-`HeatPumpSystemCalculator` evaluates a reversible heat-pump generator for:
+`HeatPumpSystemCalculator` evaluates heat-pump generation for:
 
 - space heating,
 - domestic hot water (DHW),
-- and space cooling with a reversible EER map.
+- and an optional simplified reversible space-cooling branch with an EER map.
 
-The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, optional simplified storage losses, backup energy and SPF outputs. Cooling is reported separately with the same bin/product-map approach using EER values.
+The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, optional simplified storage losses, backup energy and SPF outputs. The runnable examples use the EN 16798 cooling modules by default; the older heat-pump EER cooling branch is still available with `--calculation-path heat-pump-cooling`.
 
 For a clause-by-clause audit trail between the standard, the implementation and the output files, open [Heat Pump EN 15316-4-2 Implementation Audit](docs/heat_pump_15316_4_2_audit.html).
+
+## Cooling System Modules - EN 16798-9, EN 16798-15 And EN 16798-13 **(New)**
+
+The heat-pump examples now treat space cooling with the cooling-side EN 16798 standards:
+
+- `CoolingSystemCalculator` implements EN 16798-9 operating conditions and the handoff of cooling requests to storage or generation.
+- `CoolingStorageSystemCalculator` implements EN 16798-15 chilled-water storage heat gains and pump auxiliary energy.
+- `CoolingGenerationSystemCalculator` implements EN 16798-13 compression cooling generation using cooling capacity/EER product maps or nominal EER fallback data.
+
+For the audit trail between the standards, code and outputs, open [Cooling EN 16798 Implementation Audit](docs/cooling_16798_audit.html).
 
 ```python
 import pandas as pd
@@ -152,7 +162,7 @@ python examples/heat_pump_15316_4_2_bolzano_example.py
 
 The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed top-floor envelope and an air-to-water heat-pump map sized for a 120 m2 residential building.
 
-Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects and EN 15316-5 heating/DHW storage effects by default, calculates an hourly DHW profile, runs the heat-pump generator calculation and writes:
+Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects, EN 15316-5 heating/DHW storage effects and the EN 16798 cooling-side modules by default, calculates an hourly DHW profile, runs the generator calculations and writes:
 
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
@@ -161,9 +171,16 @@ Each scenario runs ISO52016 for the example building, applies EN 15316-2 emissio
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_hourly_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_16798_9_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_16798_9_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_storage_16798_15_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_storage_16798_15_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_generation_16798_13_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_generation_16798_13_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_hourly_allocated_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_bin_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/combined_generation_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/inspection_index.html`
 
 Open `inspection_index.html` in a browser to inspect the visual outputs. The page links to:
@@ -173,6 +190,9 @@ Open `inspection_index.html` in a browser to inspect the visual outputs. The pag
 - EN 15316-2 emission time series and monthly aggregate plots;
 - EN 15316-3 distribution time series and monthly aggregate plots;
 - EN 15316-5 storage time series and monthly aggregate plots;
+- EN 16798-9 cooling operating-condition time series;
+- EN 16798-15 cooling storage time series and aggregate plots;
+- EN 16798-13 cooling generation time series and bin plots;
 - allocated heat-pump electricity time series;
 - monthly demand, electricity, SPF and SEER summaries;
 - bin-method energy balance plots;
@@ -200,6 +220,20 @@ python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-p
 python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path storage-only
 ```
 
+To bypass only the EN 16798-15 cooling storage module while retaining EN 15316-2, EN 15316-3, EN 15316-5 and EN 16798-13, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path no-cooling-storage
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path no-cooling-storage
+```
+
+To retain the earlier reversible heat-pump cooling branch instead of EN 16798-13, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path heat-pump-cooling
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path heat-pump-cooling
+```
+
 To run EN 15316-2 emission effects but bypass EN 15316-3 distribution and EN 15316-5 storage, use:
 
 ```bash
@@ -207,7 +241,7 @@ python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-p
 python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path emission-only
 ```
 
-To reproduce the earlier simple calculation without EN 15316-2, EN 15316-3 or EN 15316-5 effects, use:
+To reproduce the earlier simple calculation without EN 15316-2, EN 15316-3, EN 15316-5 or EN 16798 effects, use:
 
 ```bash
 python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path simple
@@ -242,6 +276,13 @@ The EN 15316 series covers the calculation method for system energy requirements
   - 4-5: District heating
   - 4-7: Biomass
 - [x] EN 15316-5: Storage systems
+
+## EN 16798 Cooling Modular Structure **(New)**
+
+- [x] EN 16798-9: Cooling systems, operating conditions and M4-1/M4-4 handoff
+- [x] EN 16798-13: Cooling generation, compression systems
+- [x] EN 16798-15: Cooling storage
+- [ ] EN 16798-13 non-compression cooling generators, such as absorption, adsorption, desiccant or evaporative cooling
 
 For space heating, applicable standards include EN 15316-1, EN 15316-2-1, EN 15316-2-3 and the appropriate parts of EN 15316-4 depending on the system type, including losses and control aspects.
 

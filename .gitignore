@@ -116,3 +116,6 @@ ENV/
 # IDE settings
 .vscode/
 .idea/
+
+# Example outputs
+examples/outputs/

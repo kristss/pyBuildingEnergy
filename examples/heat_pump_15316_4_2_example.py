@@ -7,8 +7,10 @@ This script demonstrates the complete sequence:
 3. Calculate a meaningful hourly DHW need with the DHW module.
 4. Apply EN 15316-3 water-based distribution losses and pump auxiliaries.
 5. Apply EN 15316-5 heating/DHW storage losses and auxiliaries.
-6. Run the EN 15316-4-2 heat-pump bin calculation.
-7. Save the intermediate loads, bin balance and summary outputs.
+6. Apply EN 16798-9, EN 16798-15 and EN 16798-13 to the cooling-side
+   operating conditions, chilled storage and generation calculation.
+7. Run the EN 15316-4-2 heat-pump bin calculation for heating and DHW.
+8. Save the intermediate loads, bin balance and summary outputs.
 
 Default weather uses PVGIS for the selected scenario. If network access is not
 available, run with ``--weather-source epw --path-weather-file path/to/weather.epw``.
@@ -55,12 +57,18 @@ def default_output_dir(
     emission_method: str = "en15316-2",
     distribution_method: str = "en15316-3",
     storage_method: str = "en15316-5",
+    cooling_system_method: str = "en16798-9",
+    cooling_storage_method: str = "en16798-15",
+    cooling_generation_method: str = "en16798-13",
 ) -> Path:
     suffix = f"heat_pump_15316_4_2_{scenario}"
     if (
         emission_method == "simple"
         and distribution_method == "simple"
         and storage_method == "simple"
+        and cooling_system_method == "simple"
+        and cooling_storage_method == "simple"
+        and cooling_generation_method == "heat-pump-simple"
     ):
         suffix = f"{suffix}_simple"
     elif (
@@ -99,6 +107,10 @@ def default_output_dir(
         and storage_method == "en15316-5"
     ):
         suffix = f"{suffix}_distribution_storage"
+    if cooling_generation_method == "heat-pump-simple" and not suffix.endswith("_simple"):
+        suffix = f"{suffix}_heat_pump_cooling"
+    elif cooling_storage_method == "simple" and cooling_generation_method == "en16798-13":
+        suffix = f"{suffix}_no_cooling_storage"
     return REPO_ROOT / "examples" / "outputs" / suffix
 
 
@@ -487,6 +499,7 @@ def heat_pump_config(
     heating_map: pd.DataFrame,
     cooling_map: pd.DataFrame,
     include_internal_storage_losses: bool = True,
+    cooling_enabled: bool = True,
 ) -> dict:
     """Scenario-specific generator assumptions for the example heat pump."""
 
@@ -497,6 +510,7 @@ def heat_pump_config(
         "source_type": "air",
         "demand_unit": "kWh",
         "bin_width_C": 1.0,
+        "cooling_enabled": cooling_enabled,
         "design_outdoor_temperature_C": -3.0,
         "heating_cutoff_temperature_C": 16.0,
         "heating_sink_temp_at_design_C": 45.0,
@@ -869,6 +883,96 @@ def storage_system_config(scenario: str) -> dict:
     return config
 
 
+def cooling_system_config(scenario: str) -> dict:
+    """Scenario-specific EN 16798-9 cooling-system operating assumptions."""
+
+    config = {
+        "demand_unit": "kWh",
+        "system_type": "water",
+        "generator_temperature_control": "VARIABLE",
+        "distribution_temperature_control": "CONST",
+        "distribution_flow_control": "VARIABLE",
+        "theta_C_gen_out_set_C": 7.0,
+        "theta_C_dis_flw_set_C": 7.0,
+        "theta_C_dis_flw_set_min_C": 6.0,
+        "theta_C_dis_flw_set_max_C": 18.0,
+        "outdoor_compensation_slope": 0.0,
+        "outdoor_compensation_offset_K": 7.0,
+        "design_deltaT_K": 5.0,
+        "design_cooling_load_kW": 8.0,
+        "f_wat_C_aux_dis": 0.25,
+    }
+    if scenario == "bolzano":
+        config["design_cooling_load_kW"] = 6.5
+    return config
+
+
+def cooling_storage_system_config(scenario: str) -> dict:
+    """Scenario-specific EN 16798-15 chilled-water buffer assumptions."""
+
+    config = {
+        "demand_unit": "kWh",
+        "storage_type": "STO_TYPE_CW",
+        "location": "NC",
+        "storage_volume_l": 80.0,
+        "storage_temperature_C": 7.0,
+        "storage_output_temperature_C": 7.0,
+        "storage_return_temperature_C": 12.0,
+        "generator_outlet_temperature_C": 7.0,
+        "ambient_temperature_C": 20.0,
+        "H_C_sto_tot_ls_W_K": 0.8,
+        "generator_loop_loss_coefficient_W_K": 0.24,
+        "distribution_loop_loss_coefficient_W_K": 0.24,
+        "thermal_loss_recoverable_fraction": 0.0,
+        "auxiliary_loss_recoverable_fraction": 0.75,
+        "auxiliary_to_medium_fraction": 1.0,
+        "input_pump_power_kW": 0.020,
+        "input_pump_flow_m3_h": 0.90,
+        "input_pump_deltaT_K": 5.0,
+        "output_pump_power_kW": 0.020,
+        "output_pump_flow_m3_h": 0.90,
+        "output_pump_deltaT_K": 5.0,
+    }
+    if scenario == "bolzano":
+        config.update(
+            {
+                "storage_volume_l": 60.0,
+                "H_C_sto_tot_ls_W_K": 0.6,
+                "generator_loop_loss_coefficient_W_K": 0.18,
+                "distribution_loop_loss_coefficient_W_K": 0.18,
+                "input_pump_power_kW": 0.018,
+                "input_pump_flow_m3_h": 0.75,
+                "output_pump_power_kW": 0.018,
+                "output_pump_flow_m3_h": 0.75,
+            }
+        )
+    return config
+
+
+def cooling_generation_system_config(
+    scenario: str,
+    cooling_map: pd.DataFrame,
+) -> dict:
+    """Scenario-specific EN 16798-13 compression-cooling assumptions."""
+
+    nominal_capacity = 6.2 if scenario == "bolzano" else 8.0
+    return {
+        "demand_unit": "kWh",
+        "cooling_performance_map": cooling_map,
+        "nominal_capacity_kW": nominal_capacity,
+        "generation_type": "COMP",
+        "heat_rejection_type": "AIR_C_COND",
+        "theta_C_gen_out_limit_C": 5.0,
+        "theta_C_gen_out_set_C": 7.0,
+        "free_cooling_enabled": False,
+        "performance_includes_heat_rejection_aux": True,
+        "control_power_kW": 0.010 if scenario == "athens" else 0.008,
+        "additional_auxiliary_power_kW": 0.0,
+        "heat_recovery_fraction": 0.0,
+        "minimum_part_load_ratio": 0.0,
+    }
+
+
 def prepare_heat_pump_loads(hourly_sim: pd.DataFrame, dhw_kWh: pd.Series) -> pd.DataFrame:
     """Convert ISO52016 Wh outputs to the heat-pump module kWh inputs."""
 
@@ -984,6 +1088,68 @@ def allocate_bin_outputs_to_hours(loads: pd.DataFrame, bins: pd.DataFrame) -> pd
     out["E_C_total_kWh"] = out["C_E_hp_in_kWh"] + out["C_E_backup_in_kWh"] + out["W_C_gen_aux_kWh"]
     out["E_total_kWh"] = out["E_HW_total_kWh"] + out["E_C_total_kWh"]
     return out
+
+
+def merge_cooling_generation_to_allocated(
+    allocated: pd.DataFrame,
+    cooling_generation: pybui.CoolingGenerationSimulationResult | None,
+) -> pd.DataFrame:
+    """Replace old reversible-HP cooling columns with EN 16798-13 hourly results."""
+
+    if cooling_generation is None:
+        return allocated
+
+    out = allocated.copy()
+    hourly = cooling_generation.timeseries.reindex(out.index).fillna(0.0)
+    out["C_Q_gen_out_kWh"] = hourly["Q_C_gen_in_req_kWh"]
+    out["C_Q_hp_out_kWh"] = hourly["Q_C_gen_in_kWh"]
+    out["C_Q_backup_out_kWh"] = hourly["Q_C_gen_backup_in_kWh"]
+    out["C_Q_unmet_kWh"] = hourly["Q_C_gen_unmet_kWh"]
+    out["C_E_hp_in_kWh"] = hourly["E_C_gen_el_in_kWh"]
+    out["C_E_backup_in_kWh"] = hourly["E_C_backup_in_kWh"]
+    out["C_Q_rejected_kWh"] = hourly["Q_C_gen_out_kWh"]
+    out["C_performance"] = hourly["EER_C_gen"].replace(0.0, np.nan)
+    out["C_capacity_kW"] = hourly["Q_C_gen_capacity_kW"].replace(0.0, np.nan)
+    out["C_hp_runtime_h"] = hourly["t_C_gen_runtime_h"]
+    out["W_C_gen_aux_kWh"] = hourly["W_C_aux_gen_kWh"]
+    out["E_C_total_kWh"] = hourly["E_C_total_kWh"]
+    out["E_total_kWh"] = out["E_HW_total_kWh"] + out["E_C_total_kWh"]
+    return out
+
+
+def combined_generation_summary(
+    heat_pump_summary: dict[str, float],
+    cooling_generation: pybui.CoolingGenerationSimulationResult | None,
+) -> dict[str, float]:
+    """Return one summary dictionary for plots that show all generation services."""
+
+    summary = dict(heat_pump_summary)
+    if cooling_generation is None:
+        return summary
+
+    cooling = cooling_generation.summary
+    summary.update(
+        {
+            "QC_gen_out_kWh": cooling.get("QC_gen_in_req_kWh", 0.0),
+            "QC_hp_out_kWh": cooling.get("QC_gen_in_kWh", 0.0),
+            "QC_backup_out_kWh": cooling.get("QC_gen_backup_in_kWh", 0.0),
+            "QC_unmet_kWh": cooling.get("QC_gen_unmet_kWh", 0.0),
+            "EC_hp_in_kWh": cooling.get("EC_gen_el_in_kWh", 0.0),
+            "EC_backup_in_kWh": cooling.get("EC_backup_in_kWh", 0.0),
+            "EC_gen_in_kWh": cooling.get("EC_gen_el_in_kWh", 0.0)
+            + cooling.get("EC_backup_in_kWh", 0.0),
+            "WC_gen_aux_kWh": cooling.get("WC_aux_gen_kWh", 0.0),
+            "QC_rejected_kWh": cooling.get("QC_gen_out_kWh", 0.0),
+            "SEER_C_gen": cooling.get("SEER_C_gen", np.nan),
+        }
+    )
+    summary["E_total_electricity_kWh"] = (
+        summary.get("EHW_gen_in_kWh", 0.0)
+        + summary.get("WHW_gen_aux_kWh", 0.0)
+        + summary.get("EC_gen_in_kWh", 0.0)
+        + summary.get("WC_gen_aux_kWh", 0.0)
+    )
+    return summary
 
 
 def _write_plot(fig: go.Figure, output_path: Path) -> Path:
@@ -1463,6 +1629,199 @@ def plot_storage_monthly(
     return _write_plot(fig, output_dir / "visuals" / "07_storage_15316_5_monthly.html")
 
 
+def plot_cooling_system_16798_9(
+    cooling_system: pybui.CoolingSystemSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = cooling_system.timeseries
+    daily_energy = hourly[["Q_C_dis_out_tot_req_kWh", "Q_C_gen_in_req_kWh"]].resample("D").sum()
+    daily_state = hourly[
+        [
+            "theta_C_gen_out_req_C",
+            "theta_C_dis_in_flw_req_C",
+            "theta_C_dis_out_ret_req_C",
+            "q_V_C_dis_m3_h",
+        ]
+    ].resample("D").mean()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily cooling request passed through EN 16798-9",
+            "Required chilled-water temperatures",
+            "Required distribution volume flow",
+        ],
+    )
+    fig.add_trace(
+        go.Bar(x=daily_energy.index, y=daily_energy["Q_C_dis_out_tot_req_kWh"], name="Distribution cooling request", marker_color="#2f78b7"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=daily_energy.index, y=daily_energy["Q_C_gen_in_req_kWh"], name="Generator request before detailed losses", marker_color="#6fa8dc"),
+        row=1,
+        col=1,
+    )
+    for col, name, color in [
+        ("theta_C_gen_out_req_C", "Generator outlet required", "#1f4e79"),
+        ("theta_C_dis_in_flw_req_C", "Distribution supply required", "#2f78b7"),
+        ("theta_C_dis_out_ret_req_C", "Distribution return required", "#70ad47"),
+    ]:
+        fig.add_trace(go.Scatter(x=daily_state.index, y=daily_state[col], mode="lines", name=name, line=dict(color=color)), row=2, col=1)
+    fig.add_trace(
+        go.Scatter(x=daily_state.index, y=daily_state["q_V_C_dis_m3_h"], mode="lines", name="Cooling flow", line=dict(color="#5b9bd5")),
+        row=3,
+        col=1,
+    )
+    fig.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig.update_yaxes(title_text="degC", row=2, col=1)
+    fig.update_yaxes(title_text="m3/h", row=3, col=1)
+    fig.update_layout(title="EN 16798-9 Cooling System Operating Conditions")
+    return _write_plot(fig, output_dir / "visuals" / "08_cooling_16798_9_operating_conditions.html")
+
+
+def plot_cooling_storage_16798_15(
+    storage: pybui.CoolingStorageSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = storage.timeseries
+    daily = hourly[
+        [
+            "Q_C_sto_out_kWh",
+            "Q_C_sto_ls_tot_kWh",
+            "Q_C_sto_in_kWh",
+            "W_C_sto_aux_kWh",
+        ]
+    ].resample("D").sum()
+    temps = hourly[["theta_C_sto_C", "theta_C_sto_amb_C"]].resample("D").mean()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily chilled-storage energy balance",
+            "Daily storage auxiliary electricity",
+            "Daily storage and ambient temperatures",
+        ],
+    )
+    for col, name, color in [
+        ("Q_C_sto_out_kWh", "Storage output to distribution", "#2f78b7"),
+        ("Q_C_sto_ls_tot_kWh", "Storage heat gains", "#6fa8dc"),
+        ("Q_C_sto_in_kWh", "Generator cooling required", "#1f4e79"),
+    ]:
+        fig.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=1, col=1)
+    fig.add_trace(
+        go.Bar(x=daily.index, y=daily["W_C_sto_aux_kWh"], name="Storage pumps", marker_color="#5b9bd5"),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(go.Scatter(x=temps.index, y=temps["theta_C_sto_C"], mode="lines", name="Storage water", line=dict(color="#2f78b7")), row=3, col=1)
+    fig.add_trace(go.Scatter(x=temps.index, y=temps["theta_C_sto_amb_C"], mode="lines", name="Storage ambient", line=dict(color="#44546a")), row=3, col=1)
+    fig.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/day", row=2, col=1)
+    fig.update_yaxes(title_text="degC", row=3, col=1)
+    fig.update_layout(title="EN 16798-15 Cooling Storage")
+    return _write_plot(fig, output_dir / "visuals" / "09_cooling_storage_16798_15.html")
+
+
+def plot_cooling_generation_16798_13(
+    generation: pybui.CoolingGenerationSimulationResult,
+    output_dir: Path,
+) -> list[Path]:
+    hourly = generation.timeseries
+    daily = hourly[
+        [
+            "Q_C_gen_in_req_kWh",
+            "Q_C_gen_in_kWh",
+            "Q_C_gen_unmet_kWh",
+            "E_C_gen_el_in_kWh",
+            "E_C_backup_in_kWh",
+            "W_C_aux_gen_kWh",
+        ]
+    ].resample("D").sum()
+    perf = hourly[["EER_C_gen", "f_C_PL", "theta_C_gen_out_C", "theta_cond_in_C"]].resample("D").mean()
+
+    fig_ts = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Daily EN 16798-13 cooling generation balance",
+            "Daily generation electricity and auxiliaries",
+            "Daily EER, part-load and operating temperatures",
+        ],
+        specs=[[{}], [{}], [{"secondary_y": True}]],
+    )
+    for col, name, color in [
+        ("Q_C_gen_in_req_kWh", "Cooling required", "#2f78b7"),
+        ("Q_C_gen_in_kWh", "Cooling removed", "#1f4e79"),
+        ("Q_C_gen_unmet_kWh", "Unmet cooling", "#00a2ff"),
+    ]:
+        fig_ts.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=1, col=1)
+    for col, name, color in [
+        ("E_C_gen_el_in_kWh", "Compressor electricity", "#2f78b7"),
+        ("E_C_backup_in_kWh", "Cooling backup electricity", "#1f4e79"),
+        ("W_C_aux_gen_kWh", "Generator auxiliaries", "#5b9bd5"),
+    ]:
+        fig_ts.add_trace(go.Bar(x=daily.index, y=daily[col], name=name, marker_color=color), row=2, col=1)
+    fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["EER_C_gen"], mode="lines", name="EER", line=dict(color="#2f78b7")), row=3, col=1, secondary_y=False)
+    fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["f_C_PL"], mode="lines", name="Part-load ratio", line=dict(color="#70ad47")), row=3, col=1, secondary_y=False)
+    fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["theta_C_gen_out_C"], mode="lines", name="Evaporator outlet", line=dict(color="#1f4e79", dash="dot")), row=3, col=1, secondary_y=True)
+    fig_ts.add_trace(go.Scatter(x=perf.index, y=perf["theta_cond_in_C"], mode="lines", name="Condenser inlet", line=dict(color="#44546a", dash="dash")), row=3, col=1, secondary_y=True)
+    fig_ts.update_yaxes(title_text="kWh/day", row=1, col=1)
+    fig_ts.update_yaxes(title_text="kWh/day", row=2, col=1)
+    fig_ts.update_yaxes(title_text="ratio", row=3, col=1, secondary_y=False)
+    fig_ts.update_yaxes(title_text="degC", row=3, col=1, secondary_y=True)
+    fig_ts.update_layout(title="EN 16798-13 Cooling Generation Time Series", barmode="group")
+    ts_path = _write_plot(fig_ts, output_dir / "visuals" / "10_cooling_generation_16798_13_timeseries.html")
+
+    bins = hourly.copy()
+    bins["bin_center_C"] = np.floor(bins["T_ext_C"].astype(float)) + 0.5
+    grouped = bins.groupby("bin_center_C").agg(
+        hours=("hours", "sum"),
+        q_req=("Q_C_gen_in_req_kWh", "sum"),
+        q_supplied=("Q_C_gen_in_kWh", "sum"),
+        e_el=("E_C_gen_el_in_kWh", "sum"),
+        w_aux=("W_C_aux_gen_kWh", "sum"),
+        eer=("EER_C_gen", "mean"),
+        plr=("f_C_PL", "mean"),
+        capacity=("Q_C_gen_capacity_kW", "mean"),
+    ).reset_index()
+    fig_bin = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Cooling removed and electricity by outdoor-temperature bin",
+            "Direct EER and part-load ratio by bin",
+            "Available cooling capacity and bin hours",
+        ],
+        specs=[[{}], [{"secondary_y": True}], [{"secondary_y": True}]],
+    )
+    fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["q_supplied"], name="Cooling removed", marker_color="#2f78b7"), row=1, col=1)
+    fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["e_el"] + grouped["w_aux"], name="Cooling electricity + auxiliaries", marker_color="#5b9bd5"), row=1, col=1)
+    fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["eer"], mode="lines+markers", name="EER", line=dict(color="#2f78b7")), row=2, col=1, secondary_y=False)
+    fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["plr"], mode="lines+markers", name="Part-load ratio", line=dict(color="#70ad47")), row=2, col=1, secondary_y=True)
+    fig_bin.add_trace(go.Scatter(x=grouped["bin_center_C"], y=grouped["capacity"], mode="lines+markers", name="Capacity", line=dict(color="#1f4e79")), row=3, col=1, secondary_y=False)
+    fig_bin.add_trace(go.Bar(x=grouped["bin_center_C"], y=grouped["hours"], name="Hours", marker_color="#b7b7b7", opacity=0.55), row=3, col=1, secondary_y=True)
+    fig_bin.update_xaxes(title_text="Outdoor-temperature bin center [degC]", row=3, col=1)
+    fig_bin.update_yaxes(title_text="kWh", row=1, col=1)
+    fig_bin.update_yaxes(title_text="EER", row=2, col=1, secondary_y=False)
+    fig_bin.update_yaxes(title_text="part-load", row=2, col=1, secondary_y=True)
+    fig_bin.update_yaxes(title_text="kW", row=3, col=1, secondary_y=False)
+    fig_bin.update_yaxes(title_text="hours", row=3, col=1, secondary_y=True)
+    fig_bin.update_layout(title="EN 16798-13 Cooling Generation Bin Performance", barmode="group")
+    bin_path = _write_plot(fig_bin, output_dir / "visuals" / "11_cooling_generation_16798_13_bins.html")
+    return [ts_path, bin_path]
+
+
 def plot_heat_pump_hourly(allocated: pd.DataFrame, output_dir: Path) -> Path:
     daily = allocated[
         [
@@ -1735,6 +2094,9 @@ def create_inspection_index(
     emission_summary: dict[str, float] | None = None,
     distribution_summary: dict[str, float] | None = None,
     storage_summary: dict[str, float] | None = None,
+    cooling_system_summary: dict[str, float] | None = None,
+    cooling_storage_summary: dict[str, float] | None = None,
+    cooling_generation_summary: dict[str, float] | None = None,
 ) -> Path:
     cards = {
         "Heating demand": summary.get("QH_gen_out_kWh", 0.0),
@@ -1769,6 +2131,27 @@ def create_inspection_index(
                 "EN 15316-5 DHW storage losses": storage_summary.get("QW_sto_ls_kWh", 0.0),
             }
         )
+    if cooling_system_summary:
+        cards.update(
+            {
+                "EN 16798-9 cooling request": cooling_system_summary.get("QC_dis_out_tot_req_kWh", 0.0),
+                "EN 16798-9 mean flow": cooling_system_summary.get("q_V_C_dis_mean_m3_h", 0.0),
+            }
+        )
+    if cooling_storage_summary:
+        cards.update(
+            {
+                "EN 16798-15 cooling storage gains": cooling_storage_summary.get("QC_sto_ls_tot_kWh", 0.0),
+                "EN 16798-15 storage pump electricity": cooling_storage_summary.get("WC_sto_aux_kWh", 0.0),
+            }
+        )
+    if cooling_generation_summary:
+        cards.update(
+            {
+                "EN 16798-13 cooling electricity": cooling_generation_summary.get("EC_total_kWh", 0.0),
+                "EN 16798-13 cooling SEER": cooling_generation_summary.get("SEER_C_gen", np.nan),
+            }
+        )
     list_items = []
     if iso_report is not None:
         list_items.append(f'<li><a href="{html.escape(str(iso_report.relative_to(output_dir)))}">ISO52016 existing building report</a></li>')
@@ -1781,7 +2164,9 @@ def create_inspection_index(
         if value is not None and np.isfinite(value)
     )
     page_title = (
-        "EN 15316-2, EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
+        "EN 15316 and EN 16798 Heat-Pump System Inspection"
+        if cooling_generation_summary or cooling_storage_summary or cooling_system_summary
+        else "EN 15316-2, EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
         if storage_summary and distribution_summary and emission_summary
         else "EN 15316-3, EN 15316-5 and EN 15316-4-2 Inspection"
         if storage_summary and distribution_summary
@@ -1794,6 +2179,14 @@ def create_inspection_index(
         else "Heat Pump EN 15316-4-2 Inspection"
     )
     page_intro = (
+        "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
+        "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
+        "EN 15316-5 heating/DHW storage, EN 16798-9 cooling operating "
+        "conditions, EN 16798-15 chilled storage, EN 16798-13 cooling "
+        "generation, heat-pump heating/DHW bin method, electricity use and "
+        "seasonal performance."
+        if cooling_generation_summary or cooling_storage_summary or cooling_system_summary
+        else
         "Open the plots below to inspect the ISO52016 inputs, EN 15316-2 "
         "emission effects, EN 15316-3 distribution losses and pump auxiliaries, "
         "EN 15316-5 heating/DHW storage losses and auxiliaries, DHW profile, "
@@ -1860,13 +2253,19 @@ def create_visual_outputs(
     emission_result: pybui.EmissionSimulationResult | None = None,
     distribution_result: pybui.DistributionSimulationResult | None = None,
     storage_result: pybui.StorageSimulationResult | None = None,
+    cooling_system_result: pybui.CoolingSystemSimulationResult | None = None,
+    cooling_storage_result: pybui.CoolingStorageSimulationResult | None = None,
+    cooling_generation_result: pybui.CoolingGenerationSimulationResult | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
+    allocated = merge_cooling_generation_to_allocated(allocated, cooling_generation_result)
     allocated.to_csv(output_dir / "heat_pump_hourly_allocated_results.csv")
 
     input_title = (
-        "Storage-Adjusted Loads Sent to the Heat Pump"
+        "Final Loads Sent to Heating/DHW Heat Pump and EN 16798-13 Cooling Generator"
+        if cooling_generation_result is not None
+        else "Storage-Adjusted Loads Sent to the Heat Pump"
         if storage_result is not None
         else "Distribution-Adjusted Loads and DHW Inputs Sent to the Heat Pump"
         if distribution_result is not None
@@ -1896,13 +2295,20 @@ def create_visual_outputs(
                 plot_storage_monthly(storage_result, output_dir),
             ]
         )
+    if cooling_system_result is not None:
+        plot_paths.append(plot_cooling_system_16798_9(cooling_system_result, output_dir))
+    if cooling_storage_result is not None:
+        plot_paths.append(plot_cooling_storage_16798_15(cooling_storage_result, output_dir))
+    if cooling_generation_result is not None:
+        plot_paths.extend(plot_cooling_generation_16798_13(cooling_generation_result, output_dir))
+    combined_summary = combined_generation_summary(result.summary, cooling_generation_result)
     plot_paths.extend(
         [
             plot_heat_pump_hourly(allocated, output_dir),
             plot_monthly_summary(loads, allocated, output_dir),
             plot_bin_balance(result.bins, output_dir),
             plot_bin_performance(result.bins, output_dir),
-            plot_summary_sankey(result.summary, output_dir),
+            plot_summary_sankey(combined_summary, output_dir),
         ]
     )
     emission_summary = emission_result.summary if emission_result is not None else None
@@ -1910,55 +2316,90 @@ def create_visual_outputs(
         distribution_result.summary if distribution_result is not None else None
     )
     storage_summary = storage_result.summary if storage_result is not None else None
+    cooling_system_summary = (
+        cooling_system_result.summary if cooling_system_result is not None else None
+    )
+    cooling_storage_summary = (
+        cooling_storage_result.summary if cooling_storage_result is not None else None
+    )
+    cooling_generation_summary = (
+        cooling_generation_result.summary if cooling_generation_result is not None else None
+    )
     return create_inspection_index(
         output_dir,
-        result.summary,
+        combined_summary,
         plot_paths,
         iso_report,
         emission_summary=emission_summary,
         distribution_summary=distribution_summary,
         storage_summary=storage_summary,
+        cooling_system_summary=cooling_system_summary,
+        cooling_storage_summary=cooling_storage_summary,
+        cooling_generation_summary=cooling_generation_summary,
     )
 
 
-def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str, str]:
-    if args.calculation_path == "full":
-        return "en15316-2", "en15316-3", "en15316-5"
-    if args.calculation_path == "emission-distribution":
-        return "en15316-2", "en15316-3", "simple"
-    if args.calculation_path == "emission-storage":
-        return "en15316-2", "simple", "en15316-5"
-    if args.calculation_path == "distribution-storage":
-        return "simple", "en15316-3", "en15316-5"
-    if args.calculation_path == "storage-only":
-        return "simple", "simple", "en15316-5"
-    if args.calculation_path == "emission-only":
-        return "en15316-2", "simple", "simple"
-    if args.calculation_path == "simple":
-        return "simple", "simple", "simple"
+def resolve_system_methods(args: argparse.Namespace) -> tuple[str, str, str, str, str, str]:
+    if args.calculation_path == "full" or args.calculation_path is None:
+        methods = ["en15316-2", "en15316-3", "en15316-5", "en16798-9", "en16798-15", "en16798-13"]
+    elif args.calculation_path == "emission-distribution":
+        methods = ["en15316-2", "en15316-3", "simple", "en16798-9", "simple", "en16798-13"]
+    elif args.calculation_path == "emission-storage":
+        methods = ["en15316-2", "simple", "en15316-5", "en16798-9", "en16798-15", "en16798-13"]
+    elif args.calculation_path == "distribution-storage":
+        methods = ["simple", "en15316-3", "en15316-5", "en16798-9", "en16798-15", "en16798-13"]
+    elif args.calculation_path == "storage-only":
+        methods = ["simple", "simple", "en15316-5", "en16798-9", "en16798-15", "en16798-13"]
+    elif args.calculation_path == "emission-only":
+        methods = ["en15316-2", "simple", "simple", "en16798-9", "simple", "en16798-13"]
+    elif args.calculation_path == "no-cooling-storage":
+        methods = ["en15316-2", "en15316-3", "en15316-5", "en16798-9", "simple", "en16798-13"]
+    elif args.calculation_path == "heat-pump-cooling":
+        methods = ["en15316-2", "en15316-3", "en15316-5", "en16798-9", "simple", "heat-pump-simple"]
+    elif args.calculation_path == "simple":
+        methods = ["simple", "simple", "simple", "simple", "simple", "heat-pump-simple"]
+    else:
+        raise ValueError(f"Unsupported calculation path: {args.calculation_path}")
 
-    emission_method = args.emission_method or "en15316-2"
-    distribution_method = args.distribution_method
-    if distribution_method is None:
-        distribution_method = "simple" if emission_method == "simple" else "en15316-3"
-    storage_method = args.storage_method
-    if storage_method is None:
-        storage_method = (
-            "simple"
-            if emission_method == "simple" and distribution_method == "simple"
-            else "en15316-5"
-        )
-    return emission_method, distribution_method, storage_method
+    if args.emission_method is not None:
+        methods[0] = args.emission_method
+    if args.distribution_method is not None:
+        methods[1] = args.distribution_method
+    if args.storage_method is not None:
+        methods[2] = args.storage_method
+    if args.cooling_system_method is not None:
+        methods[3] = args.cooling_system_method
+    if args.cooling_storage_method is not None:
+        methods[4] = args.cooling_storage_method
+    if args.cooling_generation_method is not None:
+        methods[5] = args.cooling_generation_method
+
+    return tuple(methods)  # type: ignore[return-value]
 
 
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
-    emission_method, distribution_method, storage_method = resolve_system_methods(args)
+    (
+        emission_method,
+        distribution_method,
+        storage_method,
+        cooling_system_method,
+        cooling_storage_method,
+        cooling_generation_method,
+    ) = resolve_system_methods(args)
     building = example_building(scenario)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else default_output_dir(scenario, emission_method, distribution_method, storage_method)
+        else default_output_dir(
+            scenario,
+            emission_method,
+            distribution_method,
+            storage_method,
+            cooling_system_method,
+            cooling_storage_method,
+            cooling_generation_method,
+        )
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1992,6 +2433,29 @@ def run_example(args: argparse.Namespace) -> None:
         loads["Q_C_kWh"] = emission_result.timeseries["Q_C_em_in_kWh"]
     elif emission_method != "simple":
         raise ValueError("--emission-method must be 'en15316-2' or 'simple'.")
+
+    cooling_system_result = None
+    if cooling_system_method == "en16798-9":
+        cooling_system_calc = pybui.CoolingSystemCalculator(cooling_system_config(scenario))
+        cooling_system_result = cooling_system_calc.run_timeseries(loads)
+        loads["Q_C_16798_9_out_kWh"] = cooling_system_result.timeseries[
+            "Q_C_dis_out_tot_req_kWh"
+        ]
+        loads["Q_C_gen_in_req_16798_9_kWh"] = cooling_system_result.timeseries[
+            "Q_C_gen_in_req_kWh"
+        ]
+        loads["theta_C_dis_supply_C"] = cooling_system_result.timeseries[
+            "theta_C_dis_supply_C"
+        ]
+        loads["theta_C_dis_return_C"] = cooling_system_result.timeseries[
+            "theta_C_dis_return_C"
+        ]
+        loads["theta_C_gen_out_req_C"] = cooling_system_result.timeseries[
+            "theta_C_gen_out_req_C"
+        ]
+        loads["T_C_sink_C"] = cooling_system_result.timeseries["T_C_sink_C"]
+    elif cooling_system_method != "simple":
+        raise ValueError("--cooling-system-method must be 'en16798-9' or 'simple'.")
 
     distribution_result = None
     if distribution_method == "en15316-3":
@@ -2029,18 +2493,57 @@ def run_example(args: argparse.Namespace) -> None:
     elif storage_method != "simple":
         raise ValueError("--storage-method must be 'en15316-5' or 'simple'.")
 
+    cooling_storage_result = None
+    if cooling_storage_method == "en16798-15":
+        cooling_storage_calc = pybui.CoolingStorageSystemCalculator(
+            cooling_storage_system_config(scenario)
+        )
+        cooling_storage_result = cooling_storage_calc.run_timeseries(loads)
+        loads["Q_C_storage_out_kWh"] = cooling_storage_result.timeseries[
+            "Q_C_sto_out_kWh"
+        ]
+        loads["Q_C_sto_loss_kWh"] = cooling_storage_result.timeseries[
+            "Q_C_sto_ls_tot_kWh"
+        ]
+        loads["W_C_sto_aux_kWh"] = cooling_storage_result.timeseries[
+            "W_C_sto_aux_kWh"
+        ]
+        loads["Q_C_kWh"] = cooling_storage_result.timeseries["Q_C_sto_in_kWh"]
+        loads["T_C_sink_C"] = cooling_storage_result.timeseries["T_C_sink_C"]
+        loads["theta_C_gen_out_req_C"] = cooling_storage_result.timeseries[
+            "theta_C_sto_in_req_C"
+        ]
+    elif cooling_storage_method != "simple":
+        raise ValueError("--cooling-storage-method must be 'en16798-15' or 'simple'.")
+
     ensure_heating_and_cooling(loads)
 
     heating_map, cooling_map = heat_pump_maps(scenario)
+    cooling_generation_result = None
+    hp_loads = loads.copy()
+    cooling_enabled_for_heat_pump = True
+    if cooling_generation_method == "en16798-13":
+        cooling_generation_calc = pybui.CoolingGenerationSystemCalculator(
+            cooling_generation_system_config(scenario, cooling_map)
+        )
+        cooling_generation_result = cooling_generation_calc.run_timeseries(loads)
+        hp_loads["Q_C_kWh"] = 0.0
+        cooling_enabled_for_heat_pump = False
+    elif cooling_generation_method != "heat-pump-simple":
+        raise ValueError(
+            "--cooling-generation-method must be 'en16798-13' or 'heat-pump-simple'."
+        )
+
     calc = pybui.HeatPumpSystemCalculator(
         heat_pump_config(
             scenario,
             heating_map,
             cooling_map,
             include_internal_storage_losses=storage_method == "simple",
+            cooling_enabled=cooling_enabled_for_heat_pump,
         )
     )
-    result = calc.run_timeseries(loads)
+    result = calc.run_timeseries(hp_loads)
 
     loads.to_csv(output_dir / "iso52016_loads_with_dhw.csv")
     if emission_result is not None:
@@ -2063,8 +2566,37 @@ def run_example(args: argparse.Namespace) -> None:
             output_dir / "storage_15316_5_summary.csv",
             index=False,
         )
+    if cooling_system_result is not None:
+        cooling_system_result.timeseries.to_csv(
+            output_dir / "cooling_16798_9_hourly_results.csv"
+        )
+        pd.DataFrame([cooling_system_result.summary]).to_csv(
+            output_dir / "cooling_16798_9_summary.csv",
+            index=False,
+        )
+    if cooling_storage_result is not None:
+        cooling_storage_result.timeseries.to_csv(
+            output_dir / "cooling_storage_16798_15_hourly_results.csv"
+        )
+        pd.DataFrame([cooling_storage_result.summary]).to_csv(
+            output_dir / "cooling_storage_16798_15_summary.csv",
+            index=False,
+        )
+    if cooling_generation_result is not None:
+        cooling_generation_result.timeseries.to_csv(
+            output_dir / "cooling_generation_16798_13_hourly_results.csv"
+        )
+        pd.DataFrame([cooling_generation_result.summary]).to_csv(
+            output_dir / "cooling_generation_16798_13_summary.csv",
+            index=False,
+        )
     result.bins.to_csv(output_dir / "heat_pump_bin_results.csv", index=False)
     pd.DataFrame([result.summary]).to_csv(output_dir / "heat_pump_summary.csv", index=False)
+    combined_summary = combined_generation_summary(result.summary, cooling_generation_result)
+    pd.DataFrame([combined_summary]).to_csv(
+        output_dir / "combined_generation_summary.csv",
+        index=False,
+    )
     inspection_index = create_visual_outputs(
         hourly_sim=hourly_sim,
         loads=loads,
@@ -2074,21 +2606,32 @@ def run_example(args: argparse.Namespace) -> None:
         emission_result=emission_result,
         distribution_result=distribution_result,
         storage_result=storage_result,
+        cooling_system_result=cooling_system_result,
+        cooling_storage_result=cooling_storage_result,
+        cooling_generation_result=cooling_generation_result,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
     print(f"Emission calculation mode: {emission_method}")
     print(f"Distribution calculation mode: {distribution_method}")
     print(f"Storage calculation mode: {storage_method}")
+    print(f"Cooling operating-condition mode: {cooling_system_method}")
+    print(f"Cooling storage mode: {cooling_storage_method}")
+    print(f"Cooling generation mode: {cooling_generation_method}")
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
     if emission_result is not None:
+        cooling_input_label = (
+            "EN 16798-13 cooling generator input load"
+            if cooling_generation_result is not None
+            else "Heat-pump space cooling input load"
+        )
         print(f"ISO52016 space heating need: {emission_result.summary['QH_em_out_kWh']:,.1f} kWh")
         print(f"EN 15316-2 heating emission losses: {emission_result.summary['QH_em_ls_kWh']:,.1f} kWh")
         print(f"Heat-pump space heating input load: {loads['Q_H_kWh'].sum():,.1f} kWh")
         print(f"ISO52016 space cooling need: {emission_result.summary['QC_em_out_kWh']:,.1f} kWh")
         print(f"EN 15316-2 cooling emission losses: {emission_result.summary['QC_em_ls_kWh']:,.1f} kWh")
-        print(f"Heat-pump space cooling input load: {loads['Q_C_kWh'].sum():,.1f} kWh")
+        print(f"{cooling_input_label}: {loads['Q_C_kWh'].sum():,.1f} kWh")
         print(f"EN 15316-2 emission auxiliaries: {emission_result.summary['W_em_aux_kWh']:,.1f} kWh")
     else:
         load_label = (
@@ -2111,11 +2654,22 @@ def run_example(args: argparse.Namespace) -> None:
         print(f"Heat-pump DHW input load: {loads['Q_W_kWh'].sum():,.1f} kWh")
     else:
         print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
-    print(f"Heating+DHW electricity incl. backup: {result.summary['EHW_gen_in_kWh']:,.1f} kWh")
+    if cooling_system_result is not None:
+        print(f"EN 16798-9 cooling request: {cooling_system_result.summary['QC_dis_out_tot_req_kWh']:,.1f} kWh")
+        print(f"EN 16798-9 mean cooling flow: {cooling_system_result.summary['q_V_C_dis_mean_m3_h']:.3f} m3/h")
+    if cooling_storage_result is not None:
+        print(f"EN 16798-15 cooling storage heat gains: {cooling_storage_result.summary['QC_sto_ls_tot_kWh']:,.1f} kWh")
+        print(f"EN 16798-15 cooling storage auxiliaries: {cooling_storage_result.summary['WC_sto_aux_kWh']:,.1f} kWh")
+        print(f"Cooling generator input after storage: {loads['Q_C_kWh'].sum():,.1f} kWh")
+    print(f"Heating+DHW electricity incl. backup: {combined_summary['EHW_gen_in_kWh']:,.1f} kWh")
     print(f"Heating+DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
-    print(f"Cooling electricity: {result.summary['EC_gen_in_kWh']:,.1f} kWh")
-    print(f"SPF_HW_gen: {result.summary['SPF_HW_gen']:.2f}")
-    print(f"SEER_C_gen: {result.summary['SEER_C_gen']:.2f}")
+    if cooling_generation_result is not None:
+        print(f"EN 16798-13 cooling electricity: {cooling_generation_result.summary['EC_total_kWh']:,.1f} kWh")
+        print(f"EN 16798-13 cooling rejected heat: {cooling_generation_result.summary['QC_gen_out_kWh']:,.1f} kWh")
+    else:
+        print(f"Cooling electricity: {result.summary['EC_gen_in_kWh']:,.1f} kWh")
+    print(f"SPF_HW_gen: {combined_summary['SPF_HW_gen']:.2f}")
+    print(f"SEER_C_gen: {combined_summary['SEER_C_gen']:.2f}")
 
 
 def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
@@ -2151,18 +2705,22 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
             "distribution-storage",
             "storage-only",
             "emission-only",
+            "no-cooling-storage",
+            "heat-pump-cooling",
             "simple",
         ],
         default=None,
         help=(
             "Shortcut for the subsystem chain. 'full' applies EN 15316-2, "
-            "EN 15316-3 and EN 15316-5 before heat-pump generation; "
+            "EN 15316-3, EN 15316-5 and the EN 16798 cooling-side modules; "
             "'emission-distribution' applies EN 15316-2 and EN 15316-3 but "
-            "uses the simple storage treatment inside the heat-pump module; "
+            "uses simple storage; "
             "'emission-storage', 'distribution-storage' and 'storage-only' "
             "isolate selected subsystems; 'emission-only' applies EN 15316-2 "
-            "only; 'simple' uses the earlier direct ISO52016/DHW loads and "
-            "simple heat-pump storage losses. Default: full."
+            "only; 'no-cooling-storage' bypasses EN 16798-15; "
+            "'heat-pump-cooling' keeps the older reversible heat-pump cooling "
+            "branch instead of EN 16798-13; 'simple' uses the earlier direct "
+            "ISO52016/DHW loads and simple heat-pump storage losses. Default: full."
         ),
     )
     parser.add_argument(
@@ -2197,6 +2755,38 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
             "generation; 'simple' keeps the earlier simplified storage losses "
             "inside the heat-pump module. Default: en15316-5 unless all upstream "
             "methods are simple or --calculation-path is set."
+        ),
+    )
+    parser.add_argument(
+        "--cooling-system-method",
+        choices=["en16798-9", "simple"],
+        default=None,
+        help=(
+            "Cooling operating-condition connector. 'en16798-9' calculates "
+            "required chilled-water temperatures and flow; 'simple' uses fixed "
+            "heat-pump defaults. Default: en16798-9 unless --calculation-path "
+            "overrides it."
+        ),
+    )
+    parser.add_argument(
+        "--cooling-storage-method",
+        choices=["en16798-15", "simple"],
+        default=None,
+        help=(
+            "Cooling storage calculation mode. 'en16798-15' applies chilled "
+            "storage heat gains and pump auxiliaries; 'simple' bypasses cooling "
+            "storage. Default: en16798-15 unless --calculation-path overrides it."
+        ),
+    )
+    parser.add_argument(
+        "--cooling-generation-method",
+        choices=["en16798-13", "heat-pump-simple"],
+        default=None,
+        help=(
+            "Cooling generation calculation mode. 'en16798-13' uses the cooling "
+            "generation module M4-8; 'heat-pump-simple' keeps the earlier "
+            "reversible heat-pump cooling treatment. Default: en16798-13 unless "
+            "--calculation-path overrides it."
         ),
     )
     parser.add_argument(
