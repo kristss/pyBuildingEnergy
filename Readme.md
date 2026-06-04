@@ -47,8 +47,11 @@ More details in the example folder.
 
 ## Domestic Hot Water - DHW
 
-- [x] Calculation of volume and energy need for domestic hot water according to ISO 12831-3.
+- [x] Calculation of volume and energy need for domestic hot water according to EN 12831-3.
 - [ ] Assessment of thermal load based on the type of DHW system.
+
+For the audit trail between the standard, code and outputs, open
+[DHW EN 12831-3 Implementation Audit](docs/dhw_12831_3_audit.html).
 
 ## Space Emission Systems - EN 15316-2 **(New)**
 
@@ -113,6 +116,10 @@ The heat-pump examples now treat space cooling with the cooling-side EN 16798 st
 
 For the audit trail between the standards, code and outputs, open [Cooling EN 16798 Implementation Audit](docs/cooling_16798_audit.html).
 
+For the whole end-to-end workflow that interconnects EN ISO 52016, EN 12831-3,
+EN 15316, EN 16798, EN 14511 and EN 14825 in the Athens and Bolzano examples,
+open [Heat-Pump Example Simulation Workflow Audit](docs/simulation_workflow_audit.html).
+
 ```python
 import pandas as pd
 import pybuildingenergy as pybui
@@ -170,11 +177,12 @@ There is also a Bolzano convenience wrapper:
 python examples/heat_pump_15316_4_2_bolzano_example.py
 ```
 
-The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed top-floor envelope and an air-to-water heat-pump map sized for a 120 m2 residential building.
+The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed envelope and an air-to-water heat-pump map sized for a 120 m2 useful-floor-area residential building. In both cases the example geometry is a two-floor building with a 60 m2 footprint; roof and ground-slab areas are therefore 60 m2, while `net_floor_area` remains 120 m2.
 
 Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects, EN 15316-5 heating/DHW storage effects and the EN 16798 cooling-side modules by default, calculates an hourly DHW profile, runs the generator calculations and writes:
 
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/building_geometry_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_hourly_results.csv`
@@ -199,7 +207,14 @@ Each scenario runs ISO52016 for the example building, applies EN 15316-2 emissio
 
 Open `inspection_index.html` in a browser to inspect the visual outputs. The page links to:
 
+- a user-facing overview of annual loads, final electricity, monthly trends,
+  seasonal performance and useful-area intensities;
+- a workflow handoff plot that shows how heating, cooling and DHW loads move
+  through the implemented standards;
+- sanity-check plots for geometry, peak loads versus active capacity, backup
+  shares and unmet loads;
 - the existing ISO52016 building report generated with `Graphs_and_report`;
+- the whole simulation workflow audit trail;
 - daily input time series for heating, cooling, DHW and temperatures;
 - EN 15316-2 emission time series and monthly aggregate plots;
 - EN 15316-3 distribution time series and monthly aggregate plots;
@@ -294,6 +309,7 @@ The EN 15316 series covers the calculation method for system energy requirements
 
 ## EN 15316 Modular Structure **(New)**
 
+- [x] EN 12831-3: Domestic hot-water energy needs
 - [x] EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
 - [x] EN 15316-2: Emission systems (heating and cooling)
 - [x] EN 15316-3: Distribution systems (DHW, heating, cooling)
@@ -313,16 +329,22 @@ The EN 15316 series covers the calculation method for system energy requirements
 - [x] EN 16798-15: Cooling storage
 - [ ] EN 16798-13 non-compression cooling generators, such as absorption, adsorption, desiccant or evaporative cooling
 
+## Heat Pump Product Rating Structure **(New)**
+
+- [x] EN 14511-1: Heat-pump and chiller rating terms, including COP and EER definitions
+- [x] EN 14511-2: Rating and application-condition temperature points for air-to-water heat pumps and chillers
+- [x] EN 14825: Part-load capacity-ratio and degradation-coefficient correction for heating COP and cooling EER
+
 For space heating, applicable standards include EN 15316-1, EN 15316-2-1, EN 15316-2-3 and the appropriate parts of EN 15316-4 depending on the system type, including losses and control aspects.
 
 ## Single zone and Multiple Zones **(New)**
-# EN ISO 52016 — Multi-zone Calculation and Adjacent Zones
+# EN ISO 52016 - Multi-zone Calculation and Adjacent Zones
 
 **EN ISO 52016 defines that:**  
 The calculation now allows the definition of several **thermal** and **non-thermal** zones adjacent to the considered zone.
 
 
-**External Adjacent – Unheated Zone**: It is possible to define an **unheated adjacent zone** in contact with the considered thermal zone.  
+**External Adjacent - Unheated Zone**: It is possible to define an **unheated adjacent zone** in contact with the considered thermal zone.  
 The length of the separating wall may be **entirely** or **partially** connected to the considered zone.  
 
 The calculation involves:
@@ -330,12 +352,12 @@ The calculation involves:
 2. Evaluating the **heat exchange** with the thermal zone.
 
 
-**External Adjacent – Heated Zone**: In this case, the wall between the two zones is considered **adiabatic** (no heat exchange).
+**External Adjacent - Heated Zone**: In this case, the wall between the two zones is considered **adiabatic** (no heat exchange).
 **Adjusted Coefficient**: To account for the **different temperatures** between zones (e.g., thermal and non-thermal), an **adjusted coefficient** is calculated.
 
 
 ### Assumptions and Simplifications
-The standard defines various assumptions specified in section *6.5.3 — Assumptions and specific conditions*.  
+The standard defines various assumptions specified in section *6.5.3 - Assumptions and specific conditions*.  
 In general, it aims to **simplify the zoning** approach by reducing the number of zones to a minimum (ISO EN 52016-2:2018).  
 
 It also emphasizes that:
@@ -348,7 +370,7 @@ It also emphasizes that:
 
 ---
 
-## EN 16798-7 & 16798-1 - Natual ventilation and profiles **(New)**
+## EN 16798-7 & 16798-1 - Natural ventilation and profiles **(New)**
 
 Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zone either: 
 
@@ -412,10 +434,11 @@ We welcome and appreciate contributions! Every contribution, no matter how small
 ## Acknowledgment
 
 This work was carried out within European projects:
-- **Infinite** — EU Horizon 2020 (grant agreement No. 958397)  
-- **Moderate** — Horizon Europe (grant agreement No. 101069834)
+- **Infinite** - EU Horizon 2020 (grant agreement No. 958397)
+- **Moderate** - Horizon Europe (grant agreement No. 101069834)
+- **BREEZE** - Building Renovation Efforts for Zero Emission Buildings, co-funded by the European Union LIFE programme (grant agreement No. 101215197)
 
-DHW Calculation developed with data and methods from EPBCenter spreadsheet.
+DHW calculation developed with data and methods from the EPB Center spreadsheet.
 
 ## References
 
@@ -427,5 +450,15 @@ DHW Calculation developed with data and methods from EPBCenter spreadsheet.
 - EN ISO 52016-1:2018 - Energy needs for heating and cooling  
 - EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and iso 52017-1
 - EN 12831-3:2018 - DHW systems heat load and characterization  
+- EN 14511-1:2022 - Air conditioners, liquid chilling packages and heat pumps: terms and definitions
+- EN 14511-2:2022 - Air conditioners, liquid chilling packages and heat pumps: test conditions
+- EN 14825:2022 - Seasonal performance and part-load conditions for air conditioners, chillers and heat pumps
 - EN 15316-1:2018 - System energy requirements and efficiencies  
+- EN 15316-2:2017 - Space emission systems
+- EN 15316-3:2017 - Distribution systems
+- EN 15316-4-2:2008 - Heat-pump generation systems
+- EN 15316-5:2017 - Storage systems
+- EN 16798-9:2017 - Cooling systems
+- EN 16798-13:2017 - Cooling generation
+- EN 16798-15:2017 - Cooling storage
 - EN 16798-7 & 16798-1 - Ventilation standards

@@ -321,7 +321,8 @@
             The calculator starts at generator input. It expects the useful
             heat/cooling demand already calculated by building and distribution
             methods. The example script obtains space heating/cooling from
-            ISO 52016 and DHW from the package DHW calculation.
+            ISO 52016 and DHW from the EN 12831-3 energy-need calculation
+            documented in <code>docs/dhw_12831_3_audit.html</code>.
           </p>
         </div>
         <div class="card">
@@ -361,6 +362,20 @@
           </tr>
         </thead>
         <tbody>
+          <tr>
+            <td>EN 12831-3:2017, clause 6.5 and Annex B</td>
+            <td>DHW energy need supplied to the heat-pump chain.</td>
+            <td>
+              <code>Volume_and_energy_DHW_calculation()</code><br>
+              <code>make_dhw_profile()</code>
+            </td>
+            <td>
+              The example uses the EN 12831-3 volume/energy-need path and a
+              scenario calendar to create hourly DHW loads. DHW sizing/design
+              heat load is outside the heat-pump generation module.
+            </td>
+            <td><span class="status implemented">implemented</span></td>
+          </tr>
           <tr>
             <td>Scope clauses; generator subsystem boundary</td>
             <td>Generator receives thermal output required by downstream subsystems.</td>
@@ -863,6 +878,10 @@
           </tr>
         </thead>
         <tbody>
+          <tr>
+            <td><code>building_geometry_summary.csv</code></td>
+            <td>Example geometry sanity check: useful floor area, footprint, floor count, roof area and ground-slab area.</td>
+          </tr>
           <tr>
             <td><code>iso52016_loads_with_dhw.csv</code></td>
             <td>Inputs sent to the generator calculation: outdoor temperature, operative temperature, heating demand, cooling demand and DHW demand.</td>

@@ -558,7 +558,7 @@ def shading_reduction_factor(
 
 
 # ====================================================================================================
-#                                       DHW Table of ISO 12831
+#                                       DHW tables from EN 12831-3
 # ====================================================================================================
 
 # Hourly breakdown of relative demand for hot water by volume. Table B.1
@@ -612,7 +612,7 @@ table_B_3 = pd.DataFrame({
 
 })
 
-# Values for the calculation of domestic hot watrer requirements per day
+# Values for the calculation of domestic hot water requirements per day
 table_B_4 = pd.DataFrame(
     {
     'type_of_activity'  : [
@@ -641,7 +641,7 @@ table_B_5_Standard = pd.DataFrame({
     'V_W_p_day':['25-60','60-100', '40-70', '25-30']
 })
 
-# values for calculation of domestic hot water requirements per day as avergae of the values from table_B_5_standard
+# Values for calculation of domestic hot water requirements per day as averages of table_B_5_Standard ranges
 table_B_5_modified = pd.DataFrame({
     'type_of_building': [
         'residential_building - simple housing - MIN', 

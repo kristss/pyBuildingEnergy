@@ -2005,7 +2005,7 @@ class ISO52016:
         cls, building_object, lambda_gr=2.0
     ) -> conduttance_elements:
         """
-        Calculation of the conduttance between node "pli" adn node "pli-1", as determined per type of construction
+        Calculation of the conductance between node "pli" and node "pli-1", as determined per type of construction
         element in 6.5.7 in W/m2K
 
         :param building_object: Building object create according to the method ``Building``or ``Buildings_from_dictionary``.
@@ -2021,12 +2021,12 @@ class ISO52016:
             * ori_tilt: orientation and tilt values
             * g_value: onyl for window
 
-        :return: h_pli_eli: conduttance coefficient between nodes (W/m2K). *type*: np.array
+        :return: h_pli_eli: conductance coefficient between nodes (W/m2K). *type*: np.array
         """
         R_gr = 0.5 / lambda_gr  # thermal resistance of 0.5 m of ground [m2 K/W]
         # Number of envelop building elements
         el_type = [surf["ISO52016_type_string"] for surf in building_object["building_surface"]]
-        # Initialization of conduttance coefficient calcualation
+        # Initialization of conductance coefficient calculation
         h_pli_eli = np.zeros((4, len(el_type)))
         U_eli = [surf["u_value"] for surf in building_object["building_surface"]]
         R_c_eli = [0.0] * len(el_type)
@@ -2155,7 +2155,7 @@ class ISO52016:
     @classmethod
     def Areal_heat_capacity_of_element(cls, building_object) -> aeral_heat_capacity:
         """
-        Calculation of the aeral heat capacity of the node "pli" and node "pli-1" as
+        Calculation of the areal heat capacity of the node "pli" and node "pli-1" as
         determined per type of construction element [W/m2K] - 6.5.7 ISO 52016
 
         :param building_object: Building object create according to the method ``Building``or ``Buildings_from_dictionary``.
@@ -2167,7 +2167,7 @@ class ISO52016:
             * construction_class: lass of construction with respect to the distribution of the mass in the construction
                         Table B.13. Possible choice: class_i, class_e, class_ie, class_d, class_m
 
-        :return: aeral_heat_capacity: aeral heat capacity of each facade element (type: *np.array*)
+        :return: aeral_heat_capacity: areal heat capacity of each facade element (type: *np.array*)
         """
         # Number of envelop building elements
         el_type = [surf["ISO52016_type_string"] for surf in building_object["building_surface"]]
@@ -5739,7 +5739,7 @@ class ISO52016:
         i = 1
         with tqdm(total=13) as pbar:
 
-            pbar.set_postfix({"Info": f"Inizailization {i}"})
+            pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
             if kwargs["weather_source"] == "pvgis":
@@ -5760,7 +5760,7 @@ class ISO52016:
 
             # Temperature (indoor and operative)
             '''
-            Inizialize vector temperature
+            Initialize vector temperature
             Theta_int_air: internal air temperature
             Theta_int_r_mn: mean radiant temperature
                 caluclated as:
@@ -5963,7 +5963,7 @@ class ISO52016:
             # External temperature ... (to be checked)
             theta_sup = sim_df["T2m"]
             
-            # Thermal capacity of the internal environmnet of the thermal zone
+            # Thermal capacity of the internal environment of the thermal zone
             C_int = (c_int_per_A_us * building_object["building"]["net_floor_area"])
             pbar.update(1)
 
@@ -6083,11 +6083,11 @@ class ISO52016:
             pbar.update(1)
             h_pli_eli = (ISO52016().Conduttance_node_of_element(building_object).h_pli_eli)
 
-            pbar.set_postfix({"Info": f"Calculating conduttance of elements"})
+            pbar.set_postfix({"Info": f"Calculating conductance of elements"})
             pbar.update(1)
             kappa_pli_eli = (ISO52016().Areal_heat_capacity_of_element(building_object).kappa_pli_eli)
 
-            pbar.set_postfix({"Info": f"Calculating aeral heat capacity of elements"})
+            pbar.set_postfix({"Info": f"Calculating areal heat capacity of elements"})
             pbar.update(1)
             a_sol_pli_eli = (ISO52016().Solar_absorption_of_element(building_object).a_sol_pli_eli)
 
@@ -6582,7 +6582,7 @@ class ISO52016:
                                 if Type_eli[Eli] == "EXT":
                                     '''
                                     External surface node - formuala (41) 
-                                    phi_sky_eli_t:  (extra) thermal radiation to the sky in W/m2 calcualted by formula 6.5.13.3
+                                    phi_sky_eli_t:  (extra) thermal radiation to the sky in W/m2 calculated by formula 6.5.13.3
 
                                     '''
                                     if h_re_model == "dynamic":
@@ -7170,7 +7170,7 @@ class ISO52016:
         i = 1
         with tqdm(total=13) as pbar:
 
-            pbar.set_postfix({"Info": f"Inizailization {i}"})
+            pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
             if kwargs["weather_source"] == "pvgis":
@@ -7192,7 +7192,7 @@ class ISO52016:
 
             # Temperature (indoor and operative)
             '''
-            Inizialize vector temperature
+            Initialize vector temperature
             Theta_int_air: internal air temperature
             Theta_int_r_mn: mean radiant temperature
                 caluclated as:
@@ -7395,7 +7395,7 @@ class ISO52016:
             # External temperature ... (to be checked)
             theta_sup = sim_df["T2m"]
             
-            # Thermal capacity of the internal environmnet of the thermal zone
+            # Thermal capacity of the internal environment of the thermal zone
             C_int = (c_int_per_A_us * building_object["building"]["net_floor_area"])
             pbar.update(1)
 
@@ -7515,11 +7515,11 @@ class ISO52016:
             pbar.update(1)
             h_pli_eli = (ISO52016().Conduttance_node_of_element(building_object).h_pli_eli)
 
-            pbar.set_postfix({"Info": f"Calculating conduttance of elements"})
+            pbar.set_postfix({"Info": f"Calculating conductance of elements"})
             pbar.update(1)
             kappa_pli_eli = (ISO52016().Areal_heat_capacity_of_element(building_object).kappa_pli_eli)
 
-            pbar.set_postfix({"Info": f"Calculating aeral heat capacity of elements"})
+            pbar.set_postfix({"Info": f"Calculating areal heat capacity of elements"})
             pbar.update(1)
             a_sol_pli_eli = (ISO52016().Solar_absorption_of_element(building_object).a_sol_pli_eli)
 
@@ -8059,7 +8059,7 @@ class ISO52016:
                                 if Type_eli[Eli] == "EXT":
                                     '''
                                     External surface node - formuala (41) 
-                                    phi_sky_eli_t:  (extra) thermal radiation to the sky in W/m2 calcualted by formula 6.5.13.3
+                                    phi_sky_eli_t:  (extra) thermal radiation to the sky in W/m2 calculated by formula 6.5.13.3
 
                                     '''
                                     if h_re_model == "dynamic":

@@ -295,7 +295,7 @@ def test_check_heating_system_inputs(hvac_system_config):
     assert "emitter_type" in res
     assert "messages" in res
     assert "config" in res
-    assert res["emitter_type"] == "Floor heating 1"
+    assert res["emitter_type"] == hvac_system_config["emitter_type"]
 
 
 def test_heating_system_calculator(hvac_system_config):
@@ -1951,6 +1951,98 @@ def test_dhw_calculation():
     
     assert dhw_result is not None
     assert len(dhw_result) > 0
+
+
+def test_dhw_en12831_3_residential_energy_need_matches_annex_b_formula():
+    import pybuildingenergy as pybui
+    from pybuildingenergy.global_inputs import (
+        WATER_DENSITY,
+        WATER_SPECIFIC_HEAT_CAPACITY,
+    )
+
+    hourly_fractions = pd.DataFrame(
+        {
+            "Workday": [0, 0, 0, 0, 0, 0, 5, 10, 10, 5, 5, 5, 10, 5, 5, 5, 10, 10, 5, 5, 0, 0, 0, 0],
+            "Weekend": [0, 0, 0, 0, 0, 0, 5, 10, 10, 5, 5, 5, 10, 5, 5, 5, 10, 10, 5, 5, 0, 0, 0, 0],
+            "Holiday": [0, 0, 0, 0, 0, 0, 5, 10, 10, 5, 5, 5, 10, 5, 5, 5, 10, 10, 5, 5, 0, 0, 0, 0],
+        }
+    )
+    sum_fractions = pd.DataFrame(hourly_fractions.sum(), columns=["fractions"])
+    calendar = pybui.generate_calendar("Italy", 2023)
+    n_workdays = int((calendar["values"] == "Working").sum())
+    n_weekends = int((calendar["values"] == "Non-Working").sum())
+    n_holidays = int((calendar["values"] == "Holiday").sum())
+    total_days = int(len(calendar))
+
+    dhw_result = pybui.Volume_and_energy_DHW_calculation(
+        n_workdays=n_workdays,
+        n_weekends=n_weekends,
+        n_holidays=n_holidays,
+        sum_fractions=sum_fractions,
+        total_days=total_days,
+        hourly_fractions=hourly_fractions,
+        teta_W_draw=42.0,
+        teta_w_c_ref=13.5,
+        teta_w_h_ref=60.0,
+        teta_W_cold=11.2,
+        mode_calc="volume_type_bui",
+        building_type_B3="Residential",
+        building_area=120.0,
+        unit_count=1,
+        building_type_B5="Dwelling",
+        residential_typology="residential_building - simple housing - AVG",
+        calculation_method="table",
+        year=2023,
+        country_calendar=calendar,
+    )
+
+    n_p_eq_max = 0.035 * 120.0
+    n_p_eq = 1.75 + 0.3 * (n_p_eq_max - 1.75)
+    v_ref_m3_day = 45.0 * n_p_eq / 1000.0
+    expected_v_draw_m3_day = v_ref_m3_day * (60.0 - 13.5) / (42.0 - 13.5)
+    expected_q_day = (
+        expected_v_draw_m3_day
+        * WATER_DENSITY
+        * WATER_SPECIFIC_HEAT_CAPACITY
+        * (42.0 - 11.2)
+    )
+
+    assert dhw_result[1] == pytest.approx(expected_v_draw_m3_day)
+    assert dhw_result[4] == pytest.approx(expected_q_day)
+    assert dhw_result[0] == pytest.approx(expected_q_day * total_days)
+    assert sum(dhw_result[7]) == pytest.approx(dhw_result[0])
+
+
+def test_heat_pump_example_geometry_uses_useful_area_and_footprint_consistently():
+    from examples.heat_pump_15316_4_2_example import (
+        building_geometry_summary,
+        example_building,
+    )
+
+    for scenario in ("athens", "bolzano"):
+        building = example_building(scenario)
+        summary = building_geometry_summary(building)
+        b = building["building"]
+        surfaces = {surface["name"]: surface for surface in building["building_surface"]}
+        length = float(b["footprint_length"])
+        width = float(b["footprint_width"])
+        height = float(b["height"])
+
+        assert summary["net_floor_area_m2"] == pytest.approx(
+            summary["footprint_area_m2"] * summary["n_floors"]
+        )
+        assert surfaces["Roof surface"]["area"] == pytest.approx(summary["footprint_area_m2"])
+        assert surfaces["Slab to ground"]["area"] == pytest.approx(summary["footprint_area_m2"])
+        assert surfaces["North wall"]["area"] == pytest.approx(length * height)
+        assert (
+            surfaces["South wall"]["area"] + surfaces["South glazing"]["area"]
+        ) == pytest.approx(length * height)
+        assert (
+            surfaces["East wall"]["area"] + surfaces["East glazing"]["area"]
+        ) == pytest.approx(width * height)
+        assert (
+            surfaces["West wall"]["area"] + surfaces["West glazing"]["area"]
+        ) == pytest.approx(width * height)
 
 
 def test_hourly_profile_generator_accepts_weekend_alias():

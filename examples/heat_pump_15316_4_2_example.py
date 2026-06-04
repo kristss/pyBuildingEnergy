@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import copy
 import html
+import os
 from pathlib import Path
 import sys
 import warnings
@@ -126,6 +127,19 @@ def example_building(scenario: str = "athens") -> dict:
 
     weekday_on = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
     weekend_cooling = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+    n_floors = 2
+    footprint_length = 10.0
+    footprint_width = 6.0
+    footprint_area = footprint_length * footprint_width
+    net_floor_area = footprint_area * n_floors
+    floor_height = 3.0
+    total_height = floor_height * n_floors
+    north_south_wall_area = footprint_length * total_height
+    east_west_wall_area = footprint_width * total_height
+    south_glazing_area = 12.0
+    east_glazing_area = 6.0
+    west_glazing_area = 6.0
+    window_height = 1.6
 
     building = {
         "building": {
@@ -133,14 +147,18 @@ def example_building(scenario: str = "athens") -> dict:
             "azimuth_relative_to_true_north": 0,
             "latitude": 37.9888,
             "longitude": 23.7335,
-            "exposed_perimeter": 40,
-            "height": 6,
+            "exposed_perimeter": 2.0 * (footprint_length + footprint_width),
+            "height": total_height,
+            "floor_height": floor_height,
             "wall_thickness": 0.35,
-            "n_floors": 2,
+            "n_floors": n_floors,
+            "footprint_length": footprint_length,
+            "footprint_width": footprint_width,
+            "footprint_area": footprint_area,
             "building_type_class": "Residential_apartment",
             "adj_zones_present": False,
             "number_adj_zone": 0,
-            "net_floor_area": 120,
+            "net_floor_area": net_floor_area,
             "construction_class": "class_i",
             "construction_year": "2010-today",
             "country": "Greece",
@@ -150,7 +168,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "Roof surface",
                 "type": "opaque",
-                "area": 120,
+                "area": footprint_area,
                 "sky_view_factor": 1.0,
                 "u_value": 0.45,
                 "solar_absorptance": 0.5,
@@ -161,7 +179,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "North wall",
                 "type": "opaque",
-                "area": 60,
+                "area": north_south_wall_area,
                 "sky_view_factor": 0.5,
                 "u_value": 0.55,
                 "solar_absorptance": 0.5,
@@ -172,7 +190,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "South wall",
                 "type": "opaque",
-                "area": 48,
+                "area": north_south_wall_area - south_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 0.55,
                 "solar_absorptance": 0.65,
@@ -183,7 +201,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "East wall",
                 "type": "opaque",
-                "area": 52,
+                "area": east_west_wall_area - east_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 0.55,
                 "solar_absorptance": 0.6,
@@ -194,7 +212,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "West wall",
                 "type": "opaque",
-                "area": 52,
+                "area": east_west_wall_area - west_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 0.55,
                 "solar_absorptance": 0.65,
@@ -205,7 +223,7 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "Slab to ground",
                 "type": "opaque",
-                "area": 120,
+                "area": footprint_area,
                 "sky_view_factor": 0.0,
                 "u_value": 0.5,
                 "solar_absorptance": 0.6,
@@ -216,12 +234,12 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "South glazing",
                 "type": "transparent",
-                "area": 12,
+                "area": south_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 1.7,
                 "g_value": 0.55,
-                "height": 1.6,
-                "width": 7.5,
+                "height": window_height,
+                "width": south_glazing_area / window_height,
                 "parapet": 0.9,
                 "orientation": {"azimuth": 180, "tilt": 90},
                 "shading": False,
@@ -233,12 +251,12 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "East glazing",
                 "type": "transparent",
-                "area": 8,
+                "area": east_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 1.7,
                 "g_value": 0.55,
-                "height": 1.6,
-                "width": 5.0,
+                "height": window_height,
+                "width": east_glazing_area / window_height,
                 "parapet": 0.9,
                 "orientation": {"azimuth": 90, "tilt": 90},
                 "shading": False,
@@ -250,12 +268,12 @@ def example_building(scenario: str = "athens") -> dict:
             {
                 "name": "West glazing",
                 "type": "transparent",
-                "area": 8,
+                "area": west_glazing_area,
                 "sky_view_factor": 0.5,
                 "u_value": 1.7,
                 "g_value": 0.55,
-                "height": 1.6,
-                "width": 5.0,
+                "height": window_height,
+                "width": west_glazing_area / window_height,
                 "parapet": 0.9,
                 "orientation": {"azimuth": 270, "tilt": 90},
                 "shading": False,
@@ -352,12 +370,15 @@ def example_building(scenario: str = "athens") -> dict:
             surfaces[name]["u_value"] = 1.2
             surfaces[name]["g_value"] = 0.58
 
-        surfaces["South glazing"]["area"] = 18
-        surfaces["South glazing"]["width"] = 11.25
-        surfaces["East glazing"]["area"] = 10
-        surfaces["East glazing"]["width"] = 6.25
-        surfaces["West glazing"]["area"] = 12
-        surfaces["West glazing"]["width"] = 7.5
+        surfaces["South glazing"]["area"] = 16.0
+        surfaces["South glazing"]["width"] = 16.0 / window_height
+        surfaces["South wall"]["area"] = north_south_wall_area - 16.0
+        surfaces["East glazing"]["area"] = 8.0
+        surfaces["East glazing"]["width"] = 8.0 / window_height
+        surfaces["East wall"]["area"] = east_west_wall_area - 8.0
+        surfaces["West glazing"]["area"] = 8.0
+        surfaces["West glazing"]["width"] = 8.0 / window_height
+        surfaces["West wall"]["area"] = east_west_wall_area - 8.0
 
     return building
 
@@ -784,11 +805,47 @@ def _distribution_geometry(building: dict) -> tuple[float, float, float, int]:
 
     n_floors = max(int(building["building"].get("n_floors", 1)), 1)
     floor_height = float(building["building"].get("height", 3.0)) / n_floors
-    footprint_area = max(float(building["building"]["net_floor_area"]) / n_floors, 1.0)
+    footprint_area = max(
+        float(
+            building["building"].get(
+                "footprint_area",
+                float(building["building"]["net_floor_area"]) / n_floors,
+            )
+        ),
+        1.0,
+    )
+    if "footprint_length" in building["building"] and "footprint_width" in building["building"]:
+        return (
+            float(building["building"]["footprint_length"]),
+            float(building["building"]["footprint_width"]),
+            floor_height,
+            n_floors,
+        )
     aspect_ratio = 1.4
     width = float(np.sqrt(footprint_area / aspect_ratio))
     length = footprint_area / width
     return length, width, floor_height, n_floors
+
+
+def building_geometry_summary(building: dict) -> dict[str, float]:
+    """Return the main area quantities used by the example building."""
+
+    building_data = building["building"]
+    n_floors = max(int(building_data.get("n_floors", 1)), 1)
+    net_floor_area = float(building_data["net_floor_area"])
+    footprint_area = float(building_data.get("footprint_area", net_floor_area / n_floors))
+    surfaces = {surface["name"]: surface for surface in building["building_surface"]}
+    return {
+        "net_floor_area_m2": net_floor_area,
+        "n_floors": float(n_floors),
+        "footprint_area_m2": footprint_area,
+        "roof_area_m2": float(surfaces["Roof surface"]["area"]),
+        "ground_slab_area_m2": float(surfaces["Slab to ground"]["area"]),
+        "footprint_length_m": float(building_data.get("footprint_length", np.nan)),
+        "footprint_width_m": float(building_data.get("footprint_width", np.nan)),
+        "total_height_m": float(building_data.get("height", np.nan)),
+        "floor_height_m": float(building_data.get("floor_height", np.nan)),
+    }
 
 
 def _pipe_psi_by_scenario(scenario: str) -> tuple[float, float, float]:
@@ -1298,11 +1355,599 @@ def _write_plot(fig: go.Figure, output_path: Path) -> Path:
     return output_path
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if np.isfinite(number) else default
+
+
+def _optional_summary_value(
+    summary: dict[str, float] | None,
+    key: str,
+) -> float | None:
+    if not summary or key not in summary:
+        return None
+    value = _finite_float(summary[key], default=np.nan)
+    return value if np.isfinite(value) else None
+
+
+def _summary_value(
+    summary: dict[str, float] | None,
+    key: str,
+    default: float = 0.0,
+) -> float:
+    value = _optional_summary_value(summary, key)
+    return default if value is None else value
+
+
+def _sum_column(df: pd.DataFrame, column: str) -> float:
+    if column not in df:
+        return 0.0
+    return _finite_float(df[column].sum())
+
+
+def _max_column(df: pd.DataFrame, column: str) -> float:
+    if column not in df:
+        return 0.0
+    return _finite_float(df[column].max())
+
+
+def _min_active_capacity(
+    allocated: pd.DataFrame,
+    load_column: str,
+    capacity_column: str,
+) -> float:
+    if load_column not in allocated or capacity_column not in allocated:
+        return 0.0
+    active = allocated.loc[allocated[load_column].gt(0.0), capacity_column].replace(0.0, np.nan)
+    if active.dropna().empty:
+        return 0.0
+    return _finite_float(active.min())
+
+
+def _positive_stage_values(stages: list[tuple[str, float | None]]) -> tuple[list[str], list[float]]:
+    clean = [
+        (label, float(value))
+        for label, value in stages
+        if value is not None and np.isfinite(value) and value >= 0.0
+    ]
+    return [label for label, _ in clean], [value for _, value in clean]
+
+
+def _relative_href(path: Path, base_dir: Path) -> str:
+    try:
+        relative = path.relative_to(base_dir)
+    except ValueError:
+        relative = Path(os.path.relpath(path, base_dir))
+    return html.escape(relative.as_posix())
+
+
+PLOT_LINK_LABELS = {
+    "00_user_overview.html": "System overview",
+    "00_workflow_handoff.html": "Workflow handoff",
+    "00_sanity_checks.html": "Sanity checks",
+    "00_performance_14511_14825.html": "EN 14511 / EN 14825 performance data",
+    "01_inputs_timeseries.html": "Input time series",
+    "02_emission_15316_2_timeseries.html": "EN 15316-2 emission time series",
+    "03_emission_15316_2_monthly.html": "EN 15316-2 monthly emission summary",
+    "04_distribution_15316_3_timeseries.html": "EN 15316-3 distribution time series",
+    "05_distribution_15316_3_monthly.html": "EN 15316-3 monthly distribution summary",
+    "06_storage_15316_5_timeseries.html": "EN 15316-5 storage time series",
+    "07_storage_15316_5_monthly.html": "EN 15316-5 monthly storage summary",
+    "08_cooling_16798_9_operating_conditions.html": "EN 16798-9 cooling operating conditions",
+    "09_cooling_storage_16798_15.html": "EN 16798-15 cooling storage",
+    "10_cooling_generation_16798_13_timeseries.html": "EN 16798-13 cooling generation time series",
+    "11_cooling_generation_16798_13_bins.html": "EN 16798-13 cooling generation bins",
+    "02_heat_pump_timeseries.html": "Heating/DHW heat-pump time series",
+    "03_monthly_summary.html": "Monthly demand, electricity, SPF and SEER",
+    "04_bin_energy_balance.html": "EN 15316-4-2 bin energy balance",
+    "05_bin_performance.html": "COP/EER, capacity and runtime by bin",
+    "06_energy_flow_sankey.html": "Annual energy-flow Sankey",
+}
+
+
+def _plot_link_label(path: Path) -> str:
+    if path.name in PLOT_LINK_LABELS:
+        return PLOT_LINK_LABELS[path.name]
+    stem = path.stem
+    prefix, _, rest = stem.partition("_")
+    if prefix.isdigit() and rest:
+        stem = rest
+    return stem.replace("_", " ").title()
+
+
+def plot_user_overview(
+    loads: pd.DataFrame,
+    allocated: pd.DataFrame,
+    summary: dict[str, float],
+    output_dir: Path,
+    geometry_summary: dict[str, float] | None = None,
+) -> Path:
+    """Create a first-read page for end users of the example."""
+
+    monthly_loads = loads[["Q_H_kWh", "Q_W_kWh", "Q_C_kWh"]].resample("ME").sum()
+    monthly_electricity = allocated[["E_HW_total_kWh", "E_C_total_kWh"]].resample("ME").sum()
+    monthly_total_electricity = monthly_electricity.sum(axis=1)
+
+    service_names = ["Heating", "DHW", "Cooling"]
+    demand_values = [
+        _summary_value(summary, "QH_gen_out_kWh"),
+        _summary_value(summary, "QW_gen_out_kWh"),
+        _summary_value(summary, "QC_gen_out_kWh"),
+    ]
+    electricity_values = [
+        _sum_column(allocated, "H_E_hp_in_kWh") + _sum_column(allocated, "H_E_backup_in_kWh"),
+        _sum_column(allocated, "W_E_hp_in_kWh") + _sum_column(allocated, "W_E_backup_in_kWh"),
+        _sum_column(allocated, "C_E_hp_in_kWh") + _sum_column(allocated, "C_E_backup_in_kWh"),
+    ]
+    auxiliary_electricity = _sum_column(allocated, "W_HW_gen_aux_kWh") + _sum_column(
+        allocated, "W_C_gen_aux_kWh"
+    )
+
+    floor_area = (
+        _summary_value(geometry_summary, "net_floor_area_m2", default=np.nan)
+        if geometry_summary
+        else np.nan
+    )
+    if not np.isfinite(floor_area) or floor_area <= 0.0:
+        floor_area = np.nan
+    intensity_values = [
+        demand_values[0] / floor_area if np.isfinite(floor_area) else np.nan,
+        demand_values[1] / floor_area if np.isfinite(floor_area) else np.nan,
+        demand_values[2] / floor_area if np.isfinite(floor_area) else np.nan,
+        _summary_value(summary, "E_total_electricity_kWh") / floor_area
+        if np.isfinite(floor_area)
+        else np.nan,
+    ]
+
+    fig = make_subplots(
+        rows=3,
+        cols=2,
+        specs=[
+            [{}, {"type": "domain"}],
+            [{"colspan": 2}, None],
+            [{}, {}],
+        ],
+        vertical_spacing=0.14,
+        horizontal_spacing=0.12,
+        subplot_titles=[
+            "Annual demand served and electricity used",
+            "Final electricity split",
+            "Monthly demand pattern and electricity",
+            "Seasonal performance",
+            "Useful-area intensities",
+        ],
+    )
+    fig.add_trace(
+        go.Bar(
+            x=service_names,
+            y=demand_values,
+            name="Thermal demand served",
+            marker_color="#8b5a2b",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=service_names,
+            y=electricity_values,
+            name="Compressor + backup electricity",
+            marker_color="#4f6f8f",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Pie(
+            labels=[
+                "Heating",
+                "DHW",
+                "Cooling",
+                "Auxiliaries",
+            ],
+            values=electricity_values + [auxiliary_electricity],
+            name="Electricity split",
+            marker=dict(colors=["#b23b3b", "#e09f3e", "#2f78b7", "#808080"]),
+            hole=0.42,
+            textinfo="label+percent",
+        ),
+        row=1,
+        col=2,
+    )
+    for col, name, color in [
+        ("Q_H_kWh", "Heating demand", "#b23b3b"),
+        ("Q_W_kWh", "DHW demand", "#e09f3e"),
+        ("Q_C_kWh", "Cooling demand", "#2f78b7"),
+    ]:
+        fig.add_trace(
+            go.Bar(
+                x=monthly_loads.index,
+                y=monthly_loads[col],
+                name=name,
+                marker_color=color,
+            ),
+            row=2,
+            col=1,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_total_electricity.index,
+            y=monthly_total_electricity,
+            mode="lines+markers",
+            name="Total electricity",
+            line=dict(color="#1f2933", width=3),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating + DHW SPF", "Cooling SEER"],
+            y=[
+                _summary_value(summary, "SPF_HW_gen", default=np.nan),
+                _summary_value(summary, "SEER_C_gen", default=np.nan),
+            ],
+            name="Seasonal performance",
+            marker_color=["#a83232", "#2f78b7"],
+            showlegend=False,
+        ),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating", "DHW", "Cooling", "Total electricity"],
+            y=intensity_values,
+            name="kWh/m2 useful floor area",
+            marker_color=["#b23b3b", "#e09f3e", "#2f78b7", "#4f6f8f"],
+            showlegend=False,
+        ),
+        row=3,
+        col=2,
+    )
+    fig.update_yaxes(title_text="kWh/year", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/month", row=2, col=1)
+    fig.update_yaxes(title_text="ratio", row=3, col=1)
+    fig.update_yaxes(title_text="kWh/m2.year", row=3, col=2)
+    fig.update_layout(
+        title="System Overview: Loads, Electricity and Performance",
+        barmode="group",
+        height=980,
+    )
+    return _write_plot(fig, output_dir / "visuals" / "00_user_overview.html")
+
+
+def plot_workflow_handoff(
+    loads: pd.DataFrame,
+    allocated: pd.DataFrame,
+    summary: dict[str, float],
+    output_dir: Path,
+    emission_result: pybui.EmissionSimulationResult | None = None,
+    distribution_result: pybui.DistributionSimulationResult | None = None,
+    storage_result: pybui.StorageSimulationResult | None = None,
+    cooling_storage_result: pybui.CoolingStorageSimulationResult | None = None,
+    cooling_generation_result: pybui.CoolingGenerationSimulationResult | None = None,
+) -> Path:
+    """Create an annual handoff plot following the implemented standards chain."""
+
+    emission = emission_result.summary if emission_result is not None else None
+    distribution = distribution_result.summary if distribution_result is not None else None
+    storage = storage_result.summary if storage_result is not None else None
+    cooling_storage = cooling_storage_result.summary if cooling_storage_result is not None else None
+    cooling_generation = (
+        cooling_generation_result.summary if cooling_generation_result is not None else None
+    )
+    iso_heating = _optional_summary_value(emission, "QH_em_out_kWh")
+    if iso_heating is None:
+        iso_heating = _sum_column(loads, "Q_H_kWh")
+    iso_cooling = _optional_summary_value(emission, "QC_em_out_kWh")
+    if iso_cooling is None:
+        iso_cooling = _sum_column(loads, "Q_C_kWh")
+    dhw_need = _optional_summary_value(distribution, "QW_dis_out_kWh")
+    if dhw_need is None:
+        dhw_need = _sum_column(loads, "Q_W_kWh")
+
+    heating_labels, heating_values = _positive_stage_values(
+        [
+            ("ISO 52016 room load", iso_heating),
+            ("EN 15316-2 emission", _optional_summary_value(emission, "QH_em_in_kWh")),
+            ("EN 15316-3 distribution", _optional_summary_value(distribution, "QH_dis_in_kWh")),
+            ("EN 15316-5 storage", _optional_summary_value(storage, "QH_sto_in_kWh")),
+            ("Generator request", _summary_value(summary, "QH_gen_out_kWh")),
+        ]
+    )
+    cooling_labels, cooling_values = _positive_stage_values(
+        [
+            ("ISO 52016 room load", iso_cooling),
+            ("EN 15316-2 emission", _optional_summary_value(emission, "QC_em_in_kWh")),
+            ("EN 15316-3 distribution", _optional_summary_value(distribution, "QC_dis_in_kWh")),
+            ("EN 16798-15 storage", _optional_summary_value(cooling_storage, "QC_sto_in_kWh")),
+            ("Generator request", _summary_value(summary, "QC_gen_out_kWh")),
+        ]
+    )
+    dhw_labels, dhw_values = _positive_stage_values(
+        [
+            ("EN 12831-3 tap need", dhw_need),
+            ("EN 15316-3 distribution", _optional_summary_value(distribution, "QW_dis_in_kWh")),
+            ("EN 15316-5 storage", _optional_summary_value(storage, "QW_sto_in_kWh")),
+            ("Generator request", _summary_value(summary, "QW_gen_out_kWh")),
+        ]
+    )
+
+    loss_items = [
+        ("Emission heating", _summary_value(emission, "QH_em_ls_kWh")),
+        ("Emission cooling", _summary_value(emission, "QC_em_ls_kWh")),
+        ("Distribution heating", _summary_value(distribution, "QH_dis_ls_kWh")),
+        ("Distribution cooling", _summary_value(distribution, "QC_dis_ls_kWh")),
+        ("Distribution DHW", _summary_value(distribution, "QW_dis_ls_kWh")),
+        ("Storage heating", _summary_value(storage, "QH_sto_ls_kWh")),
+        ("Storage DHW", _summary_value(storage, "QW_sto_ls_kWh")),
+        ("Cooling storage gains", _summary_value(cooling_storage, "QC_sto_ls_tot_kWh")),
+    ]
+    loss_labels = [label for label, value in loss_items if value > 0.0]
+    loss_values = [value for _, value in loss_items if value > 0.0]
+
+    electricity_items = [
+        ("Heating compressor", _sum_column(allocated, "H_E_hp_in_kWh")),
+        ("DHW compressor", _sum_column(allocated, "W_E_hp_in_kWh")),
+        ("Cooling compressor", _sum_column(allocated, "C_E_hp_in_kWh")),
+        ("Heating backup", _sum_column(allocated, "H_E_backup_in_kWh")),
+        ("DHW backup", _sum_column(allocated, "W_E_backup_in_kWh")),
+        ("Cooling backup", _sum_column(allocated, "C_E_backup_in_kWh")),
+        ("Heating+DHW auxiliaries", _sum_column(allocated, "W_HW_gen_aux_kWh")),
+        ("Cooling auxiliaries", _sum_column(allocated, "W_C_gen_aux_kWh")),
+    ]
+    electricity_labels = [label for label, value in electricity_items if value > 0.0]
+    electricity_values = [value for _, value in electricity_items if value > 0.0]
+
+    qhw_request = _summary_value(summary, "QHW_gen_out_kWh")
+    qc_request = _summary_value(summary, "QC_gen_out_kWh")
+    backup_share = (
+        _summary_value(summary, "QHW_backup_out_kWh") / qhw_request if qhw_request > 0.0 else 0.0
+    )
+    h_unmet_share = (
+        _summary_value(summary, "QHW_unmet_kWh") / qhw_request if qhw_request > 0.0 else 0.0
+    )
+    c_unmet_share = (
+        _summary_value(summary, "QC_unmet_kWh") / qc_request if qc_request > 0.0 else 0.0
+    )
+
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        shared_xaxes=False,
+        vertical_spacing=0.1,
+        subplot_titles=[
+            "Annual load handoff by service",
+            "Annual load increases and thermal losses",
+            "Final electricity by component",
+            "Performance and edge-case fractions",
+        ],
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=heating_labels,
+            y=heating_values,
+            mode="lines+markers",
+            name="Heating",
+            line=dict(color="#b23b3b", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dhw_labels,
+            y=dhw_values,
+            mode="lines+markers",
+            name="DHW",
+            line=dict(color="#e09f3e", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=cooling_labels,
+            y=cooling_values,
+            mode="lines+markers",
+            name="Cooling",
+            line=dict(color="#2f78b7", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=loss_labels, y=loss_values, name="Losses/gains added to loads", marker_color="#8d99ae"),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=electricity_labels, y=electricity_values, name="Electricity", marker_color="#4f6f8f"),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating + DHW SPF", "Cooling SEER"],
+            y=[
+                _summary_value(summary, "SPF_HW_gen", default=np.nan),
+                _summary_value(summary, "SEER_C_gen", default=np.nan),
+            ],
+            name="Seasonal performance",
+            marker_color=["#b23b3b", "#2f78b7"],
+        ),
+        row=4,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating+DHW backup", "Heating+DHW unmet", "Cooling unmet"],
+            y=[backup_share, h_unmet_share, c_unmet_share],
+            name="Fraction of request",
+            marker_color=["#7f1d1d", "#ff9900", "#00a2ff"],
+        ),
+        row=4,
+        col=1,
+        secondary_y=True,
+    )
+    fig.update_yaxes(title_text="kWh/year", row=1, col=1)
+    fig.update_yaxes(title_text="kWh/year", row=2, col=1)
+    fig.update_yaxes(title_text="kWh/year", row=3, col=1)
+    fig.update_yaxes(title_text="ratio", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="fraction", tickformat=".0%", row=4, col=1, secondary_y=True)
+    fig.update_layout(
+        title="Workflow Handoff: From Building Loads to Generator Electricity",
+        barmode="group",
+        height=1220,
+    )
+    return _write_plot(fig, output_dir / "visuals" / "00_workflow_handoff.html")
+
+
+def plot_sanity_checks(
+    loads: pd.DataFrame,
+    allocated: pd.DataFrame,
+    summary: dict[str, float],
+    output_dir: Path,
+    geometry_summary: dict[str, float] | None = None,
+) -> Path:
+    """Create compact checks for geometry, sizing and exceptional outputs."""
+
+    geometry_summary = geometry_summary or {}
+    floor_area = _summary_value(geometry_summary, "net_floor_area_m2", default=np.nan)
+    footprint = _summary_value(geometry_summary, "footprint_area_m2", default=np.nan)
+    floors = _summary_value(geometry_summary, "n_floors", default=np.nan)
+    expected_floor_area = footprint * floors if np.isfinite(footprint) and np.isfinite(floors) else np.nan
+    area_consistency = floor_area / expected_floor_area if expected_floor_area > 0 else np.nan
+
+    annual_electricity = _summary_value(summary, "E_total_electricity_kWh", default=np.nan)
+    electricity_intensity = (
+        annual_electricity / floor_area
+        if np.isfinite(annual_electricity) and np.isfinite(floor_area) and floor_area > 0.0
+        else np.nan
+    )
+    annual_load_intensity = (
+        (
+            _summary_value(summary, "QH_gen_out_kWh")
+            + _summary_value(summary, "QW_gen_out_kWh")
+            + _summary_value(summary, "QC_gen_out_kWh")
+        )
+        / floor_area
+        if np.isfinite(floor_area) and floor_area > 0.0
+        else np.nan
+    )
+
+    qhw_request = _summary_value(summary, "QHW_gen_out_kWh")
+    qc_request = _summary_value(summary, "QC_gen_out_kWh")
+    backup_share = (
+        _summary_value(summary, "QHW_backup_out_kWh") / qhw_request if qhw_request > 0.0 else 0.0
+    )
+    h_unmet_share = (
+        _summary_value(summary, "QHW_unmet_kWh") / qhw_request if qhw_request > 0.0 else 0.0
+    )
+    c_unmet_share = (
+        _summary_value(summary, "QC_unmet_kWh") / qc_request if qc_request > 0.0 else 0.0
+    )
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        vertical_spacing=0.12,
+        subplot_titles=[
+            "Geometry areas used by the example",
+            "Peak hourly loads versus available active capacity",
+            "Compact plausibility indicators",
+        ],
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Useful floor area", "Footprint", "Roof", "Ground slab"],
+            y=[
+                floor_area,
+                footprint,
+                _summary_value(geometry_summary, "roof_area_m2", default=np.nan),
+                _summary_value(geometry_summary, "ground_slab_area_m2", default=np.nan),
+            ],
+            name="Area",
+            marker_color="#5f7f95",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating", "DHW", "Cooling"],
+            y=[
+                _max_column(loads, "Q_H_kWh"),
+                _max_column(loads, "Q_W_kWh"),
+                _max_column(loads, "Q_C_kWh"),
+            ],
+            name="Peak hourly load",
+            marker_color="#b07d62",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=["Heating", "DHW", "Cooling"],
+            y=[
+                _min_active_capacity(allocated, "Q_H_kWh", "H_capacity_kW"),
+                _min_active_capacity(allocated, "Q_W_kWh", "W_capacity_kW"),
+                _min_active_capacity(allocated, "Q_C_kWh", "C_capacity_kW"),
+            ],
+            name="Minimum active capacity",
+            marker_color="#4f6f8f",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=[
+                "Floor-area check",
+                "Load intensity",
+                "Electricity intensity",
+                "Backup share",
+                "Heating+DHW unmet",
+                "Cooling unmet",
+            ],
+            y=[
+                area_consistency,
+                annual_load_intensity,
+                electricity_intensity,
+                backup_share,
+                h_unmet_share,
+                c_unmet_share,
+            ],
+            name="Indicator",
+            marker_color=["#6aa84f", "#8b5a2b", "#4f6f8f", "#7f1d1d", "#ff9900", "#00a2ff"],
+        ),
+        row=3,
+        col=1,
+    )
+    fig.update_yaxes(title_text="m2", row=1, col=1)
+    fig.update_yaxes(title_text="kW", row=2, col=1)
+    fig.update_yaxes(title_text="mixed units", row=3, col=1)
+    fig.update_layout(
+        title="Sanity Checks: Geometry, Sizing and Exceptional Outputs",
+        barmode="group",
+        height=940,
+    )
+    return _write_plot(fig, output_dir / "visuals" / "00_sanity_checks.html")
+
+
 def create_iso52016_visuals(hourly_sim: pd.DataFrame, output_dir: Path, building_area: float) -> Path | None:
     """Create the existing ISO52016 report page in the visual output folder."""
 
     iso_dir = output_dir / "visuals" / "iso52016"
     iso_dir.mkdir(parents=True, exist_ok=True)
+    report_path = iso_dir / "iso52016_building_report.html"
     try:
         pybui.Graphs_and_report(
             df=hourly_sim,
@@ -1310,9 +1955,12 @@ def create_iso52016_visuals(hourly_sim: pd.DataFrame, output_dir: Path, building
             building_area=building_area,
         ).bui_analysis_page(folder_directory=str(iso_dir), name_file="iso52016_building_report")
     except Exception as exc:
+        if report_path.exists():
+            print(f"ISO52016 visual report could not be regenerated; keeping existing report: {exc}")
+            return report_path
         print(f"ISO52016 visual report could not be generated: {exc}")
         return None
-    return iso_dir / "iso52016_building_report.html"
+    return report_path
 
 
 def plot_input_timeseries(
@@ -2421,6 +3069,7 @@ def create_inspection_index(
     summary: dict[str, float],
     plot_paths: list[Path],
     iso_report: Path | None,
+    geometry_summary: dict[str, float] | None = None,
     performance_data_summary: dict[str, float] | None = None,
     emission_summary: dict[str, float] | None = None,
     distribution_summary: dict[str, float] | None = None,
@@ -2438,6 +3087,16 @@ def create_inspection_index(
         "SPF heating+DHW": summary.get("SPF_HW_gen", np.nan),
         "SEER cooling": summary.get("SEER_C_gen", np.nan),
     }
+    if geometry_summary:
+        cards.update(
+            {
+                "Useful floor area": geometry_summary.get("net_floor_area_m2", np.nan),
+                "Footprint area": geometry_summary.get("footprint_area_m2", np.nan),
+                "Floors": geometry_summary.get("n_floors", np.nan),
+                "Roof area": geometry_summary.get("roof_area_m2", np.nan),
+                "Ground slab area": geometry_summary.get("ground_slab_area_m2", np.nan),
+            }
+        )
     if performance_data_summary:
         cards.update(
             {
@@ -2500,11 +3159,25 @@ def create_inspection_index(
                 "EN 16798-13 cooling SEER": cooling_generation_summary.get("SEER_C_gen", np.nan),
             }
         )
-    list_items = []
-    if iso_report is not None:
-        list_items.append(f'<li><a href="{html.escape(str(iso_report.relative_to(output_dir)))}">ISO52016 existing building report</a></li>')
+    plot_items = []
     for path in plot_paths:
-        list_items.append(f'<li><a href="{html.escape(str(path.relative_to(output_dir)))}">{html.escape(path.stem.replace("_", " ").title())}</a></li>')
+        plot_items.append(
+            f'<li><a href="{_relative_href(path, output_dir)}">'
+            f'{html.escape(_plot_link_label(path))}</a></li>'
+        )
+    start_items = plot_items[:3]
+    detailed_items = plot_items[3:]
+    if iso_report is not None:
+        detailed_items.append(
+            f'<li><a href="{_relative_href(iso_report, output_dir)}">'
+            "ISO52016 existing building report</a></li>"
+        )
+    workflow_audit = REPO_ROOT / "docs" / "simulation_workflow_audit.html"
+    audit_items = [
+        '<li><a href="'
+        f'{_relative_href(workflow_audit, output_dir)}'
+        '">Whole simulation workflow audit trail</a></li>'
+    ]
 
     card_html = "\n".join(
         f"<div class='card'><span>{html.escape(name)}</span><strong>{value:,.2f}</strong></div>"
@@ -2576,6 +3249,10 @@ def create_inspection_index(
         "heat-pump bin method, electricity use, backup energy, losses and seasonal "
         "performance."
     )
+    page_intro += (
+        " Start with the overview, workflow handoff and sanity-check plots for a "
+        "quick interpretation, then use the detailed plots for module-level review."
+    )
     page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2594,8 +3271,12 @@ def create_inspection_index(
   <h1>{html.escape(page_title)}</h1>
   <p>{html.escape(page_intro)}</p>
   <div class="grid">{card_html}</div>
-  <h2>Interactive Outputs</h2>
-  <ul>{"".join(list_items)}</ul>
+  <h2>Start Here</h2>
+  <ul>{"".join(start_items)}</ul>
+  <h2>Detailed Interactive Plots</h2>
+  <ul>{"".join(detailed_items)}</ul>
+  <h2>Audit Documentation</h2>
+  <ul>{"".join(audit_items)}</ul>
 </body>
 </html>
 """
@@ -2617,11 +3298,13 @@ def create_visual_outputs(
     cooling_storage_result: pybui.CoolingStorageSimulationResult | None = None,
     cooling_generation_result: pybui.CoolingGenerationSimulationResult | None = None,
     performance_data_result: pybui.HeatPumpPerformanceDataResult | None = None,
+    geometry_summary: dict[str, float] | None = None,
 ) -> Path:
     iso_report = create_iso52016_visuals(hourly_sim, output_dir, building_area)
     allocated = allocate_bin_outputs_to_hours(loads, result.bins)
     allocated = merge_cooling_generation_to_allocated(allocated, cooling_generation_result)
     allocated.to_csv(output_dir / "heat_pump_hourly_allocated_results.csv")
+    combined_summary = combined_generation_summary(result.summary, cooling_generation_result)
 
     input_title = (
         "Final Loads Sent to Heating/DHW Heat Pump and EN 16798-13 Cooling Generator"
@@ -2634,7 +3317,21 @@ def create_visual_outputs(
         if emission_result is not None
         else "ISO52016 and DHW Inputs Sent to the Heat Pump"
     )
-    plot_paths = []
+    plot_paths = [
+        plot_user_overview(loads, allocated, combined_summary, output_dir, geometry_summary),
+        plot_workflow_handoff(
+            loads,
+            allocated,
+            combined_summary,
+            output_dir,
+            emission_result=emission_result,
+            distribution_result=distribution_result,
+            storage_result=storage_result,
+            cooling_storage_result=cooling_storage_result,
+            cooling_generation_result=cooling_generation_result,
+        ),
+        plot_sanity_checks(loads, allocated, combined_summary, output_dir, geometry_summary),
+    ]
     if performance_data_result is not None:
         plot_paths.append(plot_performance_data_14511_14825(performance_data_result, output_dir))
     plot_paths.append(plot_input_timeseries(loads, output_dir, title=input_title))
@@ -2665,7 +3362,6 @@ def create_visual_outputs(
         plot_paths.append(plot_cooling_storage_16798_15(cooling_storage_result, output_dir))
     if cooling_generation_result is not None:
         plot_paths.extend(plot_cooling_generation_16798_13(cooling_generation_result, output_dir))
-    combined_summary = combined_generation_summary(result.summary, cooling_generation_result)
     plot_paths.extend(
         [
             plot_heat_pump_hourly(allocated, output_dir),
@@ -2694,6 +3390,7 @@ def create_visual_outputs(
         combined_summary,
         plot_paths,
         iso_report,
+        geometry_summary=geometry_summary,
         performance_data_summary=(
             performance_data_result.summary if performance_data_result is not None else None
         ),
@@ -2764,6 +3461,7 @@ def run_example(args: argparse.Namespace) -> None:
     ) = resolve_system_methods(args)
     performance_data_method = resolve_performance_data_method(args)
     building = example_building(scenario)
+    geometry_summary = building_geometry_summary(building)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
@@ -2780,6 +3478,10 @@ def run_example(args: argparse.Namespace) -> None:
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
     output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([geometry_summary]).to_csv(
+        output_dir / "building_geometry_summary.csv",
+        index=False,
+    )
 
     hourly_sim = run_iso52016(building, args.weather_source, args.path_weather_file)
     dhw_kWh = make_dhw_profile(
@@ -3020,6 +3722,7 @@ def run_example(args: argparse.Namespace) -> None:
         cooling_storage_result=cooling_storage_result,
         cooling_generation_result=cooling_generation_result,
         performance_data_result=performance_data_result,
+        geometry_summary=geometry_summary,
     )
 
     print(f"\nHeat pump example completed for scenario: {scenario}")
@@ -3071,6 +3774,12 @@ def run_example(args: argparse.Namespace) -> None:
         print(f"Heat-pump DHW input load: {loads['Q_W_kWh'].sum():,.1f} kWh")
     else:
         print(f"DHW demand: {loads['Q_W_kWh'].sum():,.1f} kWh")
+    print(
+        "Example building geometry: "
+        f"{geometry_summary['net_floor_area_m2']:,.1f} m2 useful floor area, "
+        f"{geometry_summary['footprint_area_m2']:,.1f} m2 footprint, "
+        f"{int(geometry_summary['n_floors'])} floors"
+    )
     if cooling_system_result is not None:
         print(f"EN 16798-9 cooling request: {cooling_system_result.summary['QC_dis_out_tot_req_kWh']:,.1f} kWh")
         print(f"EN 16798-9 mean cooling flow: {cooling_system_result.summary['q_V_C_dis_mean_m3_h']:.3f} m3/h")
@@ -3078,8 +3787,8 @@ def run_example(args: argparse.Namespace) -> None:
         print(f"EN 16798-15 cooling storage heat gains: {cooling_storage_result.summary['QC_sto_ls_tot_kWh']:,.1f} kWh")
         print(f"EN 16798-15 cooling storage auxiliaries: {cooling_storage_result.summary['WC_sto_aux_kWh']:,.1f} kWh")
         print(f"Cooling generator input after storage: {loads['Q_C_kWh'].sum():,.1f} kWh")
-    print(f"Heating+DHW electricity incl. backup: {combined_summary['EHW_gen_in_kWh']:,.1f} kWh")
-    print(f"Heating+DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
+    print(f"Heating and DHW electricity, including backup: {combined_summary['EHW_gen_in_kWh']:,.1f} kWh")
+    print(f"Heating and DHW auxiliaries: {result.summary['WHW_gen_aux_kWh']:,.1f} kWh")
     if cooling_generation_result is not None:
         print(f"EN 16798-13 cooling electricity: {cooling_generation_result.summary['EC_total_kWh']:,.1f} kWh")
         print(f"EN 16798-13 cooling rejected heat: {cooling_generation_result.summary['QC_gen_out_kWh']:,.1f} kWh")
