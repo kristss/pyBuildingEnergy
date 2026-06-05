@@ -48,7 +48,7 @@ More details in the example folder.
 ## Domestic Hot Water - DHW
 
 - [x] Calculation of volume and energy need for domestic hot water according to EN 12831-3.
-- [ ] Assessment of thermal load based on the type of DHW system.
+- [x] Assessment of DHW system design heat load with EN 12831-3 storage switch points, time lag, effective reheating power and supply-curve sizing.
 
 For the audit trail between the standard, code and outputs, open
 [DHW EN 12831-3 Implementation Audit](docs/dhw_12831_3_audit.html).
@@ -177,11 +177,13 @@ There is also a Bolzano convenience wrapper:
 python examples/heat_pump_15316_4_2_bolzano_example.py
 ```
 
-The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed envelope and an air-to-water heat-pump map sized for a 120 m2 useful-floor-area residential building. In both cases the example geometry is a two-floor building with a 60 m2 footprint; roof and ground-slab areas are therefore 60 m2, while `net_floor_area` remains 120 m2.
+The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar, the EN 12831-3 Annex B Table B.2 single-family dwelling hourly DHW profile and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, the same residential Annex B hourly DHW profile, a tighter solar-exposed envelope and an air-to-water heat-pump map sized for a 120 m2 useful-floor-area residential building. In both cases the example geometry is a two-floor building with a 60 m2 footprint; roof and ground-slab areas are therefore 60 m2, while `net_floor_area` remains 120 m2.
 
-Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects, EN 15316-5 heating/DHW storage effects and the EN 16798 cooling-side modules by default, calculates an hourly DHW profile, runs the generator calculations and writes:
+Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects, EN 15316-5 heating/DHW storage effects and the EN 16798 cooling-side modules by default, calculates an hourly DHW profile and the EN 12831-3 DHW design sizing, runs the generator calculations and writes:
 
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/dhw_12831_3_design_timeseries.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/dhw_12831_3_design_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/building_geometry_summary.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
 - `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_summary.csv`
@@ -213,6 +215,8 @@ Open `inspection_index.html` in a browser to inspect the visual outputs. The pag
   through the implemented standards;
 - sanity-check plots for geometry, peak loads versus active capacity, backup
   shares and unmet loads;
+- EN 12831-3 DHW design-day needs, storage switch curves, residual storage and
+  effective reheating power;
 - the existing ISO52016 building report generated with `Graphs_and_report`;
 - the whole simulation workflow audit trail;
 - daily input time series for heating, cooling, DHW and temperatures;
@@ -249,6 +253,18 @@ performance stage, use:
 ```bash
 python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path simple --performance-data-method en14511-14825
 ```
+
+By default, the full path also runs EN 12831-3 DHW system sizing and passes the
+selected DHW storage volume and design flow into EN 15316-5 and EN 15316-3. To
+keep the earlier fixed DHW storage/distribution assumptions, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --dhw-design-method simple
+```
+
+The EN 12831-3 sizing target can be changed with `--dhw-sizing-mode check`,
+`--dhw-sizing-mode size_storage`, `--dhw-sizing-mode size_power` or
+`--dhw-sizing-mode auto`.
 
 To run the previous detailed path with EN 15316-2 and EN 15316-3 but without EN 15316-5 storage, use:
 
@@ -309,7 +325,7 @@ The EN 15316 series covers the calculation method for system energy requirements
 
 ## EN 15316 Modular Structure **(New)**
 
-- [x] EN 12831-3: Domestic hot-water energy needs
+- [x] EN 12831-3: Domestic hot-water energy needs and DHW design heat-load/sizing
 - [x] EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
 - [x] EN 15316-2: Emission systems (heating and cooling)
 - [x] EN 15316-3: Distribution systems (DHW, heating, cooling)
@@ -438,7 +454,7 @@ This work was carried out within European projects:
 - **Moderate** - Horizon Europe (grant agreement No. 101069834)
 - **BREEZE** - Building Renovation Efforts for Zero Emission Buildings, co-funded by the European Union LIFE programme (grant agreement No. 101215197)
 
-DHW calculation developed with data and methods from the EPB Center spreadsheet.
+The DHW calculation was developed with data and methods from the EPB Center spreadsheet.
 
 ## References
 
@@ -448,8 +464,8 @@ DHW calculation developed with data and methods from the EPB Center spreadsheet.
 - Directive (EU) 2024/1275 - Official Journal of the EU, May 8, 2024
 - EN ISO 52010-1:2018 - External climatic conditions  
 - EN ISO 52016-1:2018 - Energy needs for heating and cooling  
-- EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and iso 52017-1
-- EN 12831-3:2018 - DHW systems heat load and characterization  
+- EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and ISO 52017-1
+- EN 12831-3:2017 - DHW systems heat load and characterization  
 - EN 14511-1:2022 - Air conditioners, liquid chilling packages and heat pumps: terms and definitions
 - EN 14511-2:2022 - Air conditioners, liquid chilling packages and heat pumps: test conditions
 - EN 14825:2022 - Seasonal performance and part-load conditions for air conditioners, chillers and heat pumps

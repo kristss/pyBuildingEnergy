@@ -4,9 +4,10 @@ This script demonstrates the complete sequence:
 
 1. Calculate hourly space heating/cooling needs with ISO52016.
 2. Apply EN 15316-2 emitter/control effects and emission losses.
-3. Calculate a meaningful hourly DHW need with the DHW module.
+3. Calculate DHW energy needs and DHW sizing with EN 12831-3.
 4. Apply EN 15316-3 water-based distribution losses and pump auxiliaries.
-5. Apply EN 15316-5 heating/DHW storage losses and auxiliaries.
+5. Apply EN 15316-5 heating/DHW storage losses and auxiliaries using the
+   EN 12831-3 DHW storage selection where enabled.
 6. Apply EN 16798-9, EN 16798-15 and EN 16798-13 to the cooling-side
    operating conditions, chilled storage and generation calculation.
 7. Run the EN 15316-4-2 heat-pump bin calculation for heating and DHW.
@@ -62,6 +63,7 @@ def default_output_dir(
     cooling_storage_method: str = "en16798-15",
     cooling_generation_method: str = "en16798-13",
     performance_data_method: str = "en14511-14825",
+    dhw_design_method: str = "en12831-3",
 ) -> Path:
     suffix = f"heat_pump_15316_4_2_{scenario}"
     if (
@@ -115,6 +117,8 @@ def default_output_dir(
         suffix = f"{suffix}_no_cooling_storage"
     if performance_data_method == "simple" and not suffix.endswith("_simple"):
         suffix = f"{suffix}_simple_performance"
+    if dhw_design_method == "simple" and not suffix.endswith("_simple"):
+        suffix = f"{suffix}_simple_dhw_design"
     return REPO_ROOT / "examples" / "outputs" / suffix
 
 
@@ -404,15 +408,100 @@ def run_iso52016(building: dict, weather_source: str, path_weather_file: str | N
     return result[0].copy()
 
 
-def make_dhw_profile(index: pd.DatetimeIndex, building_area: float, country: str) -> pd.Series:
+def dhw_cold_water_temperature_C(scenario: str) -> float:
+    return 9.5 if scenario == "bolzano" else 11.2
+
+
+DHW_DAY_TYPE_COLUMNS = ("Workday", "Weekend", "Holiday")
+
+# EN 12831-3:2017 Annex B, Table B.2 gives relative hourly hot-water
+# volume profiles by building category. The tabulated values are percentages
+# rounded to one decimal, so some columns sum to 99.7 or 99.9 rather than
+# exactly 100. The helper below normalizes each profile before it is used.
+DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT = {
+    "single_family_dwelling": [
+        1.8, 1.0, 0.6, 0.3, 0.4, 0.6,
+        2.4, 4.7, 6.8, 5.7, 6.1, 6.1,
+        6.3, 6.4, 5.1, 4.4, 4.3, 4.7,
+        5.7, 6.5, 6.6, 5.8, 4.5, 3.1,
+    ],
+    "apartment_dwelling": [
+        1.0, 1.0, 1.0, 0.0, 0.0, 1.0,
+        3.0, 6.0, 8.0, 6.0, 5.0, 5.0,
+        6.0, 6.0, 5.0, 4.0, 4.0, 5.0,
+        6.0, 7.0, 7.0, 6.0, 5.0, 2.0,
+    ],
+    "residential_home_elderly": [
+        0.3, 0.3, 0.4, 0.7, 1.0, 1.8,
+        9.3, 15.7, 8.1, 7.5, 7.0, 6.6,
+        7.1, 5.1, 3.8, 3.3, 4.1, 2.9,
+        6.1, 4.1, 1.4, 1.8, 0.9, 0.4,
+    ],
+    "student_residence": [
+        1.4, 1.0, 0.5, 0.6, 1.3, 3.4,
+        5.8, 5.8, 6.2, 5.4, 5.1, 4.7,
+        4.2, 4.5, 4.1, 4.3, 5.3, 6.0,
+        6.6, 6.0, 5.6, 5.4, 3.9, 2.8,
+    ],
+    "hospital": [
+        0.4, 0.4, 0.5, 0.8, 1.2, 2.8,
+        7.5, 10.5, 8.0, 7.5, 7.5, 7.0,
+        7.5, 5.5, 4.3, 3.7, 4.5, 3.2,
+        7.0, 4.5, 2.0, 2.0, 1.2, 0.5,
+    ],
+}
+
+# Both example buildings are residential, two-floor, 120 m2 useful-area houses.
+# The single-family dwelling curve is therefore used for both climates; the
+# Workalendar country still gives scenario-specific workday/holiday calendars.
+SCENARIO_DHW_ANNEX_B_PROFILE = {
+    "athens": "single_family_dwelling",
+    "bolzano": "single_family_dwelling",
+}
+
+
+def dhw_annex_b_table_b2_hourly_fractions(
+    profile_key: str = "single_family_dwelling",
+) -> pd.DataFrame:
+    """Return EN 12831-3 Annex B Table B.2 hourly fractions for the examples.
+
+    ``Volume_and_energy_DHW_calculation`` expects one 24-hour vector for each
+    day type. Table B.2 is category-based, not day-type-based, so the selected
+    category profile is reused for workdays, weekends and holidays. The values
+    are normalized to fractions that sum to 1.0 per day type.
+    """
+
+    if profile_key not in DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT:
+        available = ", ".join(sorted(DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT))
+        raise ValueError(
+            f"Unknown EN 12831-3 Annex B Table B.2 profile '{profile_key}'. "
+            f"Available profiles: {available}."
+        )
+    percent = pd.Series(
+        DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT[profile_key],
+        index=range(24),
+        dtype=float,
+    )
+    if len(percent) != 24:
+        raise ValueError(f"DHW profile '{profile_key}' must contain 24 hourly values.")
+    total = float(percent.sum())
+    if total <= 0.0:
+        raise ValueError(f"DHW profile '{profile_key}' must have a positive sum.")
+    fractions = percent / total
+    return pd.DataFrame({column: fractions.values for column in DHW_DAY_TYPE_COLUMNS})
+
+
+def make_dhw_profile(
+    index: pd.DatetimeIndex,
+    building_area: float,
+    country: str,
+    cold_water_temperature_C: float = 11.2,
+    annex_b_profile_key: str = "single_family_dwelling",
+) -> pd.Series:
     """Calculate hourly DHW needs and align them to an ISO52016 hourly index."""
 
-    hourly_fractions = pd.DataFrame(
-        {
-            "Workday": [0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 20, 10, 10, 10, 10, 5, 0, 0, 0, 0, 0, 0],
-            "Weekend": [0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "Holiday": [0, 0, 0, 0, 0, 0, 0, 0, 3, 8, 8, 8, 15, 10, 10, 10, 8, 5, 0, 0, 0, 0, 0, 0],
-        }
+    hourly_fractions = dhw_annex_b_table_b2_hourly_fractions(
+        annex_b_profile_key
     )
     sum_fractions = pd.DataFrame(hourly_fractions.sum(), columns=["fractions"])
 
@@ -434,7 +523,7 @@ def make_dhw_profile(index: pd.DatetimeIndex, building_area: float, country: str
             42.0,
             13.5,
             60.0,
-            11.2,
+            cold_water_temperature_C,
             mode_calc="number_of_units",
             building_type_B3="Residential",
             building_area=building_area,
@@ -455,6 +544,106 @@ def make_dhw_profile(index: pd.DatetimeIndex, building_area: float, country: str
     if aligned.isna().any():
         aligned = aligned.ffill().bfill()
     return aligned.astype(float)
+
+
+def _nearest_capacity_kW(
+    performance_map: pd.DataFrame,
+    source_temperature_C: float,
+    sink_temperature_C: float,
+) -> float:
+    if performance_map.empty or "capacity_kW" not in performance_map:
+        return 0.0
+    df = performance_map.copy()
+    df["_distance"] = (
+        (df["source_temperature_C"].astype(float) - source_temperature_C).abs()
+        + (df["sink_temperature_C"].astype(float) - sink_temperature_C).abs()
+    )
+    return float(df.sort_values("_distance").iloc[0]["capacity_kW"])
+
+
+def dhw_design_system_config(
+    scenario: str,
+    distribution_config: dict,
+    storage_config: dict,
+    heating_map: pd.DataFrame,
+    sizing_mode: str,
+) -> dict:
+    """Build EN 12831-3 DHW design-load inputs aligned with later modules."""
+
+    dhw_storage = storage_config["dhw"]
+    dhw_distribution = distribution_config["dhw"]
+    source_design_C = -7.0 if scenario == "bolzano" else 2.0
+    sink_design_C = float(dhw_storage.get("set_temperature_C", 55.0))
+    nominal_power_kW = _nearest_capacity_kW(
+        heating_map,
+        source_temperature_C=source_design_C,
+        sink_temperature_C=sink_design_C,
+    )
+    if nominal_power_kW <= 0.0:
+        nominal_power_kW = 6.0 if scenario == "bolzano" else 7.0
+
+    config = {
+        "system_type": "loading_storage",
+        "sizing_mode": sizing_mode,
+        "demand_unit": "kWh",
+        "storage_volume_l": float(dhw_storage.get("storage_volume_l", 180.0)),
+        "storage_height_m": 1.25 if scenario == "bolzano" else 1.20,
+        "sensor_relative_height": 0.35,
+        "loading_factor": 1.0,
+        "storage_max_temperature_C": float(dhw_storage.get("set_temperature_C", 55.0)),
+        "draw_temperature_C": 42.0,
+        "cold_water_temperature_C": dhw_cold_water_temperature_C(scenario),
+        "ambient_temperature_C": float(dhw_storage.get("ambient_temperature_C", 16.0)),
+        "charging_temperature_C": min(
+            60.0,
+            float(dhw_storage.get("set_temperature_C", 55.0)) + 5.0,
+        ),
+        "nominal_power_kW": nominal_power_kW,
+        "heat_exchanger_power_kW": nominal_power_kW,
+        "heat_generator_type": "heat_pump",
+        "distribution_pipe_sections": dhw_distribution.get("pipe_sections", []),
+        "distribution_length_m": float(dhw_distribution.get("max_length_m", 0.0)),
+        "specific_distribution_loss_W_m": 11.0,
+        "pipe_mean_temperature_C": 50.0,
+        "mixed_storage_time_constant_min": 55.0 if scenario == "bolzano" else 45.0,
+        "max_storage_volume_l": 600.0,
+    }
+    # EN 12831-3 Annex B Table B.8 is used by default for DHW design standby
+    # loss. Provide one of these keys only when project/product data should
+    # override the Annex B.8 interpolation.
+    for key in (
+        "dhw_design_standby_loss_kWh_per_day",
+        "standby_loss_kWh_per_day",
+        "q_sb_sto_kWh_d",
+    ):
+        if key in dhw_storage:
+            config["standby_loss_kWh_per_day"] = float(dhw_storage[key])
+            break
+    return config
+
+
+def apply_dhw_design_to_system_configs(
+    dhw_design: pybui.DHWDesignSimulationResult | None,
+    distribution_config: dict,
+    storage_config: dict,
+) -> None:
+    """Use EN 12831-3 sizing outputs as downstream EN 15316 inputs."""
+
+    if dhw_design is None:
+        return
+    summary = dhw_design.summary
+    selected_volume_l = float(summary.get("V_sto_selected_l", 0.0) or 0.0)
+    if selected_volume_l > 0.0:
+        storage_config["dhw"]["storage_volume_l"] = selected_volume_l
+    q_sb = float(summary.get("q_sb_sto_kWh_d", 0.0) or 0.0)
+    if q_sb > 0.0:
+        storage_config["dhw"]["standby_loss_kWh_per_day_ref"] = q_sb
+    design_flow = float(summary.get("design_flow_m3_h", 0.0) or 0.0)
+    if design_flow > 0.0:
+        distribution_config["dhw"]["design_flow_m3_h"] = max(
+            float(distribution_config["dhw"].get("design_flow_m3_h", 0.0)),
+            design_flow,
+        )
 
 
 def heat_pump_maps(scenario: str = "athens") -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1009,6 +1198,9 @@ def storage_system_config(scenario: str) -> dict:
     The example keeps EN 15316-5 connection losses at 1.0 because pipe and valve
     losses are already represented explicitly in the EN 15316-3 distribution
     module. Declared daily standby losses are converted internally to H_sto_ls.
+    EN 12831-3 DHW design sizing uses Annex B Table B.8 standby losses by
+    default; set dhw_design_standby_loss_kWh_per_day for a project-specific
+    design override.
     """
 
     config = {
@@ -1428,6 +1620,7 @@ PLOT_LINK_LABELS = {
     "00_user_overview.html": "System overview",
     "00_workflow_handoff.html": "Workflow handoff",
     "00_sanity_checks.html": "Sanity checks",
+    "00_dhw_design_12831_3.html": "EN 12831-3 DHW sizing and supply curve",
     "00_performance_14511_14825.html": "EN 14511 / EN 14825 performance data",
     "01_inputs_timeseries.html": "Input time series",
     "02_emission_15316_2_timeseries.html": "EN 15316-2 emission time series",
@@ -1940,6 +2133,120 @@ def plot_sanity_checks(
         height=940,
     )
     return _write_plot(fig, output_dir / "visuals" / "00_sanity_checks.html")
+
+
+def plot_dhw_design_12831_3(
+    dhw_design: pybui.DHWDesignSimulationResult,
+    output_dir: Path,
+) -> Path:
+    hourly = dhw_design.timeseries
+    summary = dhw_design.summary
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.09,
+        subplot_titles=[
+            "Representative design-day needs and supply curves",
+            "Storage residual capacity and switch points",
+            "Effective reheating power and minute energy terms",
+        ],
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=hourly.index,
+            y=hourly["Q_W_need_cum_kWh"],
+            mode="lines",
+            name="Needs curve",
+            line=dict(color="#e09f3e", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=hourly.index,
+            y=hourly["Q_W_supply_cum_kWh"],
+            mode="lines",
+            name="Supply curve",
+            line=dict(color="#4f6f8f", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    if "Q_W_sto_residual_kWh" in hourly:
+        fig.add_trace(
+            go.Scatter(
+                x=hourly.index,
+                y=hourly["Q_W_sto_residual_kWh"],
+                mode="lines",
+                name="Residual storage capacity",
+                line=dict(color="#6aa84f", width=3),
+            ),
+            row=2,
+            col=1,
+        )
+        for col, label, color, dash in [
+            ("Q_W_sto_max_kWh", "Maximum capacity", "#1f2933", "dot"),
+            ("Q_W_sto_on_kWh", "Switch-on capacity", "#b23b3b", "dash"),
+            ("Q_W_sto_min_kWh", "Minimum allowed capacity", "#ff9900", "dash"),
+        ]:
+            if col in hourly:
+                fig.add_trace(
+                    go.Scatter(
+                        x=hourly.index,
+                        y=hourly[col],
+                        mode="lines",
+                        name=label,
+                        line=dict(color=color, dash=dash),
+                    ),
+                    row=2,
+                    col=1,
+                )
+    fig.add_trace(
+        go.Scatter(
+            x=hourly.index,
+            y=hourly["phi_eff_kW"],
+            mode="lines",
+            name="Effective reheat power",
+            line=dict(color="#7f1d1d", width=2),
+        ),
+        row=3,
+        col=1,
+    )
+    for col, label, color in [
+        ("Q_W_need_kWh", "DHW need", "#e09f3e"),
+        ("Q_W_reheat_effective_kWh", "Effective reheat energy", "#4f6f8f"),
+        ("Q_W_storage_loss_kWh", "Storage loss", "#a6a6a6"),
+        ("Q_W_distribution_loss_kWh", "Distribution loss", "#808080"),
+    ]:
+        if col in hourly:
+            fig.add_trace(
+                go.Bar(
+                    x=hourly.index,
+                    y=hourly[col],
+                    name=label,
+                    marker_color=color,
+                    opacity=0.65,
+                ),
+                row=3,
+                col=1,
+            )
+    satisfied = "satisfied" if bool(summary.get("sizing_satisfied", False)) else "not satisfied"
+    fig.update_yaxes(title_text="kWh", row=1, col=1)
+    fig.update_yaxes(title_text="kWh", row=2, col=1)
+    fig.update_yaxes(title_text="kW / kWh min", row=3, col=1)
+    fig.update_layout(
+        title=(
+            "EN 12831-3 DHW Design Load: "
+            f"{summary.get('V_sto_selected_l', 0.0):,.0f} l storage, "
+            f"{summary.get('phi_N_selected_kW', 0.0):.1f} kW generator, "
+            f"supply curve {satisfied}"
+        ),
+        barmode="overlay",
+        height=980,
+    )
+    return _write_plot(fig, output_dir / "visuals" / "00_dhw_design_12831_3.html")
 
 
 def create_iso52016_visuals(hourly_sim: pd.DataFrame, output_dir: Path, building_area: float) -> Path | None:
@@ -3070,6 +3377,7 @@ def create_inspection_index(
     plot_paths: list[Path],
     iso_report: Path | None,
     geometry_summary: dict[str, float] | None = None,
+    dhw_design_summary: dict[str, float | str | bool] | None = None,
     performance_data_summary: dict[str, float] | None = None,
     emission_summary: dict[str, float] | None = None,
     distribution_summary: dict[str, float] | None = None,
@@ -3095,6 +3403,15 @@ def create_inspection_index(
                 "Floors": geometry_summary.get("n_floors", np.nan),
                 "Roof area": geometry_summary.get("roof_area_m2", np.nan),
                 "Ground slab area": geometry_summary.get("ground_slab_area_m2", np.nan),
+            }
+        )
+    if dhw_design_summary:
+        cards.update(
+            {
+                "EN 12831-3 DHW design day": dhw_design_summary.get("Q_W_design_day_kWh", 0.0),
+                "EN 12831-3 selected DHW storage": dhw_design_summary.get("V_sto_selected_l", 0.0),
+                "EN 12831-3 DHW design flow": dhw_design_summary.get("design_flow_m3_h", 0.0),
+                "EN 12831-3 DHW supply margin": dhw_design_summary.get("supply_margin_min_kWh", 0.0),
             }
         )
     if performance_data_summary:
@@ -3249,6 +3566,15 @@ def create_inspection_index(
         "heat-pump bin method, electricity use, backup energy, losses and seasonal "
         "performance."
     )
+    if dhw_design_summary:
+        page_intro = page_intro.replace(
+            "DHW profile",
+            "EN 12831-3 DHW profile and sizing",
+        )
+        page_intro = page_intro.replace(
+            "ISO52016 and DHW inputs",
+            "ISO52016 and EN 12831-3 DHW inputs",
+        )
     page_intro += (
         " Start with the overview, workflow handoff and sanity-check plots for a "
         "quick interpretation, then use the detailed plots for module-level review."
@@ -3291,6 +3617,7 @@ def create_visual_outputs(
     result: pybui.HeatPumpSimulationResult,
     output_dir: Path,
     building_area: float,
+    dhw_design_result: pybui.DHWDesignSimulationResult | None = None,
     emission_result: pybui.EmissionSimulationResult | None = None,
     distribution_result: pybui.DistributionSimulationResult | None = None,
     storage_result: pybui.StorageSimulationResult | None = None,
@@ -3332,6 +3659,8 @@ def create_visual_outputs(
         ),
         plot_sanity_checks(loads, allocated, combined_summary, output_dir, geometry_summary),
     ]
+    if dhw_design_result is not None:
+        plot_paths.append(plot_dhw_design_12831_3(dhw_design_result, output_dir))
     if performance_data_result is not None:
         plot_paths.append(plot_performance_data_14511_14825(performance_data_result, output_dir))
     plot_paths.append(plot_input_timeseries(loads, output_dir, title=input_title))
@@ -3391,6 +3720,9 @@ def create_visual_outputs(
         plot_paths,
         iso_report,
         geometry_summary=geometry_summary,
+        dhw_design_summary=(
+            dhw_design_result.summary if dhw_design_result is not None else None
+        ),
         performance_data_summary=(
             performance_data_result.summary if performance_data_result is not None else None
         ),
@@ -3449,6 +3781,14 @@ def resolve_performance_data_method(args: argparse.Namespace) -> str:
     return "en14511-14825"
 
 
+def resolve_dhw_design_method(args: argparse.Namespace) -> str:
+    if args.dhw_design_method is not None:
+        return args.dhw_design_method
+    if args.calculation_path == "simple":
+        return "simple"
+    return "en12831-3"
+
+
 def run_example(args: argparse.Namespace) -> None:
     scenario = args.scenario
     (
@@ -3460,6 +3800,7 @@ def run_example(args: argparse.Namespace) -> None:
         cooling_generation_method,
     ) = resolve_system_methods(args)
     performance_data_method = resolve_performance_data_method(args)
+    dhw_design_method = resolve_dhw_design_method(args)
     building = example_building(scenario)
     geometry_summary = building_geometry_summary(building)
     output_dir = (
@@ -3474,6 +3815,7 @@ def run_example(args: argparse.Namespace) -> None:
             cooling_storage_method,
             cooling_generation_method,
             performance_data_method,
+            dhw_design_method,
         )
     )
     dhw_country = args.dhw_calendar_country or SCENARIO_DHW_COUNTRY[scenario]
@@ -3488,8 +3830,44 @@ def run_example(args: argparse.Namespace) -> None:
         pd.DatetimeIndex(hourly_sim.index),
         building_area=float(building["building"]["net_floor_area"]),
         country=dhw_country,
+        cold_water_temperature_C=dhw_cold_water_temperature_C(scenario),
+        annex_b_profile_key=SCENARIO_DHW_ANNEX_B_PROFILE[scenario],
     )
     loads = prepare_heat_pump_loads(hourly_sim, dhw_kWh)
+
+    performance_data_result = None
+    if performance_data_method == "en14511-14825":
+        performance_data_result = heat_pump_performance_data(scenario)
+        heating_map = performance_data_result.heating_map
+        cooling_map = performance_data_result.cooling_map
+    elif performance_data_method == "simple":
+        heating_map, cooling_map = heat_pump_maps(scenario)
+    else:
+        raise ValueError(
+            "--performance-data-method must be 'en14511-14825' or 'simple'."
+        )
+
+    distribution_config = distribution_system_config(scenario, building)
+    storage_config = storage_system_config(scenario)
+    dhw_design_result = None
+    if dhw_design_method == "en12831-3":
+        dhw_design_calc = pybui.DHWDesignLoadCalculator(
+            dhw_design_system_config(
+                scenario,
+                distribution_config,
+                storage_config,
+                heating_map,
+                sizing_mode=args.dhw_sizing_mode,
+            )
+        )
+        dhw_design_result = dhw_design_calc.run_timeseries(loads)
+        apply_dhw_design_to_system_configs(
+            dhw_design_result,
+            distribution_config,
+            storage_config,
+        )
+    elif dhw_design_method != "simple":
+        raise ValueError("--dhw-design-method must be 'en12831-3' or 'simple'.")
 
     emission_result = None
     if emission_method == "en15316-2":
@@ -3538,9 +3916,7 @@ def run_example(args: argparse.Namespace) -> None:
 
     distribution_result = None
     if distribution_method == "en15316-3":
-        distribution_calc = pybui.DistributionSystemCalculator(
-            distribution_system_config(scenario, building)
-        )
+        distribution_calc = pybui.DistributionSystemCalculator(distribution_config)
         distribution_result = distribution_calc.run_timeseries(loads)
         loads["Q_H_distribution_out_kWh"] = distribution_result.timeseries["Q_H_dis_out_kWh"]
         loads["Q_C_distribution_out_kWh"] = distribution_result.timeseries["Q_C_dis_out_kWh"]
@@ -3559,7 +3935,7 @@ def run_example(args: argparse.Namespace) -> None:
 
     storage_result = None
     if storage_method == "en15316-5":
-        storage_calc = pybui.StorageSystemCalculator(storage_system_config(scenario))
+        storage_calc = pybui.StorageSystemCalculator(storage_config)
         storage_result = storage_calc.run_timeseries(loads)
         loads["Q_H_storage_out_kWh"] = storage_result.timeseries["Q_H_sto_out_kWh"]
         loads["Q_W_storage_out_kWh"] = storage_result.timeseries["Q_W_sto_out_kWh"]
@@ -3597,18 +3973,6 @@ def run_example(args: argparse.Namespace) -> None:
 
     ensure_heating_and_cooling(loads)
 
-    performance_data_result = None
-    if performance_data_method == "en14511-14825":
-        performance_data_result = heat_pump_performance_data(scenario)
-        heating_map = performance_data_result.heating_map
-        cooling_map = performance_data_result.cooling_map
-    elif performance_data_method == "simple":
-        heating_map, cooling_map = heat_pump_maps(scenario)
-    else:
-        raise ValueError(
-            "--performance-data-method must be 'en14511-14825' or 'simple'."
-        )
-
     cooling_generation_result = None
     hp_loads = loads.copy()
     cooling_enabled_for_heat_pump = True
@@ -3641,6 +4005,14 @@ def run_example(args: argparse.Namespace) -> None:
     result = calc.run_timeseries(hp_loads)
 
     loads.to_csv(output_dir / "iso52016_loads_with_dhw.csv")
+    if dhw_design_result is not None:
+        dhw_design_result.timeseries.to_csv(
+            output_dir / "dhw_12831_3_design_timeseries.csv"
+        )
+        pd.DataFrame([dhw_design_result.summary]).to_csv(
+            output_dir / "dhw_12831_3_design_summary.csv",
+            index=False,
+        )
     if emission_result is not None:
         emission_result.timeseries.to_csv(output_dir / "emission_15316_2_hourly_results.csv")
         pd.DataFrame([emission_result.summary]).to_csv(
@@ -3715,6 +4087,7 @@ def run_example(args: argparse.Namespace) -> None:
         result=result,
         output_dir=output_dir,
         building_area=float(building["building"]["net_floor_area"]),
+        dhw_design_result=dhw_design_result,
         emission_result=emission_result,
         distribution_result=distribution_result,
         storage_result=storage_result,
@@ -3733,6 +4106,20 @@ def run_example(args: argparse.Namespace) -> None:
     print(f"Cooling storage mode: {cooling_storage_method}")
     print(f"Cooling generation mode: {cooling_generation_method}")
     print(f"Performance data mode: {performance_data_method}")
+    print(f"DHW design mode: {dhw_design_method}")
+    if dhw_design_result is not None:
+        dhw_summary = dhw_design_result.summary
+        print(
+            "EN 12831-3 DHW design: "
+            f"{dhw_summary['Q_W_design_day_kWh']:,.2f} kWh design day, "
+            f"{dhw_summary['V_sto_selected_l']:,.0f} l selected storage, "
+            f"{dhw_summary['phi_N_selected_kW']:.2f} kW selected generator power"
+        )
+        print(
+            "EN 12831-3 supply-curve check: "
+            f"margin {dhw_summary['supply_margin_min_kWh']:.3f} kWh, "
+            f"satisfied={dhw_summary['sizing_satisfied']}"
+        )
     print(f"Output folder: {output_dir.resolve()}")
     print(f"Visual inspection page: {inspection_index.resolve()}")
     if performance_data_result is not None:
@@ -3821,6 +4208,30 @@ def parse_args(default_scenario: str = "athens") -> argparse.Namespace:
         "--dhw-calendar-country",
         default=None,
         help="Workalendar country name for the DHW profile. Default: scenario-specific.",
+    )
+    parser.add_argument(
+        "--dhw-design-method",
+        choices=["en12831-3", "simple"],
+        default=None,
+        help=(
+            "DHW design-load sizing mode. 'en12831-3' runs the EN 12831-3 "
+            "summation-curve sizing check and feeds selected DHW storage/design "
+            "flow to the downstream EN 15316 modules; 'simple' keeps the earlier "
+            "fixed DHW distribution/storage assumptions. Default: en12831-3, "
+            "except --calculation-path simple defaults to simple."
+        ),
+    )
+    parser.add_argument(
+        "--dhw-sizing-mode",
+        choices=["check", "size_storage", "size_power", "auto"],
+        default="size_storage",
+        help=(
+            "EN 12831-3 sizing target when --dhw-design-method en12831-3 is used. "
+            "'check' only checks the configured generator/storage; 'size_storage' "
+            "keeps generator power and increases storage if needed; 'size_power' "
+            "keeps storage and reports required generator power; 'auto' chooses "
+            "from available inputs. Default: size_storage."
+        ),
     )
     parser.add_argument(
         "--calculation-path",
