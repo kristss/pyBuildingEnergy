@@ -1,11 +1,11 @@
 '''
-Calculation of DHW needs according to the ISO 12831-3
-The aim is to evalute and demostrate the validity of the calculation proposed by the ISO.
-This work doesn't replace the standard but it should be used along with the EPB standard.
+Calculation of DHW energy needs according to EN 12831-3.
+The aim is to evaluate and demonstrate the calculation proposed by the standard.
+This work does not replace the standard; it should be used alongside the EPB standard.
 
-Acknowledgments: The work was developed using the regulations and results obtained from the spreadsheet created by the EPBCenter.
+Acknowledgments: The work was developed using the regulations and results obtained from the spreadsheet created by the EPB Center.
 
-Authour: Daniele Antonucci
+Author: Daniele Antonucci
 '''
 
 # ======================================================================================================
@@ -39,13 +39,14 @@ def get_calendar_by_name(nation_name: str):
     except Exception:
         # Fallback for common EU countries (extend as needed)
         try:
-            from workalendar.europe import Italy, Germany, France, Spain, Austria, Switzerland
+            from workalendar.europe import Austria, France, Germany, Greece, Italy, Spain, Switzerland
             fallback = {
-                "Italy": Italy,
-                "Germany": Germany,
-                "France": France,
-                "Spain": Spain,
                 "Austria": Austria,
+                "France": France,
+                "Germany": Germany,
+                "Greece": Greece,
+                "Italy": Italy,
+                "Spain": Spain,
                 "Switzerland": Switzerland,
             }
             return fallback[nation_name]()
@@ -110,16 +111,17 @@ def calc_V_w_day_trough_V_w_p_day(method: Optional[str] = None,
                                   building_type: Optional[str] = None,
                                   V_w_p_day: Optional[float] = None):
     '''
-    for single family dwellings and apartments dwellings the V_W_p_day is calcualted based on the number of equivalent persons (adults)
+    For single-family dwellings and apartment dwellings, V_W_p_day is calculated
+    from the number of equivalent persons (adults).
 
     :param mode: two methods can be used: 
         1) 'number_of_person' providing the number of person' 
         2) 'building_area': providing the area of the building 
-        3) 'number_of_units': provinding specific units according to the table B_4
+        3) 'number_of_units': providing specific units according to Table B.4
     :param method: possible selection: 
         1) 'correlation': using correlation of B.5
         2) 'table': using table of B.5
-    :param building_area:  gross building area [m2]
+    :param building_area: useful or habitable floor area [m2]
     :param building_type:  type of building, possible choice: 'Single_family_house', 'Attached_house', 'Dwelling'
     :param num_person: number of person inhabiting the dwelling
     :param V_w_f_day: value taken from the dataframe "table_b_5"
@@ -164,7 +166,7 @@ def calc_V_w_day_trough_V_w_p_day(method: Optional[str] = None,
 
 # ======================================================================
 '''
-Calculation based on usage and the floor area
+Calculation based on usage and floor area
 '''
 
 def get_days(year):
@@ -228,7 +230,7 @@ def Volume_and_energy_DHW_calculation(
     :param: mode (str): calculation mode to be used to get the volume and energy for DHW:
         1. 'Area': using the area of the building
         2. 'number_of_units': number of units according to table B4, B5 
-        3. 'volume_type_bui': if building is 'Single_family_house', 'Attached_house', 'Dwellings' the calcuation
+        3. 'volume_type_bui': if the building is 'Single_family_house', 'Attached_house', or 'Dwellings', the calculation
             is based on the number of equivalent persons (adults)
     :param: building_type_B3 (str): Building usage type as defined in table B3.
     :param: building_area (float): Building area in square meters.

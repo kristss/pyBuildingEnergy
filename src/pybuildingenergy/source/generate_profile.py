@@ -128,13 +128,18 @@ class HourlyProfileGenerator:
           - array/list 24 → (arr, arr)
           - (arr_wd, arr_hd) → two arrays of 24
           - {'weekday': arr_wd, 'holiday': arr_hd}
+          - {'weekday': arr_wd, 'weekend': arr_hd}  # alias supported
         """
         if isinstance(value, dict):
-            if "weekday" not in value or "holiday" not in value:
-                raise ValueError(f"{cat_name}: dict deve contenere 'weekday' e 'holiday'")
-            wd, hd = value["weekday"], value["holiday"]
+            if "weekday" not in value:
+                raise ValueError(f"{cat_name}: dict deve contenere 'weekday'")
+            hd_key = "holiday" if "holiday" in value else ("weekend" if "weekend" in value else None)
+            if hd_key is None:
+                raise ValueError(f"{cat_name}: dict deve contenere 'holiday' o 'weekend'")
+
+            wd, hd = value["weekday"], value[hd_key]
             self._validate_24(wd, f"{cat_name}.weekday")
-            self._validate_24(hd, f"{cat_name}.holiday")
+            self._validate_24(hd, f"{cat_name}.{hd_key}")
             return np.asarray(wd, dtype=float), np.asarray(hd, dtype=float)
 
         if isinstance(value, (list, tuple)) and len(value) == 2 and (

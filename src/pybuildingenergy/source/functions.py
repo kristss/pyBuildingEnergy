@@ -7,8 +7,7 @@
 # Libraries
 import numpy as np
 import pandas as pd
-from sklearn.metrics import r2_score
-from sklearn.linear_model import LinearRegression
+# sklearn imported lazily inside Simple_regeression() -- avoids ~0.6s startup cost
 # from pybuildingenergy.global_inputs import main_directory_
 from pybuildingenergy.global_inputs import main_directory_
 import pickle
@@ -20,12 +19,13 @@ def _get_pair_from_bui_or_default(bui_pair_or_none, default_weekday_24, default_
     """Ritorna due np.array(24): (weekday, weekend). Valida lunghezze e converte in float."""
     if bui_pair_or_none is not None:
         wd = np.asarray(bui_pair_or_none.get("weekday"), dtype=float)
-        hd = np.asarray(bui_pair_or_none.get("weekend"), dtype=float)
+        hd_raw = bui_pair_or_none.get("weekend", bui_pair_or_none.get("holiday"))
+        hd = np.asarray(hd_raw, dtype=float)
     else:
         wd = np.asarray(default_weekday_24, dtype=float)
         hd = np.asarray(default_weekend_24, dtype=float)
     if wd.shape != (24,) or hd.shape != (24,):
-        raise ValueError(f"{name}: profili devono essere 24 valori (weekday={wd.shape}, weekend={hd.shape})")
+        raise ValueError(f"{name}: profili devono essere 24 valori (weekday={wd.shape}, weekend/holiday={hd.shape})")
     return wd, hd
 
 def _get_schedule_pair_for_bt(bt, workdays_map, weekend_map, name):
@@ -388,6 +388,8 @@ def get_buildings_demos():
 
 
 def Simple_regeression(x_data: list, y_data: list, x_data_name: str):
+    from sklearn.metrics import r2_score
+    from sklearn.linear_model import LinearRegression
     """
     Simple regression between two variable
 
@@ -426,7 +428,7 @@ def Simple_regeression(x_data: list, y_data: list, x_data_name: str):
     return (round(r2, 2), equation)
 
 
-import numpy as np
+
 
 def shading_reduction_factor(
     alpha_sol_t,           # [deg] solar altitude angle at time t
@@ -454,6 +456,12 @@ def shading_reduction_factor(
     :return: (F_sh_dir_k_ts, h_k_sun_t)
       * **F_sh_dir_k_ts** in [0..1]: direct-beam shading reduction factor for the window at time t
       * **h_k_sun_t** [m]: remaining 'sunlit' vertical height on the window at time t
+
+    Notes on azimuth convention:
+      - This function is convention-agnostic (geographical N=0/E=90/S=180/W=270
+        or ISO S=0/E=+90/W=-90) as long as `phi_sol_t` and `gamma_k_t` use the
+        same convention.
+      - In this project pipeline, callers should pass geographical azimuth.
     """
 
     # ---- helper for safe numeric conversion ----
@@ -462,6 +470,13 @@ def shading_reduction_factor(
             return float(x)
         except (TypeError, ValueError):
             return default
+
+    def angle_distance_deg(a1, a2):
+        """
+        Minimal absolute angular distance in degrees in [0, 180].
+        Robust to mixed angle representations (e.g., -90 vs 270).
+        """
+        return abs(((a1 - a2 + 180.0) % 360.0) - 180.0)
 
     # ---- minimal validation for window dimensions ----
     H = to_float(H_k, default=None)
@@ -478,8 +493,12 @@ def shading_reduction_factor(
     if None in (a, p, b, g):
         return 0.0, 0.0
 
+    # normalize azimuths to a common branch to keep behavior explicit and stable
+    p = p % 360.0
+    g = g % 360.0
+
     # if sun is far from the window normal/tilt, no direct sun on the pane
-    if abs(g - p) > 90 or abs(b - a) > 90:
+    if angle_distance_deg(g, p) > 90 or abs(b - a) > 90:
         return 0.0, 0.0
 
     # ---- convert to radians for trigonometric functions ----
@@ -540,7 +559,7 @@ def shading_reduction_factor(
 
 
 # ====================================================================================================
-#                                       DHW Table of ISO 12831
+#                                       DHW tables from EN 12831-3
 # ====================================================================================================
 
 # Hourly breakdown of relative demand for hot water by volume. Table B.1
@@ -594,7 +613,7 @@ table_B_3 = pd.DataFrame({
 
 })
 
-# Values for the calculation of domestic hot watrer requirements per day
+# Values for the calculation of domestic hot water requirements per day
 table_B_4 = pd.DataFrame(
     {
     'type_of_activity'  : [
@@ -623,7 +642,7 @@ table_B_5_Standard = pd.DataFrame({
     'V_W_p_day':['25-60','60-100', '40-70', '25-30']
 })
 
-# values for calculation of domestic hot water requirements per day as avergae of the values from table_B_5_standard
+# Values for calculation of domestic hot water requirements per day as averages of table_B_5_Standard ranges
 table_B_5_modified = pd.DataFrame({
     'type_of_building': [
         'residential_building - simple housing - MIN', 

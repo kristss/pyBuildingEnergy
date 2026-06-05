@@ -1,15 +1,19 @@
-examples
 src/pybuildingenergy/data
 create_archetype.py
 profiles.py
 test_lib.py
 result_test
+readme_dev.md
+ahu_modelica.py
+appunti.md
+venv_pybuildingenergy
+multizone_free_floating_example_guide.md
+ahu_and_iso52016.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
 
 # C extensions
 *.so
@@ -113,3 +117,6 @@ ENV/
 .vscode/
 .idea/
 activate_venv.bat
+
+# Example outputs
+examples/outputs/

@@ -18,7 +18,7 @@ WATER_DENSITY = 1000 #[kg/m3]
 WATER_SPECIFIC_HEAT_CAPACITY = 0.00116 # kWh/kgK 
 
 '''
-Conventional air change rate between the unconditioned spaces and the external environemnt
+Conventional air change rate between the unconditioned spaces and the external environment
 ISO 13798:2018
 '''
 df_n_ue = pd.DataFrame(

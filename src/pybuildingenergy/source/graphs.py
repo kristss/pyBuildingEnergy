@@ -10,7 +10,7 @@ from .functions import (
     Heating_Degree_days,
     Simple_regeression,
 )
-import json
+import json 
 
 # ========================================================================================================
 #                                   FUNCTIONS GRAPHS
@@ -303,7 +303,7 @@ def Scatter_with_regression(
     r_squared = []
     n = 0
     for data in y_data:
-        # calcuation of regression line
+        # Calculation of regression line
         # Perform linear regression using numpy
         slope, intercept, r_value, p_value, std_err = linregress(x_data, data)
 

@@ -47,8 +47,261 @@ More details in the example folder.
 
 ## Domestic Hot Water - DHW
 
-- [x] Calculation of volume and energy need for domestic hot water according to ISO 12831-3.
+- [x] Calculation of volume and energy need for domestic hot water according to EN 12831-3.
 - [ ] Assessment of thermal load based on the type of DHW system.
+
+For the audit trail between the standard, code and outputs, open
+[DHW EN 12831-3 Implementation Audit](docs/dhw_12831_3_audit.html).
+
+## Space Emission Systems - EN 15316-2 **(New)**
+
+`EmissionSystemCalculator` evaluates space-heating and water-based space-cooling
+emission effects before generation. It can be used to account for emitter and
+control effects, equivalent internal-temperature changes, embedded emitter
+losses, emission auxiliary electricity and annual emission expenditure factors.
+
+For an audit trail between the standard, code and output files, open
+[Emission EN 15316-2 Implementation Audit](docs/emission_15316_2_audit.html).
+
+## Water-Based Distribution Systems - EN 15316-3 **(New)**
+
+`DistributionSystemCalculator` evaluates water-based distribution systems for
+space heating, space cooling and DHW. It calculates pipe thermal losses,
+recoverable distribution losses, pump auxiliary electricity, recoverable pump
+heat and recovered pump heat in the fluid before the generator calculation.
+
+For the audit trail, open
+[Distribution EN 15316-3 Implementation Audit](docs/distribution_15316_3_audit.html).
+
+## Heating And DHW Storage Systems - EN 15316-5 **(New)**
+
+`StorageSystemCalculator` evaluates single-volume Method B storage systems for
+space heating and DHW. It calculates storage standing losses from product
+standby-loss data or a direct heat-loss coefficient, storage charging pump
+auxiliary electricity, recoverable storage losses and heat recovered in the
+medium before the generator calculation.
+
+For the audit trail, open
+[Storage EN 15316-5 Implementation Audit](docs/storage_15316_5_audit.html).
+
+## Heat Pump Generation - EN 15316-4-2 **(New)**
+
+`HeatPumpSystemCalculator` evaluates heat-pump generation for:
+
+- space heating,
+- domestic hot water (DHW),
+- and an optional simplified reversible space-cooling branch with an EER map.
+
+The heating and DHW calculation follows the detailed EN 15316-4-2 bin-method structure: outdoor/source temperature bins, product heating capacity and COP maps, source/sink temperature operating points, runtime/capacity checks, auxiliary energy, optional simplified storage losses, backup energy and SPF outputs. The runnable examples use the EN 16798 cooling modules by default; the older heat-pump EER cooling branch is still available with `--calculation-path heat-pump-cooling`.
+
+For a clause-by-clause audit trail between the standard, the implementation and the output files, open [Heat Pump EN 15316-4-2 Implementation Audit](docs/heat_pump_15316_4_2_audit.html).
+
+## Heat Pump Product Performance - EN 14511 And EN 14825 **(New)**
+
+`HeatPumpPerformanceDataCalculator` normalizes heat-pump rating data from EN
+14511-style capacity/COP/EER points and calculates EN 14825 part-load
+inspection values. The examples use this path by default and apply the EN 14825
+water-based part-load correction to heating/DHW COP and EN 16798-13 cooling EER.
+
+For the audit trail between the standards, code and outputs, open
+[EN 14511 / EN 14825 Product Performance Implementation Audit](docs/performance_14511_14825_audit.html).
+
+## Cooling System Modules - EN 16798-9, EN 16798-15 And EN 16798-13 **(New)**
+
+The heat-pump examples now treat space cooling with the cooling-side EN 16798 standards:
+
+- `CoolingSystemCalculator` implements EN 16798-9 operating conditions and the handoff of cooling requests to storage or generation.
+- `CoolingStorageSystemCalculator` implements EN 16798-15 chilled-water storage heat gains and pump auxiliary energy.
+- `CoolingGenerationSystemCalculator` implements EN 16798-13 compression cooling generation using cooling capacity/EER product maps or nominal EER fallback data.
+
+For the audit trail between the standards, code and outputs, open [Cooling EN 16798 Implementation Audit](docs/cooling_16798_audit.html).
+
+For the whole end-to-end workflow that interconnects EN ISO 52016, EN 12831-3,
+EN 15316, EN 16798, EN 14511 and EN 14825 in the Athens and Bolzano examples,
+open [Heat-Pump Example Simulation Workflow Audit](docs/simulation_workflow_audit.html).
+
+```python
+import pandas as pd
+import pybuildingenergy as pybui
+
+heating_map = pd.DataFrame({
+    "source_temperature_C": [-7, -7, 2, 2, 7, 7],
+    "sink_temperature_C": [35, 55, 35, 55, 35, 55],
+    "capacity_kW": [5.0, 4.0, 6.0, 5.0, 7.0, 6.0],
+    "cop": [3.2, 2.4, 3.8, 2.8, 4.2, 3.2],
+})
+
+cooling_map = pd.DataFrame({
+    "source_temperature_C": [25, 25, 35, 35],
+    "sink_temperature_C": [7, 18, 7, 18],
+    "capacity_kW": [5.0, 6.0, 4.0, 5.0],
+    "eer": [3.0, 3.6, 2.5, 3.1],
+})
+
+loads = pd.DataFrame({
+    "T_ext": [-5, 0, 5, 25],
+    "Q_H_kWh": [4.0, 3.0, 1.0, 0.0],
+    "Q_C_kWh": [0.0, 0.0, 0.0, 2.0],
+    "Q_W_kWh": [0.5, 0.5, 0.5, 0.5],
+})
+
+calc = pybui.HeatPumpSystemCalculator({
+    "heating_performance_map": heating_map,
+    "dhw_performance_map": heating_map,
+    "cooling_performance_map": cooling_map,
+    "source_type": "air",
+    "demand_unit": "kWh",
+    "dhw_target_temperature_C": 55,
+    "dhw_sink_temperature_C": 55,
+    "external_auxiliary_power_W": 100,
+})
+
+result = calc.run_timeseries(loads)
+print(result.summary["SPF_HW_gen"])
+print(result.summary["SEER_C_gen"])
+```
+
+### Run The Heat Pump Example
+
+The runnable examples are:
+
+```bash
+python -m pip install -r requirements.txt
+python examples/heat_pump_15316_4_2_example.py --scenario athens
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano
+```
+
+There is also a Bolzano convenience wrapper:
+
+```bash
+python examples/heat_pump_15316_4_2_bolzano_example.py
+```
+
+The Athens scenario uses an Athens PVGIS weather location, a Greece DHW calendar and a 26 C cooling setpoint. The Bolzano scenario uses Bolzano coordinates, an Italy DHW calendar, a tighter solar-exposed envelope and an air-to-water heat-pump map sized for a 120 m2 useful-floor-area residential building. In both cases the example geometry is a two-floor building with a 60 m2 footprint; roof and ground-slab areas are therefore 60 m2, while `net_floor_area` remains 120 m2.
+
+Each scenario runs ISO52016 for the example building, applies EN 15316-2 emission effects, EN 15316-3 distribution effects, EN 15316-5 heating/DHW storage effects and the EN 16798 cooling-side modules by default, calculates an hourly DHW profile, runs the generator calculations and writes:
+
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/iso52016_loads_with_dhw.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/building_geometry_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/emission_15316_2_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/distribution_15316_3_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/storage_15316_5_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_16798_9_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_16798_9_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_storage_16798_15_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_storage_16798_15_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_generation_16798_13_hourly_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/cooling_generation_16798_13_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/performance_14511_14825_rating_points.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/performance_14511_14825_heating_map.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/performance_14511_14825_cooling_map.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/performance_14511_14825_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_hourly_allocated_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_bin_results.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/heat_pump_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/combined_generation_summary.csv`
+- `examples/outputs/heat_pump_15316_4_2_<scenario>/inspection_index.html`
+
+Open `inspection_index.html` in a browser to inspect the visual outputs. The page links to:
+
+- a user-facing overview of annual loads, final electricity, monthly trends,
+  seasonal performance and useful-area intensities;
+- a workflow handoff plot that shows how heating, cooling and DHW loads move
+  through the implemented standards;
+- sanity-check plots for geometry, peak loads versus active capacity, backup
+  shares and unmet loads;
+- the existing ISO52016 building report generated with `Graphs_and_report`;
+- the whole simulation workflow audit trail;
+- daily input time series for heating, cooling, DHW and temperatures;
+- EN 15316-2 emission time series and monthly aggregate plots;
+- EN 15316-3 distribution time series and monthly aggregate plots;
+- EN 15316-5 storage time series and monthly aggregate plots;
+- EN 16798-9 cooling operating-condition time series;
+- EN 16798-15 cooling storage time series and aggregate plots;
+- EN 16798-13 cooling generation time series and bin plots;
+- EN 14511 / EN 14825 rating and part-load performance plots;
+- allocated heat-pump electricity time series;
+- monthly demand, electricity, SPF and SEER summaries;
+- bin-method energy balance plots;
+- bin COP/EER, capacity and runtime plots;
+- an annual energy-flow Sankey diagram.
+
+The default calculation path is the full chain:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path full
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path full
+```
+
+To keep the full subsystem chain but use the previous synthetic product maps
+without EN 14825 part-load correction, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path full --performance-data-method simple
+```
+
+To combine the direct ISO52016/DHW path with the new EN 14511/EN 14825 product
+performance stage, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path simple --performance-data-method en14511-14825
+```
+
+To run the previous detailed path with EN 15316-2 and EN 15316-3 but without EN 15316-5 storage, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path emission-distribution
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path emission-distribution
+```
+
+To run only EN 15316-5 storage between direct ISO52016/DHW loads and the heat pump, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path storage-only
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path storage-only
+```
+
+To bypass only the EN 16798-15 cooling storage module while retaining EN 15316-2, EN 15316-3, EN 15316-5 and EN 16798-13, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path no-cooling-storage
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path no-cooling-storage
+```
+
+To retain the earlier reversible heat-pump cooling branch instead of EN 16798-13, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path heat-pump-cooling
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path heat-pump-cooling
+```
+
+To run EN 15316-2 emission effects but bypass EN 15316-3 distribution and EN 15316-5 storage, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path emission-only
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path emission-only
+```
+
+To reproduce the earlier simple calculation without EN 15316-2, EN 15316-3, EN 15316-5 or EN 16798 effects, use:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --calculation-path simple
+python examples/heat_pump_15316_4_2_example.py --scenario bolzano --calculation-path simple
+```
+
+Simple mode writes to `examples/outputs/heat_pump_15316_4_2_<scenario>_simple`
+unless `--output-dir` is specified.
+
+By default the script uses PVGIS weather for the selected scenario, so it needs internet access. To run with a local EPW file instead:
+
+```bash
+python examples/heat_pump_15316_4_2_example.py --scenario athens --weather-source epw --path-weather-file path/to/weather.epw
+```
+
+The script checks that the ISO52016 run produces both heating and cooling demand and that DHW demand is non-zero before running the heat-pump calculation.
 
 ## Primary Energy - Heating System **(New)**
 
@@ -56,28 +309,42 @@ The EN 15316 series covers the calculation method for system energy requirements
 
 ## EN 15316 Modular Structure **(New)**
 
+- [x] EN 12831-3: Domestic hot-water energy needs
 - [x] EN 15316-1: General and expression of energy performance (Modules M3-1, M3-4, M3-9, M8-1, M8-4)
-- [ ] EN 15316-2: Emission systems (heating and cooling)
-- [ ] EN 15316-3: Distribution systems (DHW, heating, cooling)
+- [x] EN 15316-2: Emission systems (heating and cooling)
+- [x] EN 15316-3: Distribution systems (DHW, heating, cooling)
 - [ ] EN 15316-4-X: Heat generation systems:
   - 4-1: Combustion boilers
-  - 4-2: Heat pumps
+  - [x] 4-2: Heat pumps
   - 4-3: Solar thermal and photovoltaic systems
   - 4-4: Cogeneration systems
   - 4-5: District heating
   - 4-7: Biomass
-- [ ] EN 15316-5: Storage systems
+- [x] EN 15316-5: Storage systems
+
+## EN 16798 Cooling Modular Structure **(New)**
+
+- [x] EN 16798-9: Cooling systems, operating conditions and M4-1/M4-4 handoff
+- [x] EN 16798-13: Cooling generation, compression systems
+- [x] EN 16798-15: Cooling storage
+- [ ] EN 16798-13 non-compression cooling generators, such as absorption, adsorption, desiccant or evaporative cooling
+
+## Heat Pump Product Rating Structure **(New)**
+
+- [x] EN 14511-1: Heat-pump and chiller rating terms, including COP and EER definitions
+- [x] EN 14511-2: Rating and application-condition temperature points for air-to-water heat pumps and chillers
+- [x] EN 14825: Part-load capacity-ratio and degradation-coefficient correction for heating COP and cooling EER
 
 For space heating, applicable standards include EN 15316-1, EN 15316-2-1, EN 15316-2-3 and the appropriate parts of EN 15316-4 depending on the system type, including losses and control aspects.
 
 ## Single zone and Multiple Zones **(New)**
-# EN ISO 52016 — Multi-zone Calculation and Adjacent Zones
+# EN ISO 52016 - Multi-zone Calculation and Adjacent Zones
 
 **EN ISO 52016 defines that:**  
 The calculation now allows the definition of several **thermal** and **non-thermal** zones adjacent to the considered zone.
 
 
-**External Adjacent – Unheated Zone**: It is possible to define an **unheated adjacent zone** in contact with the considered thermal zone.  
+**External Adjacent - Unheated Zone**: It is possible to define an **unheated adjacent zone** in contact with the considered thermal zone.  
 The length of the separating wall may be **entirely** or **partially** connected to the considered zone.  
 
 The calculation involves:
@@ -85,12 +352,12 @@ The calculation involves:
 2. Evaluating the **heat exchange** with the thermal zone.
 
 
-**External Adjacent – Heated Zone**: In this case, the wall between the two zones is considered **adiabatic** (no heat exchange).
+**External Adjacent - Heated Zone**: In this case, the wall between the two zones is considered **adiabatic** (no heat exchange).
 **Adjusted Coefficient**: To account for the **different temperatures** between zones (e.g., thermal and non-thermal), an **adjusted coefficient** is calculated.
 
 
 ### Assumptions and Simplifications
-The standard defines various assumptions specified in section *6.5.3 — Assumptions and specific conditions*.  
+The standard defines various assumptions specified in section *6.5.3 - Assumptions and specific conditions*.  
 In general, it aims to **simplify the zoning** approach by reducing the number of zones to a minimum (ISO EN 52016-2:2018).  
 
 It also emphasizes that:
@@ -103,7 +370,7 @@ It also emphasizes that:
 
 ---
 
-## EN 16798-7 & 16798-1 - Natual ventilation and profiles **(New)**
+## EN 16798-7 & 16798-1 - Natural ventilation and profiles **(New)**
 
 Compute the ventilation heat transfer coefficient [W·K⁻¹] of the thermal zone either: 
 
@@ -167,10 +434,11 @@ We welcome and appreciate contributions! Every contribution, no matter how small
 ## Acknowledgment
 
 This work was carried out within European projects:
-- **Infinite** — EU Horizon 2020 (grant agreement No. 958397)  
-- **Moderate** — Horizon Europe (grant agreement No. 101069834)
+- **Infinite** - EU Horizon 2020 (grant agreement No. 958397)
+- **Moderate** - Horizon Europe (grant agreement No. 101069834)
+- **BREEZE** - Building Renovation Efforts for Zero Emission Buildings, co-funded by the European Union LIFE programme (grant agreement No. 101215197)
 
-DHW Calculation developed with data and methods from EPBCenter spreadsheet.
+DHW calculation developed with data and methods from the EPB Center spreadsheet.
 
 ## References
 
@@ -182,5 +450,15 @@ DHW Calculation developed with data and methods from EPBCenter spreadsheet.
 - EN ISO 52016-1:2018 - Energy needs for heating and cooling  
 - EN ISO 52016-2:2018 - Explanation and justification of ISO 52016-1 and iso 52017-1
 - EN 12831-3:2018 - DHW systems heat load and characterization  
+- EN 14511-1:2022 - Air conditioners, liquid chilling packages and heat pumps: terms and definitions
+- EN 14511-2:2022 - Air conditioners, liquid chilling packages and heat pumps: test conditions
+- EN 14825:2022 - Seasonal performance and part-load conditions for air conditioners, chillers and heat pumps
 - EN 15316-1:2018 - System energy requirements and efficiencies  
+- EN 15316-2:2017 - Space emission systems
+- EN 15316-3:2017 - Distribution systems
+- EN 15316-4-2:2008 - Heat-pump generation systems
+- EN 15316-5:2017 - Storage systems
+- EN 16798-9:2017 - Cooling systems
+- EN 16798-13:2017 - Cooling generation
+- EN 16798-15:2017 - Cooling storage
 - EN 16798-7 & 16798-1 - Ventilation standards

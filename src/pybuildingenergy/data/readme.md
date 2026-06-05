@@ -117,7 +117,7 @@ Residential                     0.5 m3/h
 --------
 <br />
 
-**HEATING SYSTEM**
+<!-- **HEATING SYSTEM**
 POWER:
     The power is calculated using the following formula with some approssimations
     
@@ -129,7 +129,7 @@ POWER:
 
 **COOLING SYSTEM**
 for the building archetype the cooling system is set off.
-In this case the values of cooling setpoint and setback are the same
+In this case the values of cooling setpoint and setback are the same -->
 
 
 
