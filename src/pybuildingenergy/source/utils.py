@@ -5011,10 +5011,14 @@ class ISO52016:
             or zone.get("zone_volume")
             or zone.get("volume")
         )
+        # Remove ALL inherited global volume keys before optionally setting
+        # the zone-specific one. zone_volume_m3 must be cleared too, otherwise
+        # a global "zone_volume_m3" in building_object["building"] survives the
+        # deepcopy and is preferred by the legacy lookup at building.zone_volume_m3.
+        for _vk in ("volume", "zone_volume", "zone_volume_m3"):
+            bui["building"].pop(_vk, None)
         if _hybrid_zone_vol is not None:
             bui["building"]["zone_volume_m3"] = float(_hybrid_zone_vol)
-        for _vk in ("volume", "zone_volume"):
-            bui["building"].pop(_vk, None)
 
         zone_bt = _normalize_building_type(zone.get("building_type_class"))
         global_bt = _normalize_building_type(building_object.get("building", {}).get("building_type_class"))
