@@ -1,5 +1,5 @@
 __author__ = "Daniele Antonucci, Ulrich Filippi Oberegger, Olga Somova"
-__credits__ = ["Daniele Antonucci", "Ulrich FIlippi Oberegger", "Olga Somova"]
+__credits__ = ["Daniele Antonucci", "Ulrich Filippi Oberegger", "Olga Somova"]
 __license__ = "MIT"
 __version__ = "0.1"
 __maintainer__ = "Daniele Antonucci"
@@ -7,6 +7,12 @@ __maintainer__ = "Daniele Antonucci"
 import requests
 import pandas as pd
 import datetime as dt
+
+import math
+import io
+from pathlib import Path
+import tempfile
+
 import copy
 import re
 import time
@@ -1252,6 +1258,129 @@ class ISO52010:
             longitude=longitude_,
         )
 
+    @classmethod
+    def get_tmy_data_climatedataforbuildings(
+        cls,
+        building_object,
+        dataset="EU",
+        period="1991-2020",
+        data_type="tmy",
+        out_dir=None,
+        in_memory=True, 
+    ):
+        """
+        Get Weather data from climatedataforbuildings.eu and save to an EPW file.
+
+        :param building_object: Building object create according to the method ``Building``or ``Buildings_from_dictionary``.
+        :param dataset: dataset to use ("EU" or "NO").
+        :param period: reference period ("1991-2020" or "2006-2020").
+        :param data_type: data type to use (only "tmy" supported).
+        :param out_dir: output directory for the downloaded EPW file.
+        :param in_memory: if True, return an in-memory EPW buffer instead of saving to disk. True tends to be faster. 
+        :param user_agent: custom User-Agent header for requests.
+
+        :return: path of the downloaded EPW file or an in-memory buffer (type: **Path** or **io.BytesIO**)
+        """
+        # Extract latitude and longitude from building object
+        if isinstance(building_object, dict):
+            latitude = building_object["building"]["latitude"]
+            longitude = building_object["building"]["longitude"]
+        else:
+            latitude = building_object.__getattribute__("latitude")
+            longitude = building_object.__getattribute__("longitude")
+
+        dataset = str(dataset).upper()
+        data_type = str(data_type).lower()
+        period = str(period)
+        # Validate inputs
+        valid_types = {"tmy"}
+        valid_datasets = {"EU", "NO"}
+        valid_periods = {"1991-2020", "2006-2020"}
+        
+        if data_type not in valid_types:
+            raise ValueError("type must be tmy")
+        if dataset not in valid_datasets:
+            raise ValueError("dataset must be EU or NO")
+        if period not in valid_periods:
+            raise ValueError("period must be 1991-2020 or 2006-2020")
+
+        # Set User-Agent header
+        user_agent = f"pybuildingenergy"
+        headers = {"User-Agent": user_agent}
+        # Haversine formula to calculate distance between two lat/lon points
+        def _haversine_km(lat1, lon1, lat2, lon2):
+            radius_km = 6371
+            to_rad = math.radians
+            dlat = to_rad(lat2 - lat1)
+            dlon = to_rad(lon2 - lon1)
+            a = (
+                math.sin(dlat / 2) ** 2
+                + math.cos(to_rad(lat1))
+                * math.cos(to_rad(lat2))
+                * math.sin(dlon / 2) ** 2
+            )
+            return 2 * radius_km * math.asin(math.sqrt(a))
+        # Fetch index file for locations
+        index_url = f"https://www.climatedataforbuildings.eu/api/{data_type}-{dataset.lower()}.json"
+        response = requests.get(index_url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to fetch index file from {index_url}: HTTP Error {response.status_code}"
+            )
+        points = response.json()
+        # Find closest point
+        best = None
+        best_dist = float("inf")
+        for point in points:
+            dist = _haversine_km(latitude, longitude, point["lat"], point["lon"])
+            if dist < best_dist:
+                best_dist = dist
+                best = point
+
+        if best is None:
+            raise RuntimeError(f"No points returned by {index_url}")
+        # Download EPW file for closest point
+        file_path = best["files"].get(period)
+        if not file_path:
+            raise RuntimeError(f"No file available for period {period} in {index_url}")
+
+        epw_url = f"https://www.climatedataforbuildings.eu/FA{data_type.upper()}/{file_path}"
+        response = requests.get(epw_url, headers=headers, stream=True, timeout=60)
+        # Save to disk or return in-memory buffer
+        try:
+            response.raise_for_status()
+            # Return in-memory buffer
+            if in_memory:
+                # EPW is a text format; provide a text buffer
+                return io.StringIO(response.content.decode(errors="ignore"))
+            # Save to disk
+            if out_dir is None:
+                out_dir = Path.home() / "Downloads"
+            else:
+                out_dir = Path(out_dir)
+            # Create output directory if it doesn't exist
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / Path(file_path).name
+            # Write to file with permission error handling
+            try:
+                # Write to specified output directory
+                with out_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            handle.write(chunk)
+            except PermissionError: # Fallback to temp directory
+                out_dir = Path(tempfile.gettempdir()) / "pybuildingenergy"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / Path(file_path).name
+                with out_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            handle.write(chunk)
+        finally: # Ensure response is closed
+            response.close()
+
+        return out_path
+
     # GET WEATHER DATA FROM .epw FILE
     @classmethod
     def get_tmy_data_epw(cls, path_weather_file):
@@ -1259,7 +1388,7 @@ class ISO52010:
         """
         Get Wetaher data from epw file
 
-        :param path_weather_file: path of the .epw weather file. (e.g (../User/documents/epw/athens.epw))
+        :param path_weather_file: path of the .epw weather file or an in-memory buffer.
 
         :return:
             * *elevation*: altitude of specifici location (type: **float**)
@@ -1270,6 +1399,15 @@ class ISO52010:
         """
 
         # Read EPW file
+        if isinstance(path_weather_file, (bytes, bytearray)):
+            path_weather_file = io.StringIO(
+                bytes(path_weather_file).decode(errors="ignore")
+            )
+        elif isinstance(path_weather_file, io.BytesIO):
+            path_weather_file.seek(0)
+            path_weather_file = io.StringIO(
+                path_weather_file.read().decode(errors="ignore")
+            )
         weather_data = epw.read_epw(path_weather_file)
 
         # Weather data filter in a format to be used by ISO52016 in a csv
@@ -1735,8 +1873,14 @@ def Calculation_ISO_52010(building_object, path_weather_file, weather_source="pv
         weatherData = ISO52010.get_tmy_data_pvgis(building_object)
     elif weather_source == "epw":
         weatherData = ISO52010.get_tmy_data_epw(path_weather_file)
+    elif weather_source == "climatedata":
+        if path_weather_file is None:
+            path_weather_file = ISO52010.get_tmy_data_climatedataforbuildings(
+                building_object, in_memory=True
+            )
+        weatherData = ISO52010.get_tmy_data_epw(path_weather_file)
     else:
-        raise ValueError("select the right weather source: 'epw' or 'pvgis'")
+        raise ValueError("select the right weather source: 'epw', 'pvgis', or 'climatedata'")
 
     sim_df = weatherData.weather_data
     timezoneW = weatherData.utc_offset
@@ -2587,6 +2731,9 @@ class ISO52016:
             sim_df = pd.DataFrame(Calculation_ISO_52010(building_object, path_weather_file, weather_source=weather_source).sim_df)
         
         elif weather_source == "epw":
+            sim_df = pd.DataFrame(Calculation_ISO_52010(building_object, path_weather_file, weather_source=weather_source).sim_df)
+
+        elif weather_source == "climatedata":
             sim_df = pd.DataFrame(Calculation_ISO_52010(building_object, path_weather_file, weather_source=weather_source).sim_df)
         
         sim_df.index = pd.DatetimeIndex(sim_df.index)
@@ -7226,6 +7373,9 @@ class ISO52016:
             
             elif kwargs["weather_source"] == "epw":
                 path_weather_file_ = (kwargs["path_weather_file"] if "path_weather_file" in kwargs else None)
+            
+            elif kwargs["weather_source"] == "climatedata":
+                path_weather_file_ = None
 
             sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation

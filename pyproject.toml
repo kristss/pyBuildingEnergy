@@ -103,3 +103,9 @@ dev = [
   "bump2version>=1.0.1",
   "pytest==9.0.1",
 ]
+
+
+[pytest]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  ]

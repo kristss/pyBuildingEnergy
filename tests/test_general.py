@@ -1902,6 +1902,37 @@ def test_iso52016_calculation(building_data, output_dir):
     assert os.path.exists(os.path.join(output_dir, "hourly_sim_test.csv"))
     assert os.path.exists(os.path.join(output_dir, "annual_results_test.csv"))
 
+def test_iso52016_calculation_climatedata(building_data, output_dir):
+    """Test for the ISO 52016 calculation (may take time)"""
+    import pybuildingenergy as pybui
+    
+    # Data validation
+    bui_checked, issues = pybui.sanitize_and_validate_BUI(building_data, fix=True)
+    errors = [e for e in issues if e["level"] == "ERROR"]
+    
+    assert len(errors) == 0, "Errors in data validation"
+    
+    # Run calculation
+    hourly_sim, annual_results_df = pybui.ISO52016.Temperature_and_Energy_needs_calculation(
+        bui_checked,
+        weather_source="climatedata"
+    )
+    
+    # Check results
+    assert hourly_sim is not None
+    assert annual_results_df is not None
+    assert len(hourly_sim) > 0
+    assert len(annual_results_df) > 0
+    
+    # Save results
+    hourly_sim.to_csv(os.path.join(output_dir, "hourly_sim_test.csv"))
+    annual_results_df.to_csv(os.path.join(output_dir, "annual_results_test.csv"))
+    
+    # Verify that the files were created
+    assert os.path.exists(os.path.join(output_dir, "hourly_sim_test.csv"))
+    assert os.path.exists(os.path.join(output_dir, "annual_results_test.csv"))
+
+
 
 def test_dhw_calculation():
     """Test per il calcolo del fabbisogno di acqua calda sanitaria"""

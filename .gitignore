@@ -116,6 +116,7 @@ ENV/
 # IDE settings
 .vscode/
 .idea/
+activate_venv.bat
 
 # Example outputs
 examples/outputs/
