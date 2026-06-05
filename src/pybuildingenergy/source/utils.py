@@ -4200,11 +4200,25 @@ class ISO52016:
             # naming a profile in the profile registry.  Components without a
             # profile key always run at full capacity (1.0) so infiltration
             # remains active independently of the mechanical schedule.
+            # Only the six standard profile columns are supported; unknown names
+            # warn once and fall back to 1.0.
+            _known_profiles = {
+                "occupancy_profile", "appliances_profile", "lighting_profile",
+                "heating_profile", "cooling_profile", "ventilation_profile",
+            }
             _comp_mult: dict = {}
             for _comp in vent_cfg.get("components", []):
                 _cname = str(_comp.get("name", "")).strip()
                 _prof = _comp.get("profile")
                 if _cname and _prof is not None:
+                    if _prof not in _known_profiles:
+                        import warnings as _w
+                        _w.warn(
+                            f"Zone {zname!r} component {_cname!r}: profile {_prof!r} is not "
+                            f"one of the supported profile columns {sorted(_known_profiles)}. "
+                            "Using 1.0.",
+                            stacklevel=2,
+                        )
                     _comp_mult[_cname] = _profile_value(zname, _prof, tstep, 1.0)
 
             try:
@@ -4984,6 +4998,14 @@ class ISO52016:
         bui["building"]["net_floor_area"] = zone_area
         bui["building"]["adj_zones_present"] = False
         bui["building"]["number_adj_zone"] = 0
+        # Store zone-specific volume so constant_ach uses zone air, not building total.
+        _hybrid_zone_vol = (
+            zone.get("zone_volume_m3")
+            or zone.get("zone_volume")
+            or zone.get("volume")
+        )
+        if _hybrid_zone_vol is not None:
+            bui["building"]["zone_volume_m3"] = float(_hybrid_zone_vol)
 
         zone_bt = _normalize_building_type(zone.get("building_type_class"))
         global_bt = _normalize_building_type(building_object.get("building", {}).get("building_type_class"))
@@ -6718,12 +6740,36 @@ class ISO52016:
                         or _bld_vent.get("volume")
                         or 0.0
                     )
+                    # Per-component schedules: component "profile" key names a column in
+                    # profile_df.  Unknown column names warn and fall back to 1.0 so
+                    # infiltration (no profile key) always runs at full capacity.
+                    _vent_cfg_leg = (
+                        building_object.get("building_parameters", {}).get("ventilation", {})
+                        or {}
+                    )
+                    _comp_mult_leg: dict = {}
+                    for _comp in _vent_cfg_leg.get("components", []):
+                        _cname = str(_comp.get("name", "")).strip()
+                        _cprof = _comp.get("profile")
+                        if _cname and _cprof is not None:
+                            _col = str(_cprof)
+                            if _col in profile_df.columns:
+                                _comp_mult_leg[_cname] = float(profile_df[_col].iloc[Tstepi])
+                            else:
+                                import warnings as _w
+                                _w.warn(
+                                    f"Component {_cname!r}: profile column {_col!r} not in "
+                                    "profile_df; available columns: "
+                                    f"{list(profile_df.columns)}. Using 1.0.",
+                                    stacklevel=2,
+                                )
                     _vent_bdy = resolve_ventilation_boundary(
                         building_object,
                         float(Theta_old[ri]),
                         float(sim_df.iloc[Tstepi]["T2m"]),
                         float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
                         profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                        component_multipliers=_comp_mult_leg if _comp_mult_leg else None,
                         zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
@@ -8239,12 +8285,36 @@ class ISO52016:
                         or _bld_vent.get("volume")
                         or 0.0
                     )
+                    # Per-component schedules: component "profile" key names a column in
+                    # profile_df.  Unknown column names warn and fall back to 1.0 so
+                    # infiltration (no profile key) always runs at full capacity.
+                    _vent_cfg_leg = (
+                        building_object.get("building_parameters", {}).get("ventilation", {})
+                        or {}
+                    )
+                    _comp_mult_leg: dict = {}
+                    for _comp in _vent_cfg_leg.get("components", []):
+                        _cname = str(_comp.get("name", "")).strip()
+                        _cprof = _comp.get("profile")
+                        if _cname and _cprof is not None:
+                            _col = str(_cprof)
+                            if _col in profile_df.columns:
+                                _comp_mult_leg[_cname] = float(profile_df[_col].iloc[Tstepi])
+                            else:
+                                import warnings as _w
+                                _w.warn(
+                                    f"Component {_cname!r}: profile column {_col!r} not in "
+                                    "profile_df; available columns: "
+                                    f"{list(profile_df.columns)}. Using 1.0.",
+                                    stacklevel=2,
+                                )
                     _vent_bdy = resolve_ventilation_boundary(
                         building_object,
                         float(Theta_old[ri]),
                         float(sim_df.iloc[Tstepi]["T2m"]),
                         float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
                         profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                        component_multipliers=_comp_mult_leg if _comp_mult_leg else None,
                         zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k

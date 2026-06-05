@@ -848,3 +848,142 @@ class TestSolverIntegration:
         s_ve = out["S_ve_zone1"].to_numpy()
         # All streams (base + purge) are outdoor-air, so S_ve == H_ve * T_out
         np.testing.assert_allclose(s_ve, h_ve * t_out, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Cross-solver regression tests (hybrid builder + component schedule logic)
+# ---------------------------------------------------------------------------
+
+class TestCrossSolverRegressions:
+    """Component schedules and zone volume must behave correctly in all solver paths."""
+
+    # ------------------------------------------------------------------
+    # Hybrid builder: zone volume
+    # ------------------------------------------------------------------
+
+    def _hybrid_bld(self, zone_vol=None, global_vol=2000.0):
+        return {
+            "building": {
+                "net_floor_area": 200.0,
+                "building_type_class": "Residential_apartment",
+                "adj_zones_present": False,
+                "construction_class": "class_i",
+                "volume": global_vol,
+            },
+            "building_parameters": {
+                "ventilation": {"ventilation_type": "custom",
+                                "custom_heat_transfer_coefficient_ventilation": 0.0,
+                                "flow_rate_per_person": 0.0},
+                "temperature_setpoints": {},
+            },
+            "building_surface": [_adiabatic_surface("zone_a")],
+            "zones": [{
+                "name": "zone_a",
+                "net_floor_area": 100.0,
+                "heating_setpoint": 21.0, "heating_setback": 15.0,
+                "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+                **({"zone_volume_m3": zone_vol} if zone_vol is not None else {}),
+            }],
+        }
+
+    def test_hybrid_builder_copies_zone_volume(self):
+        """Hybrid per-zone bui must carry zone_volume_m3 from the zone dict."""
+        bui = ISO52016._build_single_zone_building_object_for_core(
+            self._hybrid_bld(zone_vol=450.0), "zone_a"
+        )
+        stored = bui["building"].get("zone_volume_m3")
+        assert stored == pytest.approx(450.0), f"Expected 450.0, got {stored}"
+        assert stored != pytest.approx(2000.0), "Must not be global volume"
+
+    def test_hybrid_builder_no_zone_volume_does_not_promote_global(self):
+        """Without a zone volume key, the global building volume must not be promoted."""
+        bui = ISO52016._build_single_zone_building_object_for_core(
+            self._hybrid_bld(zone_vol=None, global_vol=9999.0), "zone_a"
+        )
+        stored = bui["building"].get("zone_volume_m3")
+        assert stored is None or stored != pytest.approx(9999.0), (
+            f"Global volume must not be promoted to zone; got {stored}"
+        )
+
+    # ------------------------------------------------------------------
+    # Component schedule logic (resolver level, path-independent)
+    # ------------------------------------------------------------------
+
+    def _bld_with_components(self, comp_list, zone_vol=300.0):
+        return {
+            "building": {
+                "net_floor_area": 100.0,
+                "building_type_class": "Residential_apartment",
+                "construction_class": "class_i",
+                "adj_zones_present": False,
+                "zone_volume_m3": zone_vol,
+            },
+            "building_parameters": {
+                "ventilation": {"components": comp_list},
+                "temperature_setpoints": {},
+            },
+        }
+
+    def test_infiltration_unaffected_by_ahu_profile(self):
+        """Infiltration (no profile key) stays at full capacity when AHU multiplier=0."""
+        bld = self._bld_with_components([
+            {"name": "infiltration", "ventilation_type": "constant_ach",
+             "air_changes_per_hour": 0.015},
+            {"name": "ahu", "ventilation_type": "prescribed",
+             "heat_transfer_coefficient_w_k": 400.0,
+             "source_temperature_c": 18.0},
+        ], zone_vol=300.0)
+        rho, cp = 1.204, 1006.0
+        h_inf = rho * cp * 0.015 * 300.0 / 3600.0
+
+        # AHU off via component_multipliers; infiltration has no profile → 1.0
+        bdy = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0,
+            component_multipliers={"ahu": 0.0},
+            zone_volume_m3=300.0,
+        )
+        inf_h = sum(s.heat_transfer_coefficient_w_k
+                    for s in bdy.streams if s.name == "infiltration")
+        assert inf_h == pytest.approx(h_inf, rel=1e-4)
+        ahu_h = sum(s.heat_transfer_coefficient_w_k
+                    for s in bdy.streams if s.name == "ahu")
+        assert ahu_h == pytest.approx(0.0)
+
+    def test_ahu_scaled_by_component_multiplier(self):
+        """AHU component is scaled by its component_multiplier (0.5 → half H_k)."""
+        bld = self._bld_with_components([
+            {"name": "ahu", "ventilation_type": "prescribed",
+             "heat_transfer_coefficient_w_k": 600.0,
+             "source_temperature_c": 18.0},
+        ])
+        bdy_half = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0, component_multipliers={"ahu": 0.5}
+        )
+        assert bdy_half.heat_transfer_coefficient_w_k == pytest.approx(300.0)
+
+    def test_unknown_profile_emits_warning_in_multizone_path(self):
+        """An unknown component profile key in the multizone path must emit a warning."""
+        import warnings
+        bld = _one_zone_building()
+        bld["zones"][0]["ventilation"] = {
+            "components": [{
+                "name": "mech",
+                "ventilation_type": "prescribed",
+                "heat_transfer_coefficient_w_k": 300.0,
+                "source_temperature_c": 18.0,
+                "profile": "nonexistent_column",
+            }]
+        }
+        # Update zone proxy so the component is picked up
+        bld["building_parameters"]["ventilation"] = {}
+        sim_df = _minimal_sim_df(n=4)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ISO52016.simulate_envelope_multizone_free_floating(
+                building_object=bld,
+                _precomputed_sim_df=sim_df,
+                use_profiles=False,
+            )
+        assert any("nonexistent_column" in str(w.message) for w in caught), (
+            "Expected a warning about the unknown profile column"
+        )
