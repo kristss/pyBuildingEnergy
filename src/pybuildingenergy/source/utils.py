@@ -2546,7 +2546,12 @@ class ISO52016:
         # GET MIN, MAX AND MEAN of External temperature values at monthly(M) resolution
         path_weather_file_ = kwargs.get("path_weather_file")
         weather_source = kwargs.get("weather_source", "pvgis")
-        sim_df = Calculation_ISO_52010(building_object, path_weather_file_, weather_source=weather_source).sim_df
+        if kwargs.get("_precomputed_sim_df") is not None:
+            sim_df = kwargs["_precomputed_sim_df"].copy()
+            sim_df.index = pd.DatetimeIndex(sim_df.index)
+            sim_df = sim_df.sort_index()
+        else:
+            sim_df = Calculation_ISO_52010(building_object, path_weather_file_, weather_source=weather_source).sim_df
 
         try:
             external_temperature_monthly_averages = sim_df["T2m"].resample("ME").mean()
@@ -4998,7 +5003,9 @@ class ISO52016:
         bui["building"]["net_floor_area"] = zone_area
         bui["building"]["adj_zones_present"] = False
         bui["building"]["number_adj_zone"] = 0
-        # Store zone-specific volume so constant_ach uses zone air, not building total.
+        # Zone-specific volume: set from zone dict if present, then remove any
+        # inherited global keys so the legacy lookup cannot silently use building-total
+        # airflow for per-zone constant_ach.
         _hybrid_zone_vol = (
             zone.get("zone_volume_m3")
             or zone.get("zone_volume")
@@ -5006,6 +5013,8 @@ class ISO52016:
         )
         if _hybrid_zone_vol is not None:
             bui["building"]["zone_volume_m3"] = float(_hybrid_zone_vol)
+        for _vk in ("volume", "zone_volume"):
+            bui["building"].pop(_vk, None)
 
         zone_bt = _normalize_building_type(zone.get("building_type_class"))
         global_bt = _normalize_building_type(building_object.get("building", {}).get("building_type_class"))
@@ -5094,6 +5103,16 @@ class ISO52016:
         _zone_vent_obj = zone.get("ventilation", {})
         if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
             vent["components"] = _zone_vent_obj["components"]
+
+        # Zone-specific schedule profiles: copy from zone dict into building_parameters
+        # so the legacy profile generator uses per-zone schedules, not global ones.
+        # Matches what multizone V1 does at zone_profile_bui construction.
+        for _pkey in ("ventilation_profile", "heating_profile", "cooling_profile",
+                      "occupancy_profile", "appliances_profile", "lighting_profile"):
+            _zone_prof = zone.get(_pkey)
+            if _zone_prof is not None:
+                bp[_pkey] = copy.deepcopy(_zone_prof)
+
         bp.setdefault("internal_gains", copy.deepcopy(building_object.get("building_parameters", {}).get("internal_gains", [])))
 
         return bui
@@ -6049,13 +6068,18 @@ class ISO52016:
             pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
-            if kwargs["weather_source"] == "pvgis":
+            path_weather_file_ = kwargs.get("path_weather_file", None)
+            if kwargs.get("_precomputed_sim_df") is not None:
+                # Test bypass: skip EPW loading. Remove before upstreaming.
+                sim_df = kwargs["_precomputed_sim_df"].copy()
+                sim_df.index = pd.DatetimeIndex(sim_df.index)
+                sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
+                sim_df = sim_df.sort_index()
+            elif kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
-            
-            elif kwargs["weather_source"] == "epw":
-                path_weather_file_ = (kwargs["path_weather_file"] if "path_weather_file" in kwargs else None)
-
-            sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
+                sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
+            else:
+                sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation
 
             # Heating and cooling Load
@@ -6380,11 +6404,11 @@ class ISO52016:
             pbar.update(1)
 
             # Temperature ground and thermal bridges
-            t_Th = ISO52016().Temp_calculation_of_ground(
-                building_object,
-                path_weather_file=path_weather_file_,
-                weather_source=kwargs["weather_source"],
-            )
+            _tth_kw = {"path_weather_file": path_weather_file_,
+                        "weather_source": kwargs["weather_source"]}
+            if kwargs.get("_precomputed_sim_df") is not None:
+                _tth_kw["_precomputed_sim_df"] = kwargs["_precomputed_sim_df"]
+            t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
             pbar.update(1)
@@ -7340,10 +7364,11 @@ class ISO52016:
             columns=["Q_HC", "T_op", "T_ext"],
         )
 
-        # Ventilation diagnostics: H_ve, S_ve, equivalent source temp, heat flow
+        # Zone air and ventilation diagnostics
         _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
         _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
         _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["T_air"] = _t_air_arr
         hourly_results["H_ve"] = _h_ve_arr
         hourly_results["S_ve"] = _s_ve_arr
         _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
@@ -7542,12 +7567,19 @@ class ISO52016:
             pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
-            if kwargs["weather_source"] == "pvgis":
+            path_weather_file_ = kwargs.get("path_weather_file", None)
+            if kwargs.get("_precomputed_sim_df") is not None:
+                # Test bypass: skip EPW loading. Remove before upstreaming.
+                sim_df = kwargs["_precomputed_sim_df"].copy()
+                sim_df.index = pd.DatetimeIndex(sim_df.index)
+                sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
+                sim_df = sim_df.sort_index()
+            elif kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
-            
+
             elif kwargs["weather_source"] == "epw":
                 path_weather_file_ = (kwargs["path_weather_file"] if "path_weather_file" in kwargs else None)
-            
+
             elif kwargs["weather_source"] == "climatedata":
                 path_weather_file_ = None
 
@@ -7877,11 +7909,11 @@ class ISO52016:
             pbar.update(1)
 
             # Temperature ground and thermal bridges
-            t_Th = ISO52016().Temp_calculation_of_ground(
-                building_object,
-                path_weather_file=path_weather_file_,
-                weather_source=kwargs["weather_source"],
-            )
+            _tth_kw = {"path_weather_file": path_weather_file_,
+                        "weather_source": kwargs["weather_source"]}
+            if kwargs.get("_precomputed_sim_df") is not None:
+                _tth_kw["_precomputed_sim_df"] = kwargs["_precomputed_sim_df"]
+            t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
             pbar.update(1)
@@ -8927,10 +8959,11 @@ class ISO52016:
         hourly_results["T_air"] = Theta_int_air[act_slice, 0]
         hourly_results["T_rad"] = Theta_int_r_mn[act_slice, 0]
 
-        # Ventilation diagnostics: H_ve, S_ve, equivalent source temp, heat flow
+        # Zone air and ventilation diagnostics
         _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
         _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
         _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["T_air"] = _t_air_arr
         hourly_results["H_ve"] = _h_ve_arr
         hourly_results["S_ve"] = _s_ve_arr
         _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
