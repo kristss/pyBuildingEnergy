@@ -1836,6 +1836,44 @@ def Calculation_ISO_52010(building_object, path_weather_file, weather_source="pv
 # ===============================================================================================
 
 
+def _series_to_float_array(df, col: str, default: float | None = None):
+    """Return a column of df as a float64 NumPy array.
+    Used to replace hot-path .iloc[t] accesses with O(1) array indexing.
+    """
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+    if default is None:
+        raise KeyError(f"Missing required weather/profile column: {col!r}")
+    return np.full(len(df), float(default), dtype=float)
+
+
+def _safe_load(P_max, T_set, T0, Tupper, clip_factor=2000.0):
+    """Return HVAC load [W] using ISO 52016 Eq. (27) with robust fallback.
+    Positive = heating, negative = cooling.
+    Defined at module level so it is not recreated on every timestep.
+    """
+    try:
+        pmax = float(P_max)
+        t_set = float(T_set)
+        t0 = float(T0)
+        t_upper = float(Tupper)
+    except (TypeError, ValueError):
+        return 0.0
+    dT = t_set - t0
+    if not np.isfinite(dT) or abs(dT) < 1e-9:
+        return 0.0
+    denom = t_upper - t0
+    if np.isfinite(denom) and abs(denom) >= 0.05:
+        load = pmax * dT / denom
+    else:
+        load = clip_factor * dT
+    if not np.isfinite(load):
+        return 0.0
+    if pmax >= 0.0:
+        return float(min(pmax, max(0.0, load)))
+    return float(max(pmax, min(0.0, load)))
+
+
 class ISO52016:
 
     or_tilt_azim_dic = {
@@ -4143,7 +4181,7 @@ class ISO52016:
             B = np.zeros((Ntot,), dtype=float)
             zone_air_links_t, zone_hsurf_sum_t, h_ci_internal_t = _build_zone_air_links_from_theta(theta_prev)
 
-            T_out = float(sim_df["T2m"].iloc[tstep])
+            T_out = float(T2m_arr[tstep])
             u_wind = 0.0
             if "WS10m" in sim_df.columns:
                 u_wind = float(pd.to_numeric(sim_df["WS10m"], errors="coerce").iloc[tstep])
@@ -5007,7 +5045,7 @@ class ISO52016:
             A = np.zeros((Ntot, Ntot), dtype=float)
             B = np.zeros((Ntot,), dtype=float)
             zone_internal_links = [[] for _ in range(Z)]
-            T_out = float(sim_df["T2m"].iloc[tstep])
+            T_out = float(T2m_arr[tstep])
             u_wind = 0.0
             if "WS10m" in sim_df.columns:
                 u_wind = float(pd.to_numeric(sim_df["WS10m"], errors="coerce").iloc[tstep])
@@ -6045,11 +6083,11 @@ class ISO52016:
 
             def _compute_h_re_external_t(theta_state_prev: np.ndarray, tstep: int):
                 h_re_t = heat_radiative_elements_external_tab.copy()
-                t_ref_t = np.full(bui_eln, float(sim_df["T2m"].iloc[tstep]), dtype=float)
+                t_ref_t = np.full(bui_eln, float(T2m_arr[tstep]), dtype=float)
                 if h_re_model != "dynamic" or not isinstance(building_object, dict):
                     return h_re_t, t_ref_t
 
-                T_out_t = float(sim_df["T2m"].iloc[tstep])
+                T_out_t = float(T2m_arr[tstep])
                 T_sky_t = _sky_temperature_from_weather(sim_df, tstep, sky_t_model)
                 for Eli in range(bui_eln):
                     if Type_eli[Eli] != "EXT" or not surf_has_node[Eli]:
@@ -6238,20 +6276,66 @@ class ISO52016:
         E_ground_loss_Wh = 0.0
         E_storage_Wh = 0.0
 
+        # --- Commit-1 pre-loop allocations ---
+        vig = VentilationInternalGains(building_object)
+        _MatA = np.zeros((nodes.Rn, nodes.Rn), dtype=float)
+        _VecB = np.zeros((nodes.Rn, 3), dtype=float)
+        # -------------------------------------
+
+        # --- Commit-2: pre-extract time-series as NumPy arrays ---
+        T2m_arr       = _series_to_float_array(sim_df, "T2m")
+        WS10m_arr     = _series_to_float_array(sim_df, "WS10m", default=0.0)
+        heat_prof_arr = _series_to_float_array(profile_df, "heating_profile", default=1.0)
+        cool_prof_arr = _series_to_float_array(profile_df, "cooling_profile", default=1.0)
+        vent_prof_arr = _series_to_float_array(profile_df, "ventilation_profile", default=1.0)
+        occ_prof_arr  = _series_to_float_array(profile_df, "occupancy_profile", default=0.0)
+        app_prof_arr  = _series_to_float_array(profile_df, "appliances_profile", default=0.0)
+        light_prof_arr= _series_to_float_array(profile_df, "lighting_profile", default=0.0)
+        month_arr     = (sim_df.index.month.to_numpy() - 1).astype(int)
+        # solar irradiance and shading factor pre-indexed per element
+        _Tstepn_c2 = len(sim_df)
+        I_sol_dif_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        I_sol_dir_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        I_sol_tot_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        F_sh_el      = np.ones((_Tstepn_c2, bui_eln), dtype=float)
+        for _c2_Eli in range(bui_eln):
+            _c2_ori  = orientation_elements[_c2_Eli]
+            _c2_dif  = f"I_sol_dif_{_c2_ori}"
+            _c2_dir  = f"I_sol_dir_w_{_c2_ori}"
+            _c2_tot  = f"I_sol_tot_{_c2_ori}"
+            if _c2_dif in sim_df.columns:
+                I_sol_dif_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_dif], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            if _c2_dir in sim_df.columns:
+                I_sol_dir_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_dir], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            if _c2_tot in sim_df.columns:
+                I_sol_tot_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_tot], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            _c2_wincol = win_col_for_index.get(_c2_Eli)
+            if _c2_wincol and _c2_wincol in sim_df.columns:
+                F_sh_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_wincol], errors="coerce").fillna(1.0).to_numpy(dtype=float)
+                )
+        # -----------------------------------------------------------
+
         with tqdm(total=Tstepn) as pbar:
             n_w = 0
             for Tstepi in range(start_idx, Tstepn):
 
-                if profile_df.iloc[Tstepi]["heating_profile"] > 0:
+                if heat_prof_arr[Tstepi] > 0:
                     Theta_H_set = building_object["building_parameters"]["temperature_setpoints"]["heating_setpoint"]
                 else:
                     Theta_H_set = building_object["building_parameters"]["temperature_setpoints"]["heating_setback"]
-                if profile_df.iloc[Tstepi]["cooling_profile"] > 0:
+                if cool_prof_arr[Tstepi] > 0:
                     Theta_C_set = building_object["building_parameters"]["temperature_setpoints"]["cooling_setpoint"]
                 else:
                     Theta_C_set = building_object["building_parameters"]["temperature_setpoints"]["cooling_setback"]
 
-                Theta_old = VecB[:, colB_act]
+                Theta_old = VecB[:, colB_act].copy()
 
                 # firs step:
                 # HEATING:
@@ -6264,7 +6348,6 @@ class ISO52016:
                     A_use = building_object["building"]["net_floor_area"]
                     design_P = max(150.0 * A_use, 15_000.0)  # e.g., 150 W/m² or 15 kW minimum
                     warmup_P = 3.0 * design_P
-                    
 
                     if isinstance(building_object, dict):
                         if Tstepi < warmup_hours:  # During warmup, almost unlimited heating power to ensure convergence to setpoint
@@ -6272,9 +6355,8 @@ class ISO52016:
                         else:
                             power_heating_max = building_object["building_parameters"]["system_capacities"]["heating_capacity"]
                     else:
-                        power_heating_max = building_object.power_heating_max  
+                        power_heating_max = building_object.power_heating_max
                     power_heating_max_act = power_heating_max
-                    # power_heating_max_act = building_object.power_heating_max
 
                 # COOLING:
                 # if there is no set point for heating (cooling system not installed) -> cooling power = 0
@@ -6291,7 +6373,6 @@ class ISO52016:
                     else:
                         power_cooling_max = building_object.power_cooling_max
                         power_cooling_max_act = power_cooling_max
-                    # power_cooling_max_act = building_object.power_cooling_max
 
                 # Default HVAC mode columns (0 = free-float, 1 = heating candidate, 2 = cooling candidate).
                 # Keep them always defined to avoid accidental references in single-mode branches.
@@ -6317,13 +6398,15 @@ class ISO52016:
 
                     iterate = False
 
-                    VecB = np.zeros((nodes.Rn, 3))
-                    MatA = np.zeros((nodes.Rn, nodes.Rn))
+                    _VecB.fill(0.0)
+                    VecB = _VecB
+                    _MatA.fill(0.0)
+                    MatA = _MatA
                     Phi_sol_dir_zt_t = 0 # inizialize solar gain
- 
+
                     # Solar  heat gain source inside the thermal zone 6.5.13.2
                     for Eli in range(bui_eln):
-                        
+
                         if isinstance(building_object, dict):
                             if (building_object["building_surface"][Eli]["ISO52016_type_string"]== "AD"):
                                 continue
@@ -6339,18 +6422,13 @@ class ISO52016:
                             
                             # case with shading reduction factor
                             Ffr_wi = 0.25 # <- to modify with shading calculation annex F. o.25 is a good approximation
-                            transparent_names = [surface["name"] for surface in building_object["building_surface"] if surface.get("type") == "transparent"]
-                            
-                            if g_gl_wi_t[Eli] != 0:
-                                colname = win_col_for_index.get(Eli)  # column for this specific window element
-                                if colname and colname in sim_df.columns:
-                                    F_sh_obst_wi_t = float(sim_df[colname].iloc[Tstepi])
-                                else:
-                                    F_sh_obst_wi_t = 1.0
-                            else:
-                                F_sh_obst_wi_t = 1.0
+                            F_sh_obst_wi_t = F_sh_el[Tstepi, Eli] if g_gl_wi_t[Eli] != 0 else 1.0
 
-                            Phi_sol_dir_zt_t += g_gl_wi_t[Eli] * (sim_df[f'I_sol_dif_{orientation_elements[Eli]}'].iloc[Tstepi] + sim_df[f'I_sol_dir_w_{orientation_elements[Eli]}'].iloc[Tstepi] * F_sh_obst_wi_t) * area_elements[Eli] * (1 - Ffr_wi)
+                            Phi_sol_dir_zt_t += (
+                                g_gl_wi_t[Eli]
+                                * (I_sol_dif_el[Tstepi, Eli] + I_sol_dir_el[Tstepi, Eli] * F_sh_obst_wi_t)
+                                * area_elements[Eli] * (1 - Ffr_wi)
+                            )
                             
                             '''
                             FRAME AREA FRACTION OF THE WINDOW 
@@ -6383,15 +6461,15 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = VentilationInternalGains(building_object).heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], sim_df.iloc[Tstepi]["T2m"], sim_df.iloc[Tstepi]["WS10m"], 
+                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
+                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
                         type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
                         custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
                     # sanifica
                     if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
                         H_ve_nat_hour = 0.0
 
-                    H_ve_nat = float(H_ve_nat_hour) * float(profile_df['ventilation_profile'].iloc[Tstepi])
+                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
                     if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
                         H_ve_nat = 0.0
                     H_ve_nat_all.append(H_ve_nat)
@@ -6409,13 +6487,13 @@ class ISO52016:
                         list_adj_zones = building_object['building']['number_adj_zone']
                         adj_bui_class = building_object['adjacent_zones'][0]['building_type_class']
                         adj_bui_a_use = building_object['adjacent_zones'][0]['a_use']
-                        phi_int_gains_unc_zone = VentilationInternalGains(building_object).internal_gains(
+                        phi_int_gains_unc_zone = vig.internal_gains(
                             building_type_class = adj_bui_class, 
                             a_use = adj_bui_a_use, 
                             unconditioned_zones_nearby = False,
-                            h_occup=float(profile_df['occupancy_profile'].iloc[Tstepi]),
-                            h_app=float(profile_df['appliances_profile'].iloc[Tstepi]),
-                            h_light=float(profile_df['lighting_profile'].iloc[Tstepi]),
+                            h_occup=occ_prof_arr[Tstepi],
+                            h_app=app_prof_arr[Tstepi],
+                            h_light=light_prof_arr[Tstepi],
                         )
                         phi_solar_gains_unc_zone = 0 # <----- TO BE MODIFIED ACCORDING TO THE WIDNOW OF THE UNCODITIONED ZONES !!!!!
                         phi_gn_dir_ztu = phi_int_gains_unc_zone + phi_solar_gains_unc_zone
@@ -6440,25 +6518,25 @@ class ISO52016:
                     # ---------------------------------------------------------------------------
                     # Internal gains conditioned and unconditioned zones
                     if building_object['building']['adj_zones_present']:
-                        int_gains_with_unconditioned_zones = VentilationInternalGains(building_object).internal_gains(
+                        int_gains_with_unconditioned_zones = vig.internal_gains(
                                             building_type_class = building_object['building']['building_type_class'], 
                                             a_use=building_object['building']['net_floor_area'], 
                                             unconditioned_zones_nearby = True, 
                                             Fztc_ztu_m=F_ztc_ztu_m,
                                             list_adj_zones=list_adj_zones,
                                             b_ztu=b_ztu,
-                                            h_occup=profile_df['occupancy_profile'].iloc[Tstepi],
-                                            h_app=profile_df['appliances_profile'].iloc[Tstepi],
-                                            h_light=profile_df['lighting_profile'].iloc[Tstepi],
+                                            h_occup=occ_prof_arr[Tstepi],
+                                            h_app=app_prof_arr[Tstepi],
+                                            h_light=light_prof_arr[Tstepi],
                                             )
                     else:
-                        int_gains_conditioned_zone = VentilationInternalGains(building_object).internal_gains(
+                        int_gains_conditioned_zone = vig.internal_gains(
                                             building_type_class = building_object['building']['building_type_class'], 
                                             a_use=building_object['building']['net_floor_area'], 
                                             unconditioned_zones_nearby = False,
-                                            h_occup=profile_df['occupancy_profile'].iloc[Tstepi],
-                                            h_app=profile_df['appliances_profile'].iloc[Tstepi],
-                                            h_light=profile_df['lighting_profile'].iloc[Tstepi],
+                                            h_occup=occ_prof_arr[Tstepi],
+                                            h_app=app_prof_arr[Tstepi],
+                                            h_light=light_prof_arr[Tstepi],
                                             )
 
                     if building_object['building']['adj_zones_present'] and building_object['building']['number_adj_zone']>=1:
@@ -6471,8 +6549,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
-                        + H_ve_nat * theta_sup.iloc[Tstepi]
+                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
+                        + H_ve_nat * T2m_arr[Tstepi]
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -6536,8 +6614,8 @@ class ISO52016:
                         if Tstepi >0:
                             # Single zones
                             if list_adj_zones == 1:
-                                theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]) + (phi_gn_dir_ztu/H_ztu))                        
-                                theta_ztu_t_checked =min(sim_df["T2m"].iloc[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]), theta_ztu_t)
+                                theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
+                                theta_ztu_t_checked = min(T2m_arr[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]), theta_ztu_t)
                                 theta_ztu[Tstepi] = theta_ztu_t_checked
                             
                             # Multiple zones
@@ -6545,8 +6623,8 @@ class ISO52016:
                                 for z in range(list_adj_zones):
                                     zone = building_object['adjacent_zones'][z]
                                     H_ztu = H_ztu_zones_df.loc['H_ztu'][zone['name']]
-                                    theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
-                                    theta_ztu_t_checked =min(sim_df["T2m"].iloc[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]), theta_ztu_t)
+                                    theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
+                                    theta_ztu_t_checked = min(T2m_arr[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]), theta_ztu_t)
                                     theta_ztu[Tstepi,z] = theta_ztu_t_checked
                         theta_ztu_df = pd.DataFrame(theta_ztu, columns=H_ztu_zones_df.columns.tolist())
 
@@ -6587,9 +6665,9 @@ class ISO52016:
                                     '''
                                     if h_re_model == "dynamic":
                                         XTemp = (
-                                            heat_convective_elements_external[Eli] * sim_df["T2m"].iloc[Tstepi]
+                                            heat_convective_elements_external[Eli] * T2m_arr[Tstepi]
                                             + heat_radiative_elements_external_t[Eli] * ext_rad_ref_temp_t[Eli]
-                                            + a_sol_pli_eli[Pli, Eli] * sim_df[f'I_sol_tot_{orientation_elements[Eli]}'].iloc[Tstepi]
+                                            + a_sol_pli_eli[Pli, Eli] * I_sol_tot_el[Tstepi, Eli]
                                         )
                                     else:
                                         phi_sky_eli_t = (
@@ -6599,9 +6677,9 @@ class ISO52016:
                                         )
                                         XTemp = (
                                             (heat_convective_elements_external[Eli] + heat_radiative_elements_external_t[Eli])
-                                            * sim_df["T2m"].iloc[Tstepi]
+                                            * T2m_arr[Tstepi]
                                             - phi_sky_eli_t
-                                            + a_sol_pli_eli[Pli, Eli] * sim_df[f'I_sol_tot_{orientation_elements[Eli]}'].iloc[Tstepi]
+                                            + a_sol_pli_eli[Pli, Eli] * I_sol_tot_el[Tstepi, Eli]
                                         )
                                     for cBi in range(nrHCmodes):
                                         VecB[ri, cBi] += XTemp
@@ -6635,7 +6713,7 @@ class ISO52016:
                                     # R_gr_ve is area-specific [m2K/W], so 1 / R_gr_ve is the
                                     # correct areal conductance here. The total-area scaling is
                                     # applied later only in post-processing energy balances.
-                                    XTemp = (1 / t_Th.R_gr_ve) * t_Th.Theta_gr_ve[sim_df.index.month[Tstepi] - 1]
+                                    XTemp = (1 / t_Th.R_gr_ve) * t_Th.Theta_gr_ve[month_arr[Tstepi]]
                                     for cBi in range(nrHCmodes):
                                         VecB[ri, cBi] += XTemp
 
@@ -6699,20 +6777,20 @@ class ISO52016:
 
                     '''
                     ######## solve system of equations #######
-                    if np.linalg.matrix_rank(MatA) < MatA.shape[0]:
-                        print("⚠️ Warning: MatA is singular or ill-conditioned")
-                        print("Rank:", np.linalg.matrix_rank(MatA), "Expected:", MatA.shape[0])
-                        np.set_printoptions(precision=3, suppress=True)
-                        print("MatA diagonal:", np.diag(MatA))
-                    
                     # --- Safe diagonal regularization (avoid read-only error) ---
                     diag_min = max(1e-6, 1e-9 * np.linalg.norm(MatA, ord=np.inf))
                     d = np.diag(MatA).copy()
                     np.maximum(d, diag_min, out=d)
                     np.fill_diagonal(MatA, d)
                     # -------------------------------------------------------------
-                    theta = np.linalg.solve(MatA, VecB)
-                    VecB = theta
+                    try:
+                        theta = np.linalg.solve(MatA, VecB)
+                    except np.linalg.LinAlgError:
+                        rank = np.linalg.matrix_rank(MatA)
+                        print(f"⚠️ MatA solve failed at t={Tstepi}: rank={rank}/{MatA.shape[0]}")
+                        print("MatA diagonal:", np.diag(MatA))
+                        raise
+                    VecB[:, :] = theta
                     
                     # Air Temperature
                     Theta_int_air[Tstepi, :] = VecB[0, :]
@@ -6750,40 +6828,6 @@ class ISO52016:
                     thet_int_op_0: operating temperature in free floating condition in °C
                     theta_int_op_upper: is the internal operational temperature, obtained for the upper heating or cooling load °C
                     '''
-                    def _safe_load(P_max, T_set, T0, Tupper, clip_factor=2000.0):
-                        """
-                        Return HVAC load [W] using Eq. (27) with robust fallback.
-                        Positive load = heating, negative load = cooling.
-                        """
-                        try:
-                            pmax = float(P_max)
-                            t_set = float(T_set)
-                            t0 = float(T0)
-                            t_upper = float(Tupper)
-                        except (TypeError, ValueError):
-                            return 0.0
-
-                        dT = t_set - t0
-                        if not np.isfinite(dT) or abs(dT) < 1e-9:
-                            return 0.0
-
-                        denom = (t_upper - t0)
-                        if np.isfinite(denom) and abs(denom) >= 0.05:
-                            load = pmax * dT / denom
-                        else:
-                            # Small/invalid denominator: use bounded linear fallback.
-                            load = clip_factor * dT
-
-                        if not np.isfinite(load):
-                            return 0.0
-
-                        # Clamp to the available capacity and enforce expected sign.
-                        if pmax >= 0.0:
-                            # Heating branch
-                            return float(min(pmax, max(0.0, load)))
-                        # Cooling branch (pmax is negative)
-                        return float(max(pmax, min(0.0, load)))
-                        
                     if nrHCmodes > 1:
                         # HEATING
                         if Theta_int_op[Tstepi, 0] < Theta_H_set:
@@ -6853,7 +6897,7 @@ class ISO52016:
 
                     # 4) Ventilation
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    T_out = T2m_arr[Tstepi]
                     q_vent = float(H_ve_nat) * (T_in - T_out)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
@@ -6864,7 +6908,7 @@ class ISO52016:
                     else:         E_solar_Wh   += (-q_tb) * dt_h
 
                     # 6) Ground
-                    T_gr = float(t_Th.Theta_gr_ve[sim_df.index.month[Tstepi] - 1])
+                    T_gr = float(t_Th.Theta_gr_ve[month_arr[Tstepi]])
                     h_ground = _ground_conductance_w_per_k(
                         float(getattr(t_Th, "ground_contact_area", 0.0)),
                         t_Th,
@@ -7477,11 +7521,11 @@ class ISO52016:
 
             def _compute_h_re_external_t(theta_state_prev: np.ndarray, tstep: int):
                 h_re_t = heat_radiative_elements_external_tab.copy()
-                t_ref_t = np.full(bui_eln, float(sim_df["T2m"].iloc[tstep]), dtype=float)
+                t_ref_t = np.full(bui_eln, float(T2m_arr[tstep]), dtype=float)
                 if h_re_model != "dynamic" or not isinstance(building_object, dict):
                     return h_re_t, t_ref_t
 
-                T_out_t = float(sim_df["T2m"].iloc[tstep])
+                T_out_t = float(T2m_arr[tstep])
                 T_sky_t = _sky_temperature_from_weather(sim_df, tstep, sky_t_model)
                 for Eli in range(bui_eln):
                     if Type_eli[Eli] != "EXT" or not surf_has_node[Eli]:
@@ -7679,20 +7723,66 @@ class ISO52016:
         E_ground_loss_Wh = 0.0
         E_storage_Wh = 0.0
 
+        # --- Commit-1 pre-loop allocations ---
+        vig = VentilationInternalGains(building_object)
+        _MatA = np.zeros((nodes.Rn, nodes.Rn), dtype=float)
+        _VecB = np.zeros((nodes.Rn, 3), dtype=float)
+        # -------------------------------------
+
+        # --- Commit-2: pre-extract time-series as NumPy arrays ---
+        T2m_arr       = _series_to_float_array(sim_df, "T2m")
+        WS10m_arr     = _series_to_float_array(sim_df, "WS10m", default=0.0)
+        heat_prof_arr = _series_to_float_array(profile_df, "heating_profile", default=1.0)
+        cool_prof_arr = _series_to_float_array(profile_df, "cooling_profile", default=1.0)
+        vent_prof_arr = _series_to_float_array(profile_df, "ventilation_profile", default=1.0)
+        occ_prof_arr  = _series_to_float_array(profile_df, "occupancy_profile", default=0.0)
+        app_prof_arr  = _series_to_float_array(profile_df, "appliances_profile", default=0.0)
+        light_prof_arr= _series_to_float_array(profile_df, "lighting_profile", default=0.0)
+        month_arr     = (sim_df.index.month.to_numpy() - 1).astype(int)
+        # solar irradiance and shading factor pre-indexed per element
+        _Tstepn_c2 = len(sim_df)
+        I_sol_dif_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        I_sol_dir_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        I_sol_tot_el = np.zeros((_Tstepn_c2, bui_eln), dtype=float)
+        F_sh_el      = np.ones((_Tstepn_c2, bui_eln), dtype=float)
+        for _c2_Eli in range(bui_eln):
+            _c2_ori  = orientation_elements[_c2_Eli]
+            _c2_dif  = f"I_sol_dif_{_c2_ori}"
+            _c2_dir  = f"I_sol_dir_w_{_c2_ori}"
+            _c2_tot  = f"I_sol_tot_{_c2_ori}"
+            if _c2_dif in sim_df.columns:
+                I_sol_dif_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_dif], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            if _c2_dir in sim_df.columns:
+                I_sol_dir_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_dir], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            if _c2_tot in sim_df.columns:
+                I_sol_tot_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_tot], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                )
+            _c2_wincol = win_col_for_index.get(_c2_Eli)
+            if _c2_wincol and _c2_wincol in sim_df.columns:
+                F_sh_el[:, _c2_Eli] = (
+                    pd.to_numeric(sim_df[_c2_wincol], errors="coerce").fillna(1.0).to_numpy(dtype=float)
+                )
+        # -----------------------------------------------------------
+
         with tqdm(total=Tstepn) as pbar:
             n_w = 0
             for Tstepi in range(start_idx, Tstepn):
 
-                if profile_df.iloc[Tstepi]["heating_profile"] > 0:
+                if heat_prof_arr[Tstepi] > 0:
                     Theta_H_set = building_object["building_parameters"]["temperature_setpoints"]["heating_setpoint"]
                 else:
                     Theta_H_set = building_object["building_parameters"]["temperature_setpoints"]["heating_setback"]
-                if profile_df.iloc[Tstepi]["cooling_profile"] > 0:
+                if cool_prof_arr[Tstepi] > 0:
                     Theta_C_set = building_object["building_parameters"]["temperature_setpoints"]["cooling_setpoint"]
                 else:
                     Theta_C_set = building_object["building_parameters"]["temperature_setpoints"]["cooling_setback"]
 
-                Theta_old = VecB[:, colB_act]
+                Theta_old = VecB[:, colB_act].copy()
 
                 # firs step:
                 # HEATING:
@@ -7705,7 +7795,7 @@ class ISO52016:
                     A_use = building_object["building"]["net_floor_area"]
                     design_P = max(150.0 * A_use, 15_000.0)  # e.g., 150 W/m² or 15 kW minimum
                     warmup_P = 3.0 * design_P
-                    
+
 
                     if isinstance(building_object, dict):
                         if Tstepi < warmup_hours:  # During warmup, almost unlimited heating power to ensure convergence to setpoint
@@ -7794,13 +7884,15 @@ class ISO52016:
 
                     iterate = False
 
-                    VecB = np.zeros((nodes.Rn, 3))
-                    MatA = np.zeros((nodes.Rn, nodes.Rn))
+                    _VecB.fill(0.0)
+                    VecB = _VecB
+                    _MatA.fill(0.0)
+                    MatA = _MatA
                     Phi_sol_dir_zt_t = 0 # inizialize solar gain
- 
+
                     # Solar  heat gain source inside the thermal zone 6.5.13.2
                     for Eli in range(bui_eln):
-                        
+
                         if isinstance(building_object, dict):
                             if (building_object["building_surface"][Eli]["ISO52016_type_string"]== "AD"):
                                 continue
@@ -7816,18 +7908,13 @@ class ISO52016:
                             
                             # case with shading reduction factor
                             Ffr_wi = 0.25 # <- to modify with shading calculation annex F. o.25 is a good approximation
-                            transparent_names = [surface["name"] for surface in building_object["building_surface"] if surface.get("type") == "transparent"]
-                            
-                            if g_gl_wi_t[Eli] != 0:
-                                colname = win_col_for_index.get(Eli)  # column for this specific window element
-                                if colname and colname in sim_df.columns:
-                                    F_sh_obst_wi_t = float(sim_df[colname].iloc[Tstepi])
-                                else:
-                                    F_sh_obst_wi_t = 1.0
-                            else:
-                                F_sh_obst_wi_t = 1.0
+                            F_sh_obst_wi_t = F_sh_el[Tstepi, Eli] if g_gl_wi_t[Eli] != 0 else 1.0
 
-                            Phi_sol_dir_zt_t += g_gl_wi_t[Eli] * (sim_df[f'I_sol_dif_{orientation_elements[Eli]}'].iloc[Tstepi] + sim_df[f'I_sol_dir_w_{orientation_elements[Eli]}'].iloc[Tstepi] * F_sh_obst_wi_t) * area_elements[Eli] * (1 - Ffr_wi)
+                            Phi_sol_dir_zt_t += (
+                                g_gl_wi_t[Eli]
+                                * (I_sol_dif_el[Tstepi, Eli] + I_sol_dir_el[Tstepi, Eli] * F_sh_obst_wi_t)
+                                * area_elements[Eli] * (1 - Ffr_wi)
+                            )
                             
                             '''
                             FRAME AREA FRACTION OF THE WINDOW 
@@ -7860,15 +7947,15 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = VentilationInternalGains(building_object).heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], sim_df.iloc[Tstepi]["T2m"], sim_df.iloc[Tstepi]["WS10m"], 
+                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
+                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
                         type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
                         custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
                     # sanifica
                     if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
                         H_ve_nat_hour = 0.0
 
-                    H_ve_nat = float(H_ve_nat_hour) * float(profile_df['ventilation_profile'].iloc[Tstepi])
+                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
                     if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
                         H_ve_nat = 0.0
                     H_ve_nat_all.append(H_ve_nat)
@@ -7886,13 +7973,13 @@ class ISO52016:
                         list_adj_zones = building_object['building']['number_adj_zone']
                         adj_bui_class = building_object['adjacent_zones'][0]['building_type_class']
                         adj_bui_a_use = building_object['adjacent_zones'][0]['a_use']
-                        phi_int_gains_unc_zone = VentilationInternalGains(building_object).internal_gains(
+                        phi_int_gains_unc_zone = vig.internal_gains(
                             building_type_class = adj_bui_class, 
                             a_use = adj_bui_a_use, 
                             unconditioned_zones_nearby = False,
-                            h_occup=float(profile_df['occupancy_profile'].iloc[Tstepi]),
-                            h_app=float(profile_df['appliances_profile'].iloc[Tstepi]),
-                            h_light=float(profile_df['lighting_profile'].iloc[Tstepi]),
+                            h_occup=occ_prof_arr[Tstepi],
+                            h_app=app_prof_arr[Tstepi],
+                            h_light=light_prof_arr[Tstepi],
                         )
                         phi_solar_gains_unc_zone = 0 # <----- TO BE MODIFIED ACCORDING TO THE WIDNOW OF THE UNCODITIONED ZONES !!!!!
                         phi_gn_dir_ztu = phi_int_gains_unc_zone + phi_solar_gains_unc_zone
@@ -7917,25 +8004,25 @@ class ISO52016:
                     # ---------------------------------------------------------------------------
                     # Internal gains conditioned and unconditioned zones
                     if building_object['building']['adj_zones_present']:
-                        int_gains_with_unconditioned_zones = VentilationInternalGains(building_object).internal_gains(
+                        int_gains_with_unconditioned_zones = vig.internal_gains(
                                             building_type_class = building_object['building']['building_type_class'], 
                                             a_use=building_object['building']['net_floor_area'], 
                                             unconditioned_zones_nearby = True, 
                                             Fztc_ztu_m=F_ztc_ztu_m,
                                             list_adj_zones=list_adj_zones,
                                             b_ztu=b_ztu,
-                                            h_occup=profile_df['occupancy_profile'].iloc[Tstepi],
-                                            h_app=profile_df['appliances_profile'].iloc[Tstepi],
-                                            h_light=profile_df['lighting_profile'].iloc[Tstepi],
+                                            h_occup=occ_prof_arr[Tstepi],
+                                            h_app=app_prof_arr[Tstepi],
+                                            h_light=light_prof_arr[Tstepi],
                                             )
                     else:
-                        int_gains_conditioned_zone = VentilationInternalGains(building_object).internal_gains(
+                        int_gains_conditioned_zone = vig.internal_gains(
                                             building_type_class = building_object['building']['building_type_class'], 
                                             a_use=building_object['building']['net_floor_area'], 
                                             unconditioned_zones_nearby = False,
-                                            h_occup=profile_df['occupancy_profile'].iloc[Tstepi],
-                                            h_app=profile_df['appliances_profile'].iloc[Tstepi],
-                                            h_light=profile_df['lighting_profile'].iloc[Tstepi],
+                                            h_occup=occ_prof_arr[Tstepi],
+                                            h_app=app_prof_arr[Tstepi],
+                                            h_light=light_prof_arr[Tstepi],
                                             )
 
                     if building_object['building']['adj_zones_present'] and building_object['building']['number_adj_zone']>=1:
@@ -7948,8 +8035,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
-                        + H_ve_nat * theta_sup.iloc[Tstepi]
+                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
+                        + H_ve_nat * T2m_arr[Tstepi]
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -8013,8 +8100,8 @@ class ISO52016:
                         if Tstepi >0:
                             # Single zones
                             if list_adj_zones == 1:
-                                theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]) + (phi_gn_dir_ztu/H_ztu))                        
-                                theta_ztu_t_checked =min(sim_df["T2m"].iloc[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]), theta_ztu_t)
+                                theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
+                                theta_ztu_t_checked = min(T2m_arr[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]), theta_ztu_t)
                                 theta_ztu[Tstepi] = theta_ztu_t_checked
                             
                             # Multiple zones
@@ -8022,8 +8109,8 @@ class ISO52016:
                                 for z in range(list_adj_zones):
                                     zone = building_object['adjacent_zones'][z]
                                     H_ztu = H_ztu_zones_df.loc['H_ztu'][zone['name']]
-                                    theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
-                                    theta_ztu_t_checked =min(sim_df["T2m"].iloc[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - sim_df["T2m"].iloc[Tstepi]), theta_ztu_t)
+                                    theta_ztu_t = (Theta_int_op[Tstepi-1,0] - b_ztu*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]) + (phi_gn_dir_ztu/H_ztu))
+                                    theta_ztu_t_checked = min(T2m_arr[Tstepi] + c_ztu_h_max*(Theta_int_op[Tstepi-1,0] - T2m_arr[Tstepi]), theta_ztu_t)
                                     theta_ztu[Tstepi,z] = theta_ztu_t_checked
                         theta_ztu_df = pd.DataFrame(theta_ztu, columns=H_ztu_zones_df.columns.tolist())
 
@@ -8064,9 +8151,9 @@ class ISO52016:
                                     '''
                                     if h_re_model == "dynamic":
                                         XTemp = (
-                                            heat_convective_elements_external[Eli] * sim_df["T2m"].iloc[Tstepi]
+                                            heat_convective_elements_external[Eli] * T2m_arr[Tstepi]
                                             + heat_radiative_elements_external_t[Eli] * ext_rad_ref_temp_t[Eli]
-                                            + a_sol_pli_eli[Pli, Eli] * sim_df[f'I_sol_tot_{orientation_elements[Eli]}'].iloc[Tstepi]
+                                            + a_sol_pli_eli[Pli, Eli] * I_sol_tot_el[Tstepi, Eli]
                                         )
                                     else:
                                         phi_sky_eli_t = (
@@ -8076,9 +8163,9 @@ class ISO52016:
                                         )
                                         XTemp = (
                                             (heat_convective_elements_external[Eli] + heat_radiative_elements_external_t[Eli])
-                                            * sim_df["T2m"].iloc[Tstepi]
+                                            * T2m_arr[Tstepi]
                                             - phi_sky_eli_t
-                                            + a_sol_pli_eli[Pli, Eli] * sim_df[f'I_sol_tot_{orientation_elements[Eli]}'].iloc[Tstepi]
+                                            + a_sol_pli_eli[Pli, Eli] * I_sol_tot_el[Tstepi, Eli]
                                         )
                                     for cBi in range(nrHCmodes):
                                         VecB[ri, cBi] += XTemp
@@ -8112,7 +8199,7 @@ class ISO52016:
                                     # R_gr_ve is area-specific [m2K/W], so 1 / R_gr_ve is the
                                     # correct areal conductance here. The total-area scaling is
                                     # applied later only in post-processing energy balances.
-                                    XTemp = (1 / t_Th.R_gr_ve) * t_Th.Theta_gr_ve[sim_df.index.month[Tstepi] - 1]
+                                    XTemp = (1 / t_Th.R_gr_ve) * t_Th.Theta_gr_ve[month_arr[Tstepi]]
                                     for cBi in range(nrHCmodes):
                                         VecB[ri, cBi] += XTemp
 
@@ -8176,20 +8263,20 @@ class ISO52016:
 
                     '''
                     ######## solve system of equations #######
-                    if np.linalg.matrix_rank(MatA) < MatA.shape[0]:
-                        print("⚠️ Warning: MatA is singular or ill-conditioned")
-                        print("Rank:", np.linalg.matrix_rank(MatA), "Expected:", MatA.shape[0])
-                        np.set_printoptions(precision=3, suppress=True)
-                        print("MatA diagonal:", np.diag(MatA))
-                    
                     # --- Safe diagonal regularization (avoid read-only error) ---
                     diag_min = max(1e-6, 1e-9 * np.linalg.norm(MatA, ord=np.inf))
                     d = np.diag(MatA).copy()
                     np.maximum(d, diag_min, out=d)
                     np.fill_diagonal(MatA, d)
                     # -------------------------------------------------------------
-                    theta = np.linalg.solve(MatA, VecB)
-                    VecB = theta
+                    try:
+                        theta = np.linalg.solve(MatA, VecB)
+                    except np.linalg.LinAlgError:
+                        rank = np.linalg.matrix_rank(MatA)
+                        print(f"⚠️ MatA solve failed at t={Tstepi}: rank={rank}/{MatA.shape[0]}")
+                        print("MatA diagonal:", np.diag(MatA))
+                        raise
+                    VecB[:, :] = theta
                     
                     # Air Temperature
                     Theta_int_air[Tstepi, :] = VecB[0, :]
@@ -8227,40 +8314,6 @@ class ISO52016:
                     thet_int_op_0: operating temperature in free floating condition in °C
                     theta_int_op_upper: is the internal operational temperature, obtained for the upper heating or cooling load °C
                     '''
-                    def _safe_load(P_max, T_set, T0, Tupper, clip_factor=2000.0):
-                        """
-                        Return HVAC load [W] using Eq. (27) with robust fallback.
-                        Positive load = heating, negative load = cooling.
-                        """
-                        try:
-                            pmax = float(P_max)
-                            t_set = float(T_set)
-                            t0 = float(T0)
-                            t_upper = float(Tupper)
-                        except (TypeError, ValueError):
-                            return 0.0
-
-                        dT = t_set - t0
-                        if not np.isfinite(dT) or abs(dT) < 1e-9:
-                            return 0.0
-
-                        denom = (t_upper - t0)
-                        if np.isfinite(denom) and abs(denom) >= 0.05:
-                            load = pmax * dT / denom
-                        else:
-                            # Small/invalid denominator: use bounded linear fallback.
-                            load = clip_factor * dT
-
-                        if not np.isfinite(load):
-                            return 0.0
-
-                        # Clamp to the available capacity and enforce expected sign.
-                        if pmax >= 0.0:
-                            # Heating branch
-                            return float(min(pmax, max(0.0, load)))
-                        # Cooling branch (pmax is negative)
-                        return float(max(pmax, min(0.0, load)))
-                        
                     if nrHCmodes > 1:
                         # HEATING
                         if Theta_int_op[Tstepi, 0] < Theta_H_set:
@@ -8367,7 +8420,7 @@ class ISO52016:
 
                     # 4) Ventilation
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    T_out = T2m_arr[Tstepi]
                     q_vent = float(H_ve_nat) * (T_in - T_out)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
@@ -8378,7 +8431,7 @@ class ISO52016:
                     else:         E_solar_Wh   += (-q_tb) * dt_h
 
                     # 6) Ground
-                    T_gr = float(t_Th.Theta_gr_ve[sim_df.index.month[Tstepi] - 1])
+                    T_gr = float(t_Th.Theta_gr_ve[month_arr[Tstepi]])
                     h_ground = _ground_conductance_w_per_k(
                         float(getattr(t_Th, "ground_contact_area", 0.0)),
                         t_Th,
