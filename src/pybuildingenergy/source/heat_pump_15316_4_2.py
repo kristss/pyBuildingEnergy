@@ -47,6 +47,29 @@ class HeatPumpSimulationResult:
     inputs: dict[str, Any]
 
 
+def _build_pivot_arrays_hp(
+    performance_map: "pd.DataFrame | None",
+    column: str,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray] | None":
+    """Pre-build sorted pivot arrays for _bilinear_or_linear.
+    Returns None if map is absent or pivot contains NaN (IDW fallback).
+    """
+    if performance_map is None:
+        return None
+    pivot = performance_map.pivot_table(
+        index="source_temperature_C",
+        columns="sink_temperature_C",
+        values=column,
+        aggfunc="mean",
+    ).sort_index().sort_index(axis=1)
+    if pivot.isna().any().any():
+        return None
+    return (
+        pivot.index.to_numpy(dtype=float),
+        pivot.columns.to_numpy(dtype=float),
+        pivot.to_numpy(dtype=float),
+    )
+
 class HeatPumpSystemCalculator:
     """Case-specific heat-pump generation calculator.
 
@@ -243,6 +266,14 @@ class HeatPumpSystemCalculator:
             service_name="cooling",
             required=False,
         )
+        # --- Commit-2B: pre-build pivot arrays (one pivot_table call per map/column) ---
+        self._h_perf_pivot = _build_pivot_arrays_hp(self.heating_performance_map, "cop")
+        self._h_cap_pivot  = _build_pivot_arrays_hp(self.heating_performance_map, "capacity_kW")
+        self._dhw_perf_pivot = _build_pivot_arrays_hp(self.dhw_performance_map, "cop")
+        self._dhw_cap_pivot  = _build_pivot_arrays_hp(self.dhw_performance_map, "capacity_kW")
+        self._c_perf_pivot = _build_pivot_arrays_hp(self.cooling_performance_map, "eer")
+        self._c_cap_pivot  = _build_pivot_arrays_hp(self.cooling_performance_map, "capacity_kW")
+        # -----------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Time-series preparation
@@ -594,8 +625,22 @@ class HeatPumpSystemCalculator:
                 raise ValueError(
                     f"{service} demand is present, but no performance map was provided."
                 )
-            performance = _interpolate_performance(perf_map, source, sink, perf_col)
-            capacity_kW = _interpolate_performance(perf_map, source, sink, "capacity_kW")
+            # Use pre-built pivot grids when available (avoids per-call pivot_table)
+            if service == "H":
+                _perf_grid = self._h_perf_pivot
+                _cap_grid  = self._h_cap_pivot
+            elif service == "W":
+                _perf_grid = self._dhw_perf_pivot
+                _cap_grid  = self._dhw_cap_pivot
+            else:
+                _perf_grid = self._c_perf_pivot
+                _cap_grid  = self._c_cap_pivot
+            if _perf_grid is not None:
+                performance = _bilinear_or_linear(*_perf_grid, source, sink)
+                capacity_kW = _bilinear_or_linear(*_cap_grid, source, sink)
+            else:
+                performance = _interpolate_performance(perf_map, source, sink, perf_col)
+                capacity_kW = _interpolate_performance(perf_map, source, sink, "capacity_kW")
             performance = max(float(performance), _KWH_EPS)
             capacity_kW = max(float(capacity_kW), 0.0)
 

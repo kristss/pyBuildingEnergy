@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .heat_pump_15316_4_2 import _coerce_performance_map, _interpolate_performance
+from .heat_pump_15316_4_2 import _coerce_performance_map, _interpolate_performance, _bilinear_or_linear
 from .performance_14511_14825 import en14825_part_load_factor
 
 
@@ -43,6 +43,30 @@ class CoolingGenerationSimulationResult:
     summary: dict[str, float]
     inputs: dict[str, Any]
 
+
+def _build_pivot_arrays(
+    performance_map: "pd.DataFrame",
+    column: str,
+) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"] | None:
+    """Build sorted pivot arrays for bilinear interpolation.
+
+    Returns (sources, sinks, values) suitable for _bilinear_or_linear,
+    or None if the pivot contains NaN (scattered map â€” use IDW fallback).
+    Pre-building once avoids rebuilding the pivot on every timestep.
+    """
+    pivot = performance_map.pivot_table(
+        index="source_temperature_C",
+        columns="sink_temperature_C",
+        values=column,
+        aggfunc="mean",
+    ).sort_index().sort_index(axis=1)
+    if pivot.isna().any().any():
+        return None  # scattered map â€” fall back to per-call _interpolate_performance
+    return (
+        pivot.index.to_numpy(dtype=float),
+        pivot.columns.to_numpy(dtype=float),
+        pivot.to_numpy(dtype=float),
+    )
 
 class CoolingGenerationSystemCalculator:
     """EN 16798-13:2017 compression cooling-generation calculator."""
@@ -164,6 +188,14 @@ class CoolingGenerationSystemCalculator:
             raise ValueError(
                 "Provide either cooling_performance_map or nominal_capacity_kW for EN 16798-13."
             )
+        # --- Commit-2A: pre-build pivot arrays so _capacity_and_eer never
+        #     calls pivot_table inside the per-timestep loop.
+        if self.performance_map is not None:
+            self._cap_pivot = _build_pivot_arrays(self.performance_map, "capacity_kW")
+            self._eer_pivot = _build_pivot_arrays(self.performance_map, "eer")
+        else:
+            self._cap_pivot = None
+            self._eer_pivot = None
 
     def _prepare_timeseries(self, data: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(data, pd.DataFrame):
@@ -374,19 +406,19 @@ class CoolingGenerationSystemCalculator:
 
     def _capacity_and_eer(self, source_temperature_C: float, sink_temperature_C: float) -> tuple[float, float]:
         if self.performance_map is not None:
-            capacity = _interpolate_performance(
-                self.performance_map,
-                source_temperature_C,
-                sink_temperature_C,
-                "capacity_kW",
-            )
-            eer = _interpolate_performance(
-                self.performance_map,
-                source_temperature_C,
-                sink_temperature_C,
-                "eer",
-            )
-            return max(float(capacity), 0.0), max(float(eer), _KWH_EPS)
+            if self._cap_pivot is not None:
+                # Fast path: pre-built bilinear grids (the common case)
+                cap = _bilinear_or_linear(*self._cap_pivot, source_temperature_C, sink_temperature_C)
+                eer = _bilinear_or_linear(*self._eer_pivot, source_temperature_C, sink_temperature_C)
+            else:
+                # Scattered map fallback: rebuild pivot each call (rare)
+                cap = _interpolate_performance(
+                    self.performance_map, source_temperature_C, sink_temperature_C, "capacity_kW"
+                )
+                eer = _interpolate_performance(
+                    self.performance_map, source_temperature_C, sink_temperature_C, "eer"
+                )
+            return max(float(cap), 0.0), max(float(eer), _KWH_EPS)
 
         capacity = self.nominal_capacity_kW
         nominal_eer = float(self.nominal_eer or _default_nominal_eer(capacity))
