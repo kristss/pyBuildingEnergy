@@ -4091,6 +4091,10 @@ class ISO52016:
                     zone.get("infiltration_schedule_multiplier", 1.0)
                 ),
             }
+            # Pass through new components list when present in "ventilation" sub-key
+            _zone_vent_obj = zone.get("ventilation", {})
+            if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
+                zone_vent_params["components"] = _zone_vent_obj["components"]
             zone_proxies[zname] = {
                 "zone_name": zname,
                 "building": bld,
@@ -4158,8 +4162,18 @@ class ISO52016:
 
             ws = float(sim_df["WS10m"].iloc[tstep]) if "WS10m" in sim_df.columns else 0.0
             profile_mult = _profile_value(zname, "ventilation_profile", tstep, 1.0)
+            # Zone volume: look in zone dict, proxy building dict, and global building dict
+            _bld = proxy.get("building", {})
             zone_vol = float(
-                zone_obj.get("zone_volume_m3") or zone_obj.get("zone_volume") or 0.0
+                zone_obj.get("zone_volume_m3")
+                or zone_obj.get("zone_volume")
+                or _bld.get("zone_volume_m3")
+                or _bld.get("zone_volume")
+                or _bld.get("volume")
+                or building_object.get("building", {}).get("zone_volume_m3")
+                or building_object.get("building", {}).get("zone_volume")
+                or building_object.get("building", {}).get("volume")
+                or 0.0
             )
 
             try:
@@ -5022,6 +5036,10 @@ class ISO52016:
         vent["infiltration_schedule_multiplier"] = float(
             zone.get("infiltration_schedule_multiplier", 1.0)
         )
+        # Pass through new components list when present in "ventilation" sub-key
+        _zone_vent_obj = zone.get("ventilation", {})
+        if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
+            vent["components"] = _zone_vent_obj["components"]
         bp.setdefault("internal_gains", copy.deepcopy(building_object.get("building_parameters", {}).get("internal_gains", [])))
 
         return bui
@@ -6343,6 +6361,7 @@ class ISO52016:
         heating or cooling load, ΦHC;ld;ztc;t, is calculated using the following step-wise procedure: 
         """
         H_ve_nat_all = [0]
+        S_ve_nat_all = [0.0]
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -6658,16 +6677,25 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
+                    _bld_vent = building_object.get("building", {})
+                    _zone_vol_leg = float(
+                        _bld_vent.get("zone_volume_m3")
+                        or _bld_vent.get("zone_volume")
+                        or _bld_vent.get("volume")
+                        or 0.0
+                    )
                     _vent_bdy = resolve_ventilation_boundary(
                         building_object,
                         float(Theta_old[ri]),
                         float(sim_df.iloc[Tstepi]["T2m"]),
                         float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
                         profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                        zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
                     H_ve_nat_all.append(H_ve_nat)
+                    S_ve_nat_all.append(S_ve_nat)
                     
                     
                     
@@ -7220,6 +7248,16 @@ class ISO52016:
             index=sim_df_act.index,
             columns=["Q_HC", "T_op", "T_ext"],
         )
+
+        # Ventilation diagnostics: H_ve, S_ve, equivalent source temp, heat flow
+        _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["H_ve"] = _h_ve_arr
+        hourly_results["S_ve"] = _s_ve_arr
+        _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
+        hourly_results["T_ve_source_eq"] = _t_eq
+        hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
 
         # separate H/C
         hourly_results["Q_H"] = 0.0
@@ -7783,6 +7821,7 @@ class ISO52016:
         heating or cooling load, ΦHC;ld;ztc;t, is calculated using the following step-wise procedure: 
         """
         H_ve_nat_all = [0]
+        S_ve_nat_all = [0.0]
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -8146,16 +8185,25 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
+                    _bld_vent = building_object.get("building", {})
+                    _zone_vol_leg = float(
+                        _bld_vent.get("zone_volume_m3")
+                        or _bld_vent.get("zone_volume")
+                        or _bld_vent.get("volume")
+                        or 0.0
+                    )
                     _vent_bdy = resolve_ventilation_boundary(
                         building_object,
                         float(Theta_old[ri]),
                         float(sim_df.iloc[Tstepi]["T2m"]),
                         float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
                         profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                        zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
                     H_ve_nat_all.append(H_ve_nat)
+                    S_ve_nat_all.append(S_ve_nat)
                     
                     
                     
@@ -8750,6 +8798,16 @@ class ISO52016:
         )
         hourly_results["T_air"] = Theta_int_air[act_slice, 0]
         hourly_results["T_rad"] = Theta_int_r_mn[act_slice, 0]
+
+        # Ventilation diagnostics: H_ve, S_ve, equivalent source temp, heat flow
+        _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["H_ve"] = _h_ve_arr
+        hourly_results["S_ve"] = _s_ve_arr
+        _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
+        hourly_results["T_ve_source_eq"] = _t_eq
+        hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
 
         # separate H/C
         hourly_results["Q_H"] = 0.0

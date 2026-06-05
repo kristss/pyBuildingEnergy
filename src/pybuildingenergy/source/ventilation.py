@@ -65,6 +65,19 @@ class VentilationBoundary:
     """
     streams: tuple  # tuple[VentilationStream, ...]
 
+    def __post_init__(self):
+        # Coerce any iterable to tuple so the boundary is truly immutable
+        object.__setattr__(self, "streams", tuple(self.streams))
+        for s in self.streams:
+            if not isinstance(s, VentilationStream):
+                raise TypeError(
+                    f"streams must contain VentilationStream instances, got {type(s)}"
+                )
+        names = [s.name for s in self.streams]
+        if len(names) != len(set(names)):
+            dupes = [n for n in set(names) if names.count(n) > 1]
+            raise ValueError(f"Duplicate stream names in boundary: {dupes}")
+
     @property
     def heat_transfer_coefficient_w_k(self) -> float:
         """Aggregate H_ve = sum(H_k) [W/K]."""
@@ -622,6 +635,8 @@ def _resolve_component_streams(
     zone_volume_m3,
     c_air: float,
     rho_air: float,
+    component_multipliers: dict = None,
+    default_multiplier: float = 1.0,
 ) -> list:
     """Convert a ventilation components list to VentilationStream objects.
 
@@ -629,9 +644,16 @@ def _resolve_component_streams(
     - 'constant_ach': infiltration or natural ventilation via air-change rate.
       Requires zone_volume_m3. source_temperature defaults to "outdoor".
     - 'prescribed': fixed H_k and source temperature supplied by caller (e.g. AHU).
+
+    component_multipliers: optional per-component name -> float operation fraction.
+    default_multiplier: applied to any component not in component_multipliers.
+    Note: infiltration components should typically use a multiplier of 1.0 so they
+    remain active when the mechanical profile is off. Pass component_multipliers
+    explicitly to give each stream an independent schedule.
     """
     streams = []
     seen_names: set = set()
+    cm = component_multipliers or {}
     for comp in components:
         name = str(comp.get("name", "")).strip()
         if not name:
@@ -641,6 +663,7 @@ def _resolve_component_streams(
         seen_names.add(name)
 
         comp_type = str(comp.get("ventilation_type", "")).strip().lower()
+        multiplier = float(cm.get(name, default_multiplier))
 
         if comp_type == "constant_ach":
             if zone_volume_m3 is None or float(zone_volume_m3) <= 0.0:
@@ -650,14 +673,14 @@ def _resolve_component_streams(
                 )
             ach = float(comp["air_changes_per_hour"])
             q_m3_s = ach * float(zone_volume_m3) / 3600.0
-            h_k = rho_air * c_air * q_m3_s
+            h_k = rho_air * c_air * q_m3_s * multiplier
             source_temp = _parse_source_temperature(
                 comp.get("source_temperature", "outdoor"), outdoor_temperature_c
             )
             category = "outdoor_air"
 
         elif comp_type == "prescribed":
-            h_k = float(comp["heat_transfer_coefficient_w_k"])
+            h_k = float(comp["heat_transfer_coefficient_w_k"]) * multiplier
             source_temp = float(comp["source_temperature_c"])
             category = comp.get("category", "supply")
 
@@ -684,6 +707,7 @@ def resolve_ventilation_boundary(
     outdoor_temperature_c: float,
     wind_speed_m_s: float,
     profile_multiplier: float = 1.0,
+    component_multipliers: dict = None,
     zone_volume_m3=None,
     altitude_m=None,
     extra_streams=(),
@@ -700,6 +724,11 @@ def resolve_ventilation_boundary(
     All five existing ventilation_type calculations (temp_wind, occupancy, custom,
     eplus_infiltration_ext_area, sherman_grimsrud_like) are supported via this path.
 
+    profile_multiplier: operation fraction applied to the legacy single stream.
+    component_multipliers: optional dict mapping component name -> operation fraction.
+      Components not in the dict receive profile_multiplier as their default. Pass
+      {"infiltration": 1.0, "ahu_supply": 0.0} to keep infiltration on while the
+      AHU is off. When None, profile_multiplier is applied to all components.
     extra_streams: additional pre-built VentilationStream objects added by the caller
     (e.g. a summer night purge stream resolved by the timestep loop).
 
@@ -723,6 +752,8 @@ def resolve_ventilation_boundary(
             zone_volume_m3,
             c_air,
             rho_air,
+            component_multipliers=component_multipliers,
+            default_multiplier=profile_multiplier,
         )
     else:
         vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()

@@ -404,3 +404,110 @@ class TestResolveVentilationBoundary:
         bdy2 = resolve_ventilation_boundary(bld, 20.0, t_out_2, 0.0)
         assert bdy1.source_term_w == pytest.approx(400.0 * t_out_1)
         assert bdy2.source_term_w == pytest.approx(400.0 * t_out_2)
+
+    # --- Regression tests for fixed blockers ---
+
+    def test_component_profile_multiplier_applied(self):
+        """profile_multiplier must scale component H_k (was always returning H=500 W/K)."""
+        bld = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [
+                        {
+                            "name": "ahu",
+                            "ventilation_type": "prescribed",
+                            "heat_transfer_coefficient_w_k": 500.0,
+                            "source_temperature_c": 18.0,
+                        }
+                    ]
+                }
+            }
+        }
+        bdy_on = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=1.0)
+        bdy_off = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=0.0)
+        bdy_half = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=0.5)
+        assert bdy_on.heat_transfer_coefficient_w_k == pytest.approx(500.0)
+        assert bdy_off.heat_transfer_coefficient_w_k == pytest.approx(0.0)
+        assert bdy_half.heat_transfer_coefficient_w_k == pytest.approx(250.0)
+
+    def test_component_multipliers_allow_independent_schedules(self):
+        """component_multipliers lets infiltration stay on while AHU turns off."""
+        bld = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [
+                        {
+                            "name": "infiltration",
+                            "ventilation_type": "constant_ach",
+                            "air_changes_per_hour": 0.015,
+                        },
+                        {
+                            "name": "ahu",
+                            "ventilation_type": "prescribed",
+                            "heat_transfer_coefficient_w_k": 400.0,
+                            "source_temperature_c": 18.0,
+                        },
+                    ]
+                }
+            }
+        }
+        vol = 4000.0
+        # AHU off, infiltration on
+        bdy = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0,
+            profile_multiplier=0.0,
+            component_multipliers={"infiltration": 1.0, "ahu": 0.0},
+            zone_volume_m3=vol,
+        )
+        rho, cp = 1.204, 1006.0
+        h_inf = rho * cp * 0.015 * vol / 3600.0
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(h_inf, rel=1e-3)
+        names = [s.name for s in bdy.streams]
+        assert "ahu" not in names or all(
+            s.heat_transfer_coefficient_w_k == 0.0
+            for s in bdy.streams if s.name == "ahu"
+        )
+
+    def test_boundary_streams_coerced_to_tuple(self):
+        """Passing a list to VentilationBoundary must be silently coerced to tuple."""
+        s = VentilationStream("v", 100.0, 5.0)
+        bdy = VentilationBoundary(streams=[s])  # list, not tuple
+        assert isinstance(bdy.streams, tuple)
+        # Subsequent mutation of the original list must not affect the boundary
+        original_list = [s]
+        bdy2 = VentilationBoundary(streams=original_list)
+        original_list.append(VentilationStream("extra", 50.0, 0.0))
+        assert len(bdy2.streams) == 1
+
+    def test_boundary_duplicate_stream_names_rejected(self):
+        """VentilationBoundary must reject duplicate stream names."""
+        s1 = VentilationStream("dup", 100.0, 5.0)
+        s2 = VentilationStream("dup", 200.0, 10.0)
+        with pytest.raises(ValueError, match="[Dd]uplicate"):
+            VentilationBoundary(streams=(s1, s2))
+
+    def test_boundary_non_stream_element_rejected(self):
+        """VentilationBoundary must reject non-VentilationStream elements."""
+        with pytest.raises(TypeError):
+            VentilationBoundary(streams=(42,))
+
+    def test_constant_ach_with_zone_volume_m3(self):
+        """constant_ach component resolves correctly when zone_volume_m3 is supplied."""
+        bld = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [
+                        {
+                            "name": "inf",
+                            "ventilation_type": "constant_ach",
+                            "air_changes_per_hour": 0.015,
+                        }
+                    ]
+                }
+            }
+        }
+        vol = 6960.0  # m3
+        bdy = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, zone_volume_m3=vol)
+        rho, cp = 1.204, 1006.0
+        expected_h = rho * cp * (0.015 * vol / 3600.0)
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-4)
