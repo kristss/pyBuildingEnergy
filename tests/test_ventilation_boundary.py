@@ -7,13 +7,11 @@ unchanged H_ve values and that S_ve = H_ve * T_outdoor for all-outdoor cases.
 Solver identity tests verify that H_ve * T_zone - S_ve equals the physical heat flow.
 """
 
-import math
 import pytest
 from pybuildingenergy.source.ventilation import (
     VentilationStream,
     VentilationBoundary,
     resolve_ventilation_boundary,
-    VentilationInternalGains,
 )
 
 
@@ -407,8 +405,13 @@ class TestResolveVentilationBoundary:
 
     # --- Regression tests for fixed blockers ---
 
-    def test_component_profile_multiplier_applied(self):
-        """profile_multiplier must scale component H_k (was always returning H=500 W/K)."""
+    def test_component_profile_multiplier_does_not_affect_components(self):
+        """profile_multiplier only scales the legacy single stream, not components.
+
+        Components use a default_multiplier of 1.0 so infiltration can remain
+        active when the global mechanical schedule switches off.  To turn off a
+        component, use component_multipliers.
+        """
         bld = {
             "building_parameters": {
                 "ventilation": {
@@ -423,15 +426,24 @@ class TestResolveVentilationBoundary:
                 }
             }
         }
-        bdy_on = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=1.0)
-        bdy_off = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=0.0)
-        bdy_half = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=0.5)
-        assert bdy_on.heat_transfer_coefficient_w_k == pytest.approx(500.0)
+        # profile_multiplier has NO effect on components
+        bdy_prof_off = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=0.0)
+        bdy_prof_on = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, profile_multiplier=1.0)
+        assert bdy_prof_off.heat_transfer_coefficient_w_k == pytest.approx(500.0)
+        assert bdy_prof_on.heat_transfer_coefficient_w_k == pytest.approx(500.0)
+
+        # component_multipliers is the correct way to turn off individual components
+        bdy_off = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0, component_multipliers={"ahu": 0.0}
+        )
+        bdy_half = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0, component_multipliers={"ahu": 0.5}
+        )
         assert bdy_off.heat_transfer_coefficient_w_k == pytest.approx(0.0)
         assert bdy_half.heat_transfer_coefficient_w_k == pytest.approx(250.0)
 
-    def test_component_multipliers_allow_independent_schedules(self):
-        """component_multipliers lets infiltration stay on while AHU turns off."""
+    def test_infiltration_stays_on_when_ahu_is_off(self):
+        """Infiltration (no profile key) is always 1.0; AHU off via component_multipliers."""
         bld = {
             "building_parameters": {
                 "ventilation": {
@@ -452,21 +464,108 @@ class TestResolveVentilationBoundary:
             }
         }
         vol = 4000.0
-        # AHU off, infiltration on
+        rho, cp = 1.204, 1006.0
+        h_inf = rho * cp * 0.015 * vol / 3600.0
+
+        # AHU turned off via component_multipliers; infiltration has no profile
+        # so it defaults to 1.0 regardless of profile_multiplier
         bdy = resolve_ventilation_boundary(
             bld, 21.0, -5.0, 0.0,
             profile_multiplier=0.0,
-            component_multipliers={"infiltration": 1.0, "ahu": 0.0},
+            component_multipliers={"ahu": 0.0},
             zone_volume_m3=vol,
         )
-        rho, cp = 1.204, 1006.0
-        h_inf = rho * cp * 0.015 * vol / 3600.0
         assert bdy.heat_transfer_coefficient_w_k == pytest.approx(h_inf, rel=1e-3)
-        names = [s.name for s in bdy.streams]
-        assert "ahu" not in names or all(
-            s.heat_transfer_coefficient_w_k == 0.0
-            for s in bdy.streams if s.name == "ahu"
+
+        # Without any component_multipliers: both streams active at 1.0
+        bdy_both = resolve_ventilation_boundary(
+            bld, 21.0, -5.0, 0.0,
+            profile_multiplier=0.0,  # no effect on components
+            zone_volume_m3=vol,
         )
+        assert bdy_both.heat_transfer_coefficient_w_k == pytest.approx(h_inf + 400.0, rel=1e-3)
+
+    def test_global_components_fallback(self):
+        """building_parameters.ventilation.components is used when zone has no components."""
+        # Components defined at global level, zone has no ventilation sub-key
+        bld = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [
+                        {
+                            "name": "inf",
+                            "ventilation_type": "constant_ach",
+                            "air_changes_per_hour": 0.015,
+                        }
+                    ]
+                }
+            }
+        }
+        vol = 5000.0
+        rho, cp = 1.204, 1006.0
+        expected_h = rho * cp * (0.015 * vol / 3600.0)
+
+        bdy = resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, zone_volume_m3=vol)
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-4)
+
+    def test_zone_components_override_global(self):
+        """Zone-level ventilation.components takes precedence over global components.
+
+        In the multizone resolver, the zone proxy is built so that zone-level
+        components replace global ones.  This unit test uses the resolver directly
+        with a zone-proxy-shaped dict (building_parameters.ventilation.components).
+        """
+        # Simulate the zone proxy after zone-local components win: the proxy's
+        # building_parameters.ventilation.components comes from the zone dict,
+        # not the global dict.
+        zone_proxy = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [
+                        {
+                            "name": "zone_inf",
+                            "ventilation_type": "prescribed",
+                            "heat_transfer_coefficient_w_k": 50.0,
+                            "source_temperature_c": -5.0,
+                        }
+                    ]
+                }
+            }
+        }
+        bdy = resolve_ventilation_boundary(zone_proxy, 21.0, -5.0, 0.0)
+        names = [s.name for s in bdy.streams]
+        assert "zone_inf" in names
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(50.0)
+
+    def test_zone_volume_not_shared_across_zones(self):
+        """constant_ach with explicit zone_volume_m3 uses that volume, not building total."""
+        rho, cp = 1.204, 1006.0
+        ach = 0.015
+
+        def _bld_with_ach():
+            return {
+                "building_parameters": {
+                    "ventilation": {
+                        "components": [
+                            {"name": "inf", "ventilation_type": "constant_ach",
+                             "air_changes_per_hour": ach}
+                        ]
+                    }
+                }
+            }
+
+        vol_small = 500.0
+        vol_large = 8000.0
+        h_small = rho * cp * ach * vol_small / 3600.0
+        h_large = rho * cp * ach * vol_large / 3600.0
+
+        bdy_small = resolve_ventilation_boundary(_bld_with_ach(), 21.0, -5.0, 0.0, zone_volume_m3=vol_small)
+        bdy_large = resolve_ventilation_boundary(_bld_with_ach(), 21.0, -5.0, 0.0, zone_volume_m3=vol_large)
+
+        assert bdy_small.heat_transfer_coefficient_w_k == pytest.approx(h_small, rel=1e-4)
+        assert bdy_large.heat_transfer_coefficient_w_k == pytest.approx(h_large, rel=1e-4)
+        # Must differ — if both returned h_large the proxy was leaking global volume
+        assert abs(bdy_small.heat_transfer_coefficient_w_k - bdy_large.heat_transfer_coefficient_w_k) > 1.0
 
     def test_boundary_streams_coerced_to_tuple(self):
         """Passing a list to VentilationBoundary must be silently coerced to tuple."""
@@ -511,3 +610,241 @@ class TestResolveVentilationBoundary:
         rho, cp = 1.204, 1006.0
         expected_h = rho * cp * (0.015 * vol / 3600.0)
         assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Solver integration tests
+# ---------------------------------------------------------------------------
+
+import pandas as pd
+import numpy as np
+from pybuildingenergy.source.utils import ISO52016
+
+
+def _minimal_sim_df(n=8760, t_out=-5.0):
+    """Return a minimal simulation DataFrame sufficient for the multizone solver."""
+    idx = pd.date_range("2023-01-01", periods=n, freq="h")
+    df = pd.DataFrame(index=idx)
+    df["T2m"] = t_out
+    df["WS10m"] = 0.0
+    return df
+
+
+def _adiabatic_surface(zone_name, area=100.0):
+    """Minimal adiabatic surface: no thermal nodes (Pln=0), just provides zone membership."""
+    return {
+        "name": f"floor_{zone_name}",
+        "type": "opaque",
+        "boundary": "ADIABATIC",
+        "area": area,
+        "zone": zone_name,
+        "ISO52016_type_string": "AD",
+        "sky_view_factor": 0.0,
+        "u_value": 0.0,
+        "thermal_capacity": 0.0,
+        "solar_absorptance": 0.0,
+        "orientation": {"azimuth": 0, "tilt": 0},
+    }
+
+
+def _one_zone_building(
+    ventilation_type="custom",
+    custom_h_ve=500.0,
+    components=None,
+    zone_volume_m3=None,
+):
+    """Minimal single-zone building dict for the multizone solver."""
+    zone = {
+        "name": "zone1",
+        "net_floor_area": 100.0,
+        "heating_setpoint": 21.0,
+        "heating_setback": 15.0,
+        "cooling_setpoint": 26.0,
+        "cooling_setback": 30.0,
+    }
+    if components is not None:
+        zone["ventilation"] = {"components": components}
+    else:
+        zone["ventilation_type"] = ventilation_type
+        zone["custom_heat_transfer_coefficient_ventilation"] = custom_h_ve
+    if zone_volume_m3 is not None:
+        zone["zone_volume_m3"] = zone_volume_m3
+
+    return {
+        "building": {
+            "net_floor_area": 100.0,
+            "building_type_class": "Residential_apartment",
+            "adj_zones_present": False,
+            "construction_class": "class_i",
+        },
+        "building_parameters": {
+            "ventilation": {
+                "ventilation_type": "custom",
+                "custom_heat_transfer_coefficient_ventilation": custom_h_ve,
+                "flow_rate_per_person": 0.0,
+            },
+            "temperature_setpoints": {},
+        },
+        "building_surface": [_adiabatic_surface("zone1")],
+        "zones": [zone],
+    }
+
+
+class TestSolverIntegration:
+    """Verify that the affine boundary reaches the ISO52016 multizone solver."""
+
+    def _run(self, building, n=48, t_out=-5.0, use_profiles=False):
+        sim_df = _minimal_sim_df(n, t_out)
+        return ISO52016.simulate_envelope_multizone_free_floating(
+            building_object=building,
+            _precomputed_sim_df=sim_df,
+            use_profiles=use_profiles,
+        )
+
+    def test_legacy_custom_h_ve_appears_in_output(self):
+        """H_ve column must equal the configured custom H_ve for all timesteps."""
+        bld = _one_zone_building(custom_h_ve=815.0)
+        out = self._run(bld)
+        assert "H_ve_zone1" in out.columns
+        np.testing.assert_allclose(out["H_ve_zone1"].to_numpy(), 815.0, rtol=1e-6)
+
+    def test_s_ve_equals_h_ve_times_t_outdoor_for_legacy(self):
+        """For legacy outdoor-air config: S_ve = H_ve * T_outdoor at every step."""
+        t_out = -5.0
+        bld = _one_zone_building(custom_h_ve=400.0)
+        out = self._run(bld, t_out=t_out)
+        h_ve = out["H_ve_zone1"].to_numpy()
+        s_ve = out["S_ve_zone1"].to_numpy()
+        np.testing.assert_allclose(s_ve, h_ve * t_out, rtol=1e-6)
+
+    def test_prescribed_supply_reduces_heating_demand(self):
+        """A 18 °C supply requires less heating to hold setpoint than -5 °C outdoor air.
+
+        Both cases use H_k=400 W/K.  With T_zone=21 °C:
+          outdoor:   Q_ve = 400 * (21 - (-5)) = 10400 W of heat loss → large heating demand
+          supply:    Q_ve = 400 * (21 -  18 ) =  1200 W of heat loss → small heating demand
+        """
+        h = 400.0
+        t_out = -5.0
+        bld_outdoor = _one_zone_building(custom_h_ve=h)
+        bld_supply = _one_zone_building(
+            components=[{
+                "name": "mech",
+                "ventilation_type": "prescribed",
+                "heat_transfer_coefficient_w_k": h,
+                "source_temperature_c": 18.0,
+            }]
+        )
+        out_outdoor = self._run(bld_outdoor, n=48, t_out=t_out, use_profiles=True)
+        out_supply = self._run(bld_supply, n=48, t_out=t_out, use_profiles=True)
+
+        # Both zones are maintained at 21 °C; heating demand must be lower for supply
+        q_heat_outdoor = out_outdoor["Q_HVAC_zone1"].clip(lower=0).mean()
+        q_heat_supply = out_supply["Q_HVAC_zone1"].clip(lower=0).mean()
+        assert q_heat_supply < q_heat_outdoor - 1000.0, (
+            f"Heating demand should be >1 kW lower with 18 °C supply than outdoor {t_out} °C; "
+            f"got outdoor={q_heat_outdoor:.0f} W, supply={q_heat_supply:.0f} W"
+        )
+
+    def test_q_ve_closes_h_ve_times_tzone_minus_s_ve(self):
+        """Q_ve = H_ve * T_zone - S_ve must hold at every timestep."""
+        bld = _one_zone_building(custom_h_ve=600.0)
+        out = self._run(bld)
+        h_ve = out["H_ve_zone1"].to_numpy()
+        s_ve = out["S_ve_zone1"].to_numpy()
+        t_air = out["T_air_zone1"].to_numpy()
+        q_ve = out["Q_ve_zone1"].to_numpy()
+        np.testing.assert_allclose(q_ve, h_ve * t_air - s_ve, atol=1e-8)
+
+    def test_global_components_reach_solver(self):
+        """Global building_parameters.ventilation.components must not be dropped."""
+        bld = {
+            "building": {
+                "net_floor_area": 100.0,
+                "building_type_class": "Residential_apartment",
+                "adj_zones_present": False,
+            },
+            "building_parameters": {
+                "ventilation": {
+                    "components": [{
+                        "name": "inf",
+                        "ventilation_type": "prescribed",
+                        "heat_transfer_coefficient_w_k": 300.0,
+                        "source_temperature_c": -5.0,
+                    }]
+                },
+                "temperature_setpoints": {},
+            },
+            "building_surface": [],
+            "zones": [{
+                "name": "zone1",
+                "net_floor_area": 100.0,
+                "heating_setpoint": 21.0, "heating_setback": 15.0,
+                "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+            }],
+        }
+        # Add a surface so the solver doesn't crash with empty surface list
+        bld["building"]["construction_class"] = "class_i"
+        bld["building_surface"] = [_adiabatic_surface("zone1")]
+        out = self._run(bld)
+        # If global components were dropped, H_ve would be 0
+        np.testing.assert_allclose(out["H_ve_zone1"].to_numpy(), 300.0, rtol=1e-6)
+
+    def test_constant_ach_uses_zone_volume_not_building_total(self):
+        """Each zone uses its own volume for constant_ach, not the building total."""
+        ach = 0.015
+        vol_a, vol_b = 300.0, 1200.0
+        rho, cp = 1.204, 1006.0
+        h_a = rho * cp * ach * vol_a / 3600.0
+        h_b = rho * cp * ach * vol_b / 3600.0
+        def _inf():
+            return [{"name": "inf", "ventilation_type": "constant_ach",
+                     "air_changes_per_hour": ach}]
+        bld = {
+            "building": {
+                "net_floor_area": 150.0,
+                "building_type_class": "Residential_apartment",
+                "construction_class": "class_i",
+                "adj_zones_present": False,
+                "volume": vol_a + vol_b,  # global total — must not be used per-zone
+            },
+            "building_parameters": {"ventilation": {}, "temperature_setpoints": {}},
+            "building_surface": [
+                _adiabatic_surface("zone_a", area=50.0),
+                _adiabatic_surface("zone_b", area=100.0),
+            ],
+            "zones": [
+                {
+                    "name": "zone_a", "net_floor_area": 50.0, "zone_volume_m3": vol_a,
+                    "heating_setpoint": 21.0, "heating_setback": 15.0,
+                    "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+                    "ventilation": {"components": _inf()},
+                },
+                {
+                    "name": "zone_b", "net_floor_area": 100.0, "zone_volume_m3": vol_b,
+                    "heating_setpoint": 21.0, "heating_setback": 15.0,
+                    "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+                    "ventilation": {"components": _inf()},
+                },
+            ],
+        }
+        out = self._run(bld)
+        np.testing.assert_allclose(out["H_ve_zone_a"].to_numpy(), h_a, rtol=1e-4)
+        np.testing.assert_allclose(out["H_ve_zone_b"].to_numpy(), h_b, rtol=1e-4)
+
+    def test_purge_stream_source_is_outdoor(self):
+        """Summer-night purge adds an outdoor-air stream: S_ve = H_ve * T_out."""
+        t_out = 15.0  # warm — zone will be warmer, purge condition met
+        bld = _one_zone_building(custom_h_ve=200.0)
+        bld["zones"][0]["summer_night_purge"] = {
+            "enabled": True, "boost_factor": 3.0,
+            "months": [6, 8], "hours": [22, 6], "delta_t_min": 0.0,
+        }
+        sim_df = _minimal_sim_df(n=48, t_out=t_out)
+        out = ISO52016.simulate_envelope_multizone_free_floating(
+            building_object=bld, _precomputed_sim_df=sim_df
+        )
+        h_ve = out["H_ve_zone1"].to_numpy()
+        s_ve = out["S_ve_zone1"].to_numpy()
+        # All streams (base + purge) are outdoor-air, so S_ve == H_ve * T_out
+        np.testing.assert_allclose(s_ve, h_ve * t_out, rtol=1e-6)

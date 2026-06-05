@@ -3220,6 +3220,7 @@ class ISO52016:
         external_emissivity_default=None,
         progress_log_every_steps=None,
         progress_logger=None,
+        _precomputed_sim_df=None,
     ):
         """
         Multizone envelope simulation with coupled internal partitions and ideal HVAC.
@@ -3270,13 +3271,19 @@ class ISO52016:
         # ------------------------
         # 0) Weather
         # ------------------------
-        sim_df = cls().Weather_data_bui(
-            building_object, path_weather_file, weather_source=weather_source
-        ).simulation_df
-        sim_df = sim_df.copy()
-        sim_df.index = pd.DatetimeIndex(sim_df.index)
-        sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
-        sim_df = sim_df.sort_index()
+        if _precomputed_sim_df is not None:
+            sim_df = _precomputed_sim_df.copy()
+            sim_df.index = pd.DatetimeIndex(sim_df.index)
+            sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
+            sim_df = sim_df.sort_index()
+        else:
+            sim_df = cls().Weather_data_bui(
+                building_object, path_weather_file, weather_source=weather_source
+            ).simulation_df
+            sim_df = sim_df.copy()
+            sim_df.index = pd.DatetimeIndex(sim_df.index)
+            sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
+            sim_df = sim_df.sort_index()
 
         # ------------------------
         # 0.1) Time profiles (occupancy/heating/cooling/ventilation)
@@ -4091,10 +4098,24 @@ class ISO52016:
                     zone.get("infiltration_schedule_multiplier", 1.0)
                 ),
             }
-            # Pass through new components list when present in "ventilation" sub-key
+            # Components: zone-local overrides global; global is the fallback
             _zone_vent_obj = zone.get("ventilation", {})
             if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
                 zone_vent_params["components"] = _zone_vent_obj["components"]
+            elif "components" in global_vent:
+                zone_vent_params["components"] = global_vent["components"]
+
+            # Store zone-specific volume so constant_ach uses per-zone air not
+            # building-total air.  Must be set before building the proxy so the
+            # bld dict carries the correct value.
+            _zone_vol_raw = (
+                zone.get("zone_volume_m3")
+                or zone.get("zone_volume")
+                or zone.get("volume")
+            )
+            if _zone_vol_raw is not None:
+                bld["zone_volume_m3"] = float(_zone_vol_raw)
+
             zone_proxies[zname] = {
                 "zone_name": zname,
                 "building": bld,
@@ -4162,19 +4183,29 @@ class ISO52016:
 
             ws = float(sim_df["WS10m"].iloc[tstep]) if "WS10m" in sim_df.columns else 0.0
             profile_mult = _profile_value(zname, "ventilation_profile", tstep, 1.0)
-            # Zone volume: look in zone dict, proxy building dict, and global building dict
+
+            # Zone volume: zone-specific keys only; do NOT fall back to the
+            # global building volume (proxy["building"] is a copy of the global
+            # building dict and would give full-building air to every zone).
             _bld = proxy.get("building", {})
             zone_vol = float(
                 zone_obj.get("zone_volume_m3")
                 or zone_obj.get("zone_volume")
-                or _bld.get("zone_volume_m3")
-                or _bld.get("zone_volume")
-                or _bld.get("volume")
-                or building_object.get("building", {}).get("zone_volume_m3")
-                or building_object.get("building", {}).get("zone_volume")
-                or building_object.get("building", {}).get("volume")
+                or zone_obj.get("volume")
+                or _bld.get("zone_volume_m3")  # set from zone data during proxy build
                 or 0.0
             )
+
+            # Per-component schedules: each component may have a "profile" key
+            # naming a profile in the profile registry.  Components without a
+            # profile key always run at full capacity (1.0) so infiltration
+            # remains active independently of the mechanical schedule.
+            _comp_mult: dict = {}
+            for _comp in vent_cfg.get("components", []):
+                _cname = str(_comp.get("name", "")).strip()
+                _prof = _comp.get("profile")
+                if _cname and _prof is not None:
+                    _comp_mult[_cname] = _profile_value(zname, _prof, tstep, 1.0)
 
             try:
                 base_bdy = resolve_ventilation_boundary(
@@ -4183,6 +4214,7 @@ class ISO52016:
                     float(T_out),
                     float(ws),
                     profile_multiplier=profile_mult,
+                    component_multipliers=_comp_mult if _comp_mult else None,
                     zone_volume_m3=zone_vol if zone_vol > 0.0 else None,
                 )
             except Exception as exc:
@@ -6610,6 +6642,8 @@ class ISO52016:
                     Phi_HC_nd_calc[colB_C] = power_cooling_max_act
 
                 iterate = True
+                _H_ve_nat_tstep = 0.0
+                _S_ve_nat_tstep = 0.0
                 while iterate:
 
                     iterate = False
@@ -6694,8 +6728,12 @@ class ISO52016:
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
-                    H_ve_nat_all.append(H_ve_nat)
-                    S_ve_nat_all.append(S_ve_nat)
+                    # Record for this timestep; do NOT append here — the while
+                    # loop may iterate again for HVAC re-solving and we must
+                    # emit exactly one entry per timestep to keep diagnostics
+                    # aligned.
+                    _H_ve_nat_tstep = H_ve_nat
+                    _S_ve_nat_tstep = S_ve_nat
                     
                     
                     
@@ -7092,6 +7130,13 @@ class ISO52016:
                         Phi_HC_nd_act[Tstepi] = Phi_HC_nd_calc[0]
                         Theta_op_act[Tstepi] = Theta_int_op[Tstepi, 0]
                         colB_act = 0
+
+                # Append ventilation diagnostics once per timestep (outside the
+                # while loop so HVAC re-solving iterations do not duplicate entries).
+                H_ve_nat_all.append(_H_ve_nat_tstep)
+                S_ve_nat_all.append(_S_ve_nat_tstep)
+                H_ve_nat = _H_ve_nat_tstep
+                S_ve_nat = _S_ve_nat_tstep
 
                 # =========================
                 # === SANKEY (per timestep)
@@ -8118,6 +8163,8 @@ class ISO52016:
                     Phi_HC_nd_calc[colB_C] = power_cooling_max_act
 
                 iterate = True
+                _H_ve_nat_tstep = 0.0
+                _S_ve_nat_tstep = 0.0
                 while iterate:
 
                     iterate = False
@@ -8202,8 +8249,12 @@ class ISO52016:
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
-                    H_ve_nat_all.append(H_ve_nat)
-                    S_ve_nat_all.append(S_ve_nat)
+                    # Record for this timestep; do NOT append here — the while
+                    # loop may iterate again for HVAC re-solving and we must
+                    # emit exactly one entry per timestep to keep diagnostics
+                    # aligned.
+                    _H_ve_nat_tstep = H_ve_nat
+                    _S_ve_nat_tstep = S_ve_nat
                     
                     
                     
@@ -8637,6 +8688,13 @@ class ISO52016:
                         Phi_HC_nd_act[Tstepi] = Phi_HC_nd_calc[0]
                         Theta_op_act[Tstepi] = Theta_int_op[Tstepi, 0]
                         colB_act = 0
+
+                # Append ventilation diagnostics once per timestep (outside the
+                # while loop so HVAC re-solving iterations do not duplicate entries).
+                H_ve_nat_all.append(_H_ve_nat_tstep)
+                S_ve_nat_all.append(_S_ve_nat_tstep)
+                H_ve_nat = _H_ve_nat_tstep
+                S_ve_nat = _S_ve_nat_tstep
 
                 # =========================
                 # === SANKEY (per timestep)

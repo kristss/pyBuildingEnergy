@@ -746,6 +746,9 @@ def resolve_ventilation_boundary(
     components = vent_cfg.get("components", None)
 
     if components is not None:
+        # For component streams, each stream uses its own schedule (1.0 default)
+        # so infiltration components remain active when a mechanical schedule is
+        # off.  profile_multiplier is only applied to the legacy single stream.
         streams = _resolve_component_streams(
             components,
             outdoor_temperature_c,
@@ -753,7 +756,7 @@ def resolve_ventilation_boundary(
             c_air,
             rho_air,
             component_multipliers=component_multipliers,
-            default_multiplier=profile_multiplier,
+            default_multiplier=1.0,
         )
     else:
         vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()
