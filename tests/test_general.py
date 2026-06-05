@@ -1939,10 +1939,10 @@ def test_dhw_calculation():
     import pybuildingenergy as pybui
     
     # Parametri
-    teta_W_draw = 42
-    teta_W_cold = 11.2
-    teta_w_h_ref = 60
-    teta_w_c_ref = 13.5
+    theta_W_draw = 42
+    theta_W_cold = 11.2
+    theta_w_h_ref = 60
+    theta_w_c_ref = 13.5
     
     hourly_fractions = pd.DataFrame({
         "Workday": [0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 20, 10, 10, 10, 10, 5, 0, 0, 0, 0, 0, 0],
@@ -1965,10 +1965,10 @@ def test_dhw_calculation():
     # Calcolo DHW
     dhw_result = pybui.Volume_and_energy_DHW_calculation(
         n_workdays, n_weekends, n_holidays, sum_fractions, total_days, hourly_fractions,
-        teta_W_draw,
-        teta_w_c_ref,
-        teta_w_h_ref,
-        teta_W_cold,
+        theta_W_draw,
+        theta_w_c_ref,
+        theta_w_h_ref,
+        theta_W_cold,
         mode_calc='number_of_units',
         building_type_B3='Residential',
         building_area=142,
@@ -1982,6 +1982,8 @@ def test_dhw_calculation():
     
     assert dhw_result is not None
     assert len(dhw_result) > 0
+    assert len(dhw_result[6]) == total_days * 24
+    assert len(dhw_result[7]) == total_days * 24
 
 
 def test_dhw_en12831_3_residential_energy_need_matches_annex_b_formula():
@@ -2012,10 +2014,10 @@ def test_dhw_en12831_3_residential_energy_need_matches_annex_b_formula():
         sum_fractions=sum_fractions,
         total_days=total_days,
         hourly_fractions=hourly_fractions,
-        teta_W_draw=42.0,
-        teta_w_c_ref=13.5,
-        teta_w_h_ref=60.0,
-        teta_W_cold=11.2,
+        theta_W_draw=42.0,
+        theta_w_c_ref=13.5,
+        theta_w_h_ref=60.0,
+        theta_W_cold=11.2,
         mode_calc="volume_type_bui",
         building_type_B3="Residential",
         building_area=120.0,
@@ -2041,7 +2043,152 @@ def test_dhw_en12831_3_residential_energy_need_matches_annex_b_formula():
     assert dhw_result[1] == pytest.approx(expected_v_draw_m3_day)
     assert dhw_result[4] == pytest.approx(expected_q_day)
     assert dhw_result[0] == pytest.approx(expected_q_day * total_days)
+    assert len(dhw_result[6]) == total_days * 24
+    assert len(dhw_result[7]) == total_days * 24
     assert sum(dhw_result[7]) == pytest.approx(dhw_result[0])
+
+
+def test_dhw_en12831_3_direct_flow_design_power_matches_formula_18():
+    import pybuildingenergy as pybui
+
+    idx = pd.date_range("2024-01-01", periods=24, freq="h")
+    dhw = pd.Series([0.0] * 8 + [0.5, 1.0, 0.5] + [0.0] * 13, index=idx)
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "direct_flow",
+            "design_flow_l_s": 0.12,
+            "draw_temperature_C": 42.0,
+            "cold_water_temperature_C": 10.0,
+        }
+    )
+
+    result = calc.run_timeseries(pd.DataFrame({"Q_W_kWh": dhw}))
+
+    expected_phi = 0.12 * 1.0 * 4.176 * (42.0 - 10.0)
+    assert result.summary["phi_eff_nominal_kW"] == pytest.approx(expected_phi)
+    assert result.summary["design_flow_m3_h"] == pytest.approx(0.12 * 3.6)
+    assert result.summary["sizing_satisfied"] is True
+
+
+def test_dhw_en12831_3_annex_b8_standby_loss_interpolates_for_180_l():
+    import pybuildingenergy as pybui
+    from pybuildingenergy.source.DHW import _annex_b_standby_loss_kWh_d
+
+    expected = 1.35 + (180.0 - 150.0) / (200.0 - 150.0) * (1.56 - 1.35)
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "loading_storage",
+            "storage_volume_l": 180.0,
+            "nominal_power_kW": 6.0,
+        }
+    )
+
+    assert _annex_b_standby_loss_kWh_d(180.0) == pytest.approx(expected)
+    assert calc.storage_standby_loss_kWh_d == pytest.approx(expected)
+    assert calc.storage_standby_loss_source == "EN 12831-3 Annex B Table B.8"
+
+
+def test_dhw_en12831_3_explicit_standby_loss_overrides_annex_b8():
+    import pybuildingenergy as pybui
+
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "loading_storage",
+            "storage_volume_l": 180.0,
+            "standby_loss_kWh_per_day": 0.95,
+            "nominal_power_kW": 6.0,
+        }
+    )
+
+    assert calc.storage_standby_loss_kWh_d == pytest.approx(0.95)
+    assert calc.storage_standby_loss_source == "standby_loss_kWh_per_day"
+
+
+def test_dhw_en12831_3_storage_switch_points_follow_standard_formulas():
+    import pybuildingenergy as pybui
+    from pybuildingenergy.global_inputs import WATER_SPECIFIC_HEAT_CAPACITY
+
+    idx = pd.date_range("2024-01-01", periods=24, freq="h")
+    dhw = pd.Series([0.0] * 8 + [0.2, 0.4, 0.4, 0.2, 0.8, 0.3, 0.3, 0.2, 0.2] + [0.0] * 7, index=idx)
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "mixed_storage",
+            "sizing_mode": "check",
+            "storage_volume_l": 180.0,
+            "storage_height_m": 1.2,
+            "sensor_relative_height": 0.5,
+            "loading_factor": 0.96,
+            "standby_loss_kWh_per_day": 1.0,
+            "nominal_power_kW": 7.0,
+            "draw_temperature_C": 42.0,
+            "cold_water_temperature_C": 10.0,
+            "storage_max_temperature_C": 55.0,
+        }
+    )
+
+    result = calc.run_timeseries(pd.DataFrame({"Q_W_kWh": dhw}))
+    c = WATER_SPECIFIC_HEAT_CAPACITY
+    q_max = 180.0 * c * (55.0 - 10.0) * 0.96
+    q_min = 180.0 * c * (42.0 - 10.0) * 0.96 * (1.0 - 0.5 * 0.5)
+
+    assert len(result.timeseries) == 1440
+    assert result.summary["Q_sto_max_kWh"] == pytest.approx(q_max)
+    assert result.summary["Q_sto_on_kWh"] == pytest.approx(0.5 * q_max)
+    assert result.summary["Q_sto_min_kWh"] == pytest.approx(q_min)
+    assert result.summary["q_sb_sto_kWh_d"] == pytest.approx(1.0)
+    assert result.summary["q_sb_sto_source"] == "standby_loss_kWh_per_day"
+    assert result.summary["sizing_satisfied"] is True
+
+
+def test_dhw_en12831_3_size_storage_increases_insufficient_tank():
+    import pybuildingenergy as pybui
+
+    idx = pd.date_range("2024-01-01", periods=24, freq="h")
+    dhw = pd.Series([0.0] * 7 + [0.6, 1.2, 1.2, 0.8, 0.6, 1.5, 1.0, 0.8, 0.6, 0.4] + [0.0] * 7, index=idx)
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "loading_storage",
+            "sizing_mode": "size_storage",
+            "storage_volume_l": 30.0,
+            "nominal_power_kW": 0.5,
+            "draw_temperature_C": 42.0,
+            "cold_water_temperature_C": 10.0,
+            "storage_max_temperature_C": 55.0,
+            "standby_loss_kWh_per_day": 0.6,
+            "max_storage_volume_l": 500.0,
+        }
+    )
+
+    result = calc.run_timeseries(pd.DataFrame({"Q_W_kWh": dhw}))
+
+    assert result.summary["V_sto_selected_l"] > 30.0
+    assert result.summary["sizing_satisfied"] is True
+
+
+def test_dhw_en12831_3_design_sizing_aggregates_duplicate_timestamps():
+    import pybuildingenergy as pybui
+
+    idx = list(pd.date_range("2024-01-01", periods=24, freq="h"))
+    idx.insert(9, idx[9])
+    dhw = pd.Series([0.0] * len(idx), index=pd.DatetimeIndex(idx))
+    dhw.loc["2024-01-01 09:00:00"] = [0.4, 0.6]
+    dhw.loc["2024-01-01 10:00:00"] = 0.5
+    calc = pybui.DHWDesignLoadCalculator(
+        {
+            "system_type": "loading_storage",
+            "sizing_mode": "check",
+            "storage_volume_l": 180.0,
+            "nominal_power_kW": 6.0,
+            "draw_temperature_C": 42.0,
+            "cold_water_temperature_C": 10.0,
+            "storage_max_temperature_C": 55.0,
+        }
+    )
+
+    result = calc.run_timeseries(pd.DataFrame({"Q_W_kWh": dhw}))
+
+    assert len(result.timeseries) == 1440
+    assert result.summary["Q_W_design_day_kWh"] == pytest.approx(1.5)
 
 
 def test_heat_pump_example_geometry_uses_useful_area_and_footprint_consistently():
@@ -2074,6 +2221,46 @@ def test_heat_pump_example_geometry_uses_useful_area_and_footprint_consistently(
         assert (
             surfaces["West wall"]["area"] + surfaces["West glazing"]["area"]
         ) == pytest.approx(width * height)
+
+
+def test_heat_pump_example_dhw_design_uses_annex_b8_standby_loss_by_default():
+    import pybuildingenergy as pybui
+    from examples.heat_pump_15316_4_2_example import (
+        dhw_design_system_config,
+        heat_pump_maps,
+        storage_system_config,
+    )
+
+    heating_map, _ = heat_pump_maps("bolzano")
+    config = dhw_design_system_config(
+        scenario="bolzano",
+        distribution_config={"dhw": {"pipe_sections": [], "max_length_m": 0.0}},
+        storage_config=storage_system_config("bolzano"),
+        heating_map=heating_map,
+        sizing_mode="check",
+    )
+    calc = pybui.DHWDesignLoadCalculator(config)
+
+    assert "standby_loss_kWh_per_day" not in config
+    assert calc.storage_standby_loss_kWh_d == pytest.approx(1.476)
+
+
+def test_heat_pump_example_dhw_annex_b_table_b2_profiles_are_normalized():
+    from examples.heat_pump_15316_4_2_example import (
+        DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT,
+        DHW_DAY_TYPE_COLUMNS,
+        dhw_annex_b_table_b2_hourly_fractions,
+    )
+
+    for profile_key, raw_percent in DHW_ANNEX_B_TABLE_B2_VOLUME_PERCENT.items():
+        hourly_fractions = dhw_annex_b_table_b2_hourly_fractions(profile_key)
+
+        assert len(raw_percent) == 24
+        assert list(hourly_fractions.columns) == list(DHW_DAY_TYPE_COLUMNS)
+        assert len(hourly_fractions) == 24
+        assert (hourly_fractions >= 0.0).all().all()
+        for column in DHW_DAY_TYPE_COLUMNS:
+            assert hourly_fractions[column].sum() == pytest.approx(1.0)
 
 
 def test_hourly_profile_generator_accepts_weekend_alias():
