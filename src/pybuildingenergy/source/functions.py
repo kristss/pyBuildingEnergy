@@ -7,8 +7,7 @@
 # Libraries
 import numpy as np
 import pandas as pd
-from sklearn.metrics import r2_score
-from sklearn.linear_model import LinearRegression
+# sklearn imported lazily inside Simple_regeression() -- avoids ~0.6s startup cost
 # from pybuildingenergy.global_inputs import main_directory_
 from pybuildingenergy.global_inputs import main_directory_
 import pickle
@@ -389,6 +388,8 @@ def get_buildings_demos():
 
 
 def Simple_regeression(x_data: list, y_data: list, x_data_name: str):
+    from sklearn.metrics import r2_score
+    from sklearn.linear_model import LinearRegression
     """
     Simple regression between two variable
 

@@ -10,16 +10,15 @@ import datetime as dt
 import copy
 import re
 import time
-from timezonefinder import TimezoneFinder
+# timezonefinder imported lazily -- avoids ~0.7s startup cost
 from pytz import timezone
 import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
-from pvlib.iotools import epw
+# pvlib imported lazily -- avoids ~1.9s startup cost
 from .ventilation import VentilationInternalGains   
-from .generate_profile import HourlyProfileGenerator
 from .functions import *
-from .generate_profile import get_country_code_from_latlon
+# generate_profile imported lazily -- avoids ~0.8s startup cost
 from .table_iso_16798_1 import * 
 from . import table_iso_16798_1 as iso16798_profiles
 
@@ -1186,6 +1185,7 @@ class ISO52010:
     # GET DATA FROM PVGIS
     @classmethod
     def get_tmy_data_pvgis(cls, building_object) -> WeatherDataResult:
+    from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
         """
         Get Weather data from pvgis API
 
@@ -1255,6 +1255,7 @@ class ISO52010:
     # GET WEATHER DATA FROM .epw FILE
     @classmethod
     def get_tmy_data_epw(cls, path_weather_file):
+    from pvlib.iotools import epw  # lazy: avoids ~1.9s cold import
         """
         Get Wetaher data from epw file
 
@@ -4645,6 +4646,7 @@ class ISO52016:
         warmup_hours=744,
         **kwargs,
     ):
+    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Multizone hourly/annual energy-need calculation.
         This extends the multizone coupled model with profile-driven setpoints,
@@ -5643,6 +5645,7 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
+    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
@@ -7072,6 +7075,7 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
+    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
