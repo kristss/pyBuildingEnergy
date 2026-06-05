@@ -22,7 +22,12 @@ import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
 # pvlib imported lazily -- avoids ~1.9s startup cost
-from .ventilation import VentilationInternalGains   
+from .ventilation import (
+    VentilationInternalGains,
+    VentilationStream,
+    VentilationBoundary,
+    resolve_ventilation_boundary,
+)
 from .functions import *
 # generate_profile imported lazily -- avoids ~0.8s startup cost
 from .table_iso_16798_1 import * 
@@ -3798,6 +3803,9 @@ class ISO52016:
                     "mode": np.empty(Tstepn, dtype=object),
                     "Phi_int": np.empty(Tstepn, dtype=float),
                     "H_ve": np.empty(Tstepn, dtype=float),
+                    "S_ve": np.empty(Tstepn, dtype=float),
+                    "T_ve_source_eq": np.full(Tstepn, np.nan, dtype=float),
+                    "Q_ve": np.empty(Tstepn, dtype=float),
                     "H_ground": np.empty(Tstepn, dtype=float),
                     "Q_ground": np.empty(Tstepn, dtype=float),
                     "night_purge_factor": np.empty(Tstepn, dtype=float),
@@ -4131,41 +4139,49 @@ class ISO52016:
             theta_air_prev: float,
             tstep: int,
             T_out: float,
-        ) -> tuple[float, float, int]:
+        ) -> tuple:  # (VentilationBoundary, float, int)
+            _empty = VentilationBoundary(streams=())
             if not include_ventilation:
-                return 0.0, 1.0, 0
-
-            vent_type = str(zone_obj.get("ventilation_type", "none")).strip().lower()
-            if vent_type in ("none", "off", "disabled", ""):
-                return 0.0, 1.0, 0
+                return _empty, 1.0, 0
 
             zname = str(zone_obj.get("name", zone_names[0]))
             if zname not in zone_proxies:
                 zname = zone_names[0]
+
+            proxy = zone_proxies[zname]
+            vent_cfg = proxy.get("building_parameters", {}).get("ventilation", {})
+            vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()
+            has_components = "components" in vent_cfg
+
+            if not has_components and vent_type in ("none", "off", "disabled", ""):
+                return _empty, 1.0, 0
+
             ws = float(sim_df["WS10m"].iloc[tstep]) if "WS10m" in sim_df.columns else 0.0
+            profile_mult = _profile_value(zname, "ventilation_profile", tstep, 1.0)
+            zone_vol = float(
+                zone_obj.get("zone_volume_m3") or zone_obj.get("zone_volume") or 0.0
+            )
+
             try:
-                h_ve = VentilationInternalGains(zone_proxies[zname]).heat_transfer_coefficient_by_ventilation(
-                    zone_proxies[zname],
+                base_bdy = resolve_ventilation_boundary(
+                    proxy,
                     float(theta_air_prev),
                     float(T_out),
                     float(ws),
-                    type_ventilation=vent_type,
-                    flowrate_person=float(zone_obj.get("flow_rate_per_person", 0.0)),
-                    custom_Hve_k_t=float(zone_obj.get("custom_heat_transfer_coefficient_ventilation", 0.0)),
+                    profile_multiplier=profile_mult,
+                    zone_volume_m3=zone_vol if zone_vol > 0.0 else None,
                 )
-                h_ve = float(np.ravel(np.asarray(h_ve))[0])
-            except Exception:
-                h_ve = 0.0
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Zone {zname!r}: ventilation boundary resolution failed "
+                    f"(ventilation_type={vent_type!r}): {exc}"
+                ) from exc
 
-            if not np.isfinite(h_ve) or h_ve < 0.0:
-                h_ve = 0.0
-            h_ve *= _profile_value(zname, "ventilation_profile", tstep, 1.0)
             purge_factor_applied = 1.0
             purge_active = 0
 
-            # Optional summer night purge:
-            # boost ventilation when outdoor air is cooler than indoor air,
-            # within configured months/hours.
+            # Optional summer night purge: represented as an additional outdoor-air stream.
+            # H_purge = max(0, boost_factor - 1) * H_base so total equals boost_factor * H_base.
             purge_cfg = zone_obj.get("summer_night_purge", None)
             if not isinstance(purge_cfg, dict):
                 purge_cfg = (
@@ -4251,11 +4267,22 @@ class ISO52016:
 
                 if month_ok and hour_ok:
                     if float(theta_air_prev) - float(T_out) >= delta_t_min:
+                        H_base = base_bdy.heat_transfer_coefficient_w_k
+                        H_purge = max(0.0, boost_factor - 1.0) * H_base
+                        if H_purge > 0.0:
+                            purge_stream = VentilationStream(
+                                name="summer_night_purge",
+                                heat_transfer_coefficient_w_k=H_purge,
+                                source_temperature_c=float(T_out),
+                                category="outdoor_air",
+                            )
+                            base_bdy = VentilationBoundary(
+                                streams=base_bdy.streams + (purge_stream,)
+                            )
                         purge_factor_applied = float(boost_factor)
                         purge_active = 1
-                        h_ve *= purge_factor_applied
 
-            return max(0.0, float(h_ve)), purge_factor_applied, purge_active
+            return base_bdy, purge_factor_applied, purge_active
 
         def _zone_solar_transmitted_w(tstep: int) -> np.ndarray:
             phi_sol = np.zeros(Z, dtype=float)
@@ -4323,6 +4350,7 @@ class ISO52016:
             tstep: int,
             phi_int_z: np.ndarray,
             h_ve_z: np.ndarray,
+            s_ve_z: np.ndarray,
             phi_sol_z: np.ndarray,
         ):
             A = np.zeros((Ntot, Ntot), dtype=float)
@@ -4339,13 +4367,14 @@ class ISO52016:
             for zi in range(Z):
                 C_air = float(C_air_zone[zi])
                 h_ve = float(h_ve_z[zi])
+                s_ve = float(s_ve_z[zi])
                 h_tb = float(H_tb_zone[zi])
                 phi_int = float(phi_int_z[zi])
                 phi_sol_conv = float(f_sol_c) * float(phi_sol_z[zi])
 
                 A[zi, zi] += C_air / dt_s + h_ve + h_tb
                 B[zi] += (C_air / dt_s) * float(theta_prev[zi])
-                B[zi] += h_ve * T_out + h_tb * T_out
+                B[zi] += s_ve + h_tb * T_out
                 B[zi] += float(f_int_c) * phi_int + phi_sol_conv
 
             # surfaces
@@ -4508,6 +4537,7 @@ class ISO52016:
             theta_prev: np.ndarray,
             mode_vec,
             h_ve_z: np.ndarray,
+            s_ve_z: np.ndarray,
             phi_int_z: np.ndarray,
             phi_sol_z: np.ndarray,
             T_out: float,
@@ -4520,6 +4550,7 @@ class ISO52016:
                     continue
                 C = float(C_air_zone[zi])
                 h_ve = float(h_ve_z[zi])
+                s_ve = float(s_ve_z[zi])
                 h_tb = float(H_tb_zone[zi])
                 T_air = float(theta_new[zi])
                 T_prev = float(theta_prev[zi])
@@ -4533,7 +4564,7 @@ class ISO52016:
                     (C / dt_s + sum_h + h_ve + h_tb) * T_air
                     - sum_hTs
                     - (C / dt_s) * T_prev
-                    - h_ve * T_out
+                    - s_ve
                     - h_tb * T_out
                     - gains_conv
                 )
@@ -4571,13 +4602,16 @@ class ISO52016:
             T_out = float(sim_df["T2m"].iloc[t])
             phi_int_z_t = np.zeros(Z, dtype=float)
             h_ve_z_t = np.zeros(Z, dtype=float)
+            s_ve_z_t = np.zeros(Z, dtype=float)
             purge_factor_z_t = np.ones(Z, dtype=float)
             purge_active_z_t = np.zeros(Z, dtype=int)
             for zi, zone in enumerate(zones):
                 phi_int_z_t[zi] = _zone_internal_gain_w(zone, t)
-                h_ve_z_t[zi], purge_factor_z_t[zi], purge_active_z_t[zi] = _zone_ventilation_h_wk(
+                vent_bdy, purge_factor_z_t[zi], purge_active_z_t[zi] = _zone_ventilation_h_wk(
                     zone, Theta[zi], t, T_out
                 )
+                h_ve_z_t[zi] = vent_bdy.heat_transfer_coefficient_w_k
+                s_ve_z_t[zi] = vent_bdy.source_term_w
             phi_sol_z_t = _zone_solar_transmitted_w(t)
 
             # Base matrix for this timestep
@@ -4586,6 +4620,7 @@ class ISO52016:
                 t,
                 phi_int_z_t,
                 h_ve_z_t,
+                s_ve_z_t,
                 phi_sol_z_t,
             )
 
@@ -4636,6 +4671,7 @@ class ISO52016:
                 Theta,
                 mode,
                 h_ve_z_t,
+                s_ve_z_t,
                 phi_int_z_t,
                 phi_sol_z_t,
                 T_out,
@@ -4690,6 +4726,7 @@ class ISO52016:
                     Theta,
                     mode,
                     h_ve_z_t,
+                    s_ve_z_t,
                     phi_int_z_t,
                     phi_sol_z_t,
                     T_out,
@@ -4730,6 +4767,13 @@ class ISO52016:
                 zone_out["mode"][t] = mode[zi]
                 zone_out["Phi_int"][t] = float(phi_int_z_t[zi])
                 zone_out["H_ve"][t] = float(h_ve_z_t[zi])
+                zone_out["S_ve"][t] = float(s_ve_z_t[zi])
+                _h_ve_i = float(h_ve_z_t[zi])
+                _s_ve_i = float(s_ve_z_t[zi])
+                zone_out["T_ve_source_eq"][t] = (
+                    _s_ve_i / _h_ve_i if _h_ve_i > 0.0 else np.nan
+                )
+                zone_out["Q_ve"][t] = _h_ve_i * float(Theta_air_t[zi]) - _s_ve_i
                 zone_out["H_ground"][t] = float(zone_h_ground[zi]) if zi < len(zone_h_ground) else 0.0
                 zone_out["Q_ground"][t] = float(q_ground_zone_t.get(str(zone_out["name"]), 0.0))
                 zone_out["night_purge_factor"][t] = float(purge_factor_z_t[zi])
@@ -4770,6 +4814,9 @@ class ISO52016:
             out_data[f"mode_{name}"] = zone_out["mode"]
             out_data[f"Phi_int_{name}"] = zone_out["Phi_int"]
             out_data[f"H_ve_{name}"] = zone_out["H_ve"]
+            out_data[f"S_ve_{name}"] = zone_out["S_ve"]
+            out_data[f"T_ve_source_eq_{name}"] = zone_out["T_ve_source_eq"]
+            out_data[f"Q_ve_{name}"] = zone_out["Q_ve"]
             out_data[f"H_ground_{name}"] = zone_out["H_ground"]
             out_data[f"Q_ground_{name}"] = zone_out["Q_ground"]
             out_data[f"night_purge_factor_{name}"] = zone_out["night_purge_factor"]
@@ -6611,17 +6658,15 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
-                        type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
-                        custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
-                    # sanifica
-                    if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
-                        H_ve_nat_hour = 0.0
-
-                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
-                    if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
-                        H_ve_nat = 0.0
+                    _vent_bdy = resolve_ventilation_boundary(
+                        building_object,
+                        float(Theta_old[ri]),
+                        float(sim_df.iloc[Tstepi]["T2m"]),
+                        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
+                        profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                    )
+                    H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
+                    S_ve_nat = _vent_bdy.source_term_w
                     H_ve_nat_all.append(H_ve_nat)
                     
                     
@@ -6699,8 +6744,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
-                        + H_ve_nat * T2m_arr[Tstepi]
+                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
+                        + S_ve_nat
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -7045,10 +7090,10 @@ class ISO52016:
                     if   phi_hc > 0: E_heating_Wh +=  phi_hc * dt_h
                     elif phi_hc < 0: E_cooling_Wh += (-phi_hc) * dt_h
 
-                    # 4) Ventilation
+                    # 4) Ventilation: Q_ve = H_ve * T_in - S_ve (positive = heat leaving zone)
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = T2m_arr[Tstepi]
-                    q_vent = float(H_ve_nat) * (T_in - T_out)
+                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    q_vent = float(H_ve_nat) * T_in - float(S_ve_nat)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
 
@@ -8101,17 +8146,15 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
-                        type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
-                        custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
-                    # sanifica
-                    if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
-                        H_ve_nat_hour = 0.0
-
-                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
-                    if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
-                        H_ve_nat = 0.0
+                    _vent_bdy = resolve_ventilation_boundary(
+                        building_object,
+                        float(Theta_old[ri]),
+                        float(sim_df.iloc[Tstepi]["T2m"]),
+                        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
+                        profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
+                    )
+                    H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
+                    S_ve_nat = _vent_bdy.source_term_w
                     H_ve_nat_all.append(H_ve_nat)
                     
                     
@@ -8189,8 +8232,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
-                        + H_ve_nat * T2m_arr[Tstepi]
+                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
+                        + S_ve_nat
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -8572,10 +8615,10 @@ class ISO52016:
                     if   phi_hc > 0: E_heating_Wh +=  phi_hc * dt_h
                     elif phi_hc < 0: E_cooling_Wh += (-phi_hc) * dt_h
 
-                    # 4) Ventilation
+                    # 4) Ventilation: Q_ve = H_ve * T_in - S_ve (positive = heat leaving zone)
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = T2m_arr[Tstepi]
-                    q_vent = float(H_ve_nat) * (T_in - T_out)
+                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    q_vent = float(H_ve_nat) * T_in - float(S_ve_nat)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
 
