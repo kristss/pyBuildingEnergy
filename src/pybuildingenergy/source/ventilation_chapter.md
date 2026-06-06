@@ -76,7 +76,7 @@ This makes the method resilient to different calling conventions. It reduces boi
 
 ### 3.3 The `temp_wind` model
 
-When `type_ventilation == "temp_wind"`, the method evaluates a natural ventilation formulation based on the combined effect of wind and stack pressure, following the ISO 16798-7 logic documented in the source comments.
+When `type_ventilation == "temp_wind"`, the method evaluates a natural ventilation formulation based on the combined effect of wind and stack pressure, following the EN 16798-7 logic documented in the source comments.
 
 The implementation:
 

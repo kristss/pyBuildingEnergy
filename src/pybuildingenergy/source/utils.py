@@ -112,6 +112,25 @@ class h_natural_vent:
     H_ve_nat: np.array
 
 
+def _make_sched_resolver(kwargs, iso16798_profiles_obj):
+    """Return a schedule-kwarg resolver that handles explicit None correctly.
+
+    ``kwargs.get(key, default)`` only returns *default* when the key is absent;
+    it returns ``None`` when the caller passes the key explicitly as ``None``
+    (e.g. the multizone hybrid caller always passes ``occupants_schedule_workdays=None``).
+    Using an explicit ``is None`` check avoids this and also avoids the ``v or default``
+    anti-pattern, which silently replaces falsey-but-valid inputs such as ``{}`` and
+    raises ``ValueError`` for array-like inputs whose truth value is ambiguous.
+    """
+    def _sched(key, attr):
+        v = kwargs.get(key)
+        return (
+            getattr(iso16798_profiles_obj, attr, {"Residential_apartment": [1.0] * 24})
+            if v is None else v
+        )
+    return _sched
+
+
 def _infer_timestep_hours_from_index(index, default=1.0):
     """
     Infer representative timestep duration [h] from an index.
@@ -2546,12 +2565,7 @@ class ISO52016:
         # GET MIN, MAX AND MEAN of External temperature values at monthly(M) resolution
         path_weather_file_ = kwargs.get("path_weather_file")
         weather_source = kwargs.get("weather_source", "pvgis")
-        if kwargs.get("_precomputed_sim_df") is not None:
-            sim_df = kwargs["_precomputed_sim_df"].copy()
-            sim_df.index = pd.DatetimeIndex(sim_df.index)
-            sim_df = sim_df.sort_index()
-        else:
-            sim_df = Calculation_ISO_52010(building_object, path_weather_file_, weather_source=weather_source).sim_df
+        sim_df = Calculation_ISO_52010(building_object, path_weather_file_, weather_source=weather_source).sim_df
 
         try:
             external_temperature_monthly_averages = sim_df["T2m"].resample("ME").mean()
@@ -3225,7 +3239,6 @@ class ISO52016:
         external_emissivity_default=None,
         progress_log_every_steps=None,
         progress_logger=None,
-        _precomputed_sim_df=None,
     ):
         """
         Multizone envelope simulation with coupled internal partitions and ideal HVAC.
@@ -3276,19 +3289,13 @@ class ISO52016:
         # ------------------------
         # 0) Weather
         # ------------------------
-        if _precomputed_sim_df is not None:
-            sim_df = _precomputed_sim_df.copy()
-            sim_df.index = pd.DatetimeIndex(sim_df.index)
-            sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
-            sim_df = sim_df.sort_index()
-        else:
-            sim_df = cls().Weather_data_bui(
-                building_object, path_weather_file, weather_source=weather_source
-            ).simulation_df
-            sim_df = sim_df.copy()
-            sim_df.index = pd.DatetimeIndex(sim_df.index)
-            sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
-            sim_df = sim_df.sort_index()
+        sim_df = cls().Weather_data_bui(
+            building_object, path_weather_file, weather_source=weather_source
+        ).simulation_df
+        sim_df = sim_df.copy()
+        sim_df.index = pd.DatetimeIndex(sim_df.index)
+        sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
+        sim_df = sim_df.sort_index()
 
         # ------------------------
         # 0.1) Time profiles (occupancy/heating/cooling/ventilation)
@@ -5108,16 +5115,23 @@ class ISO52016:
         if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
             vent["components"] = _zone_vent_obj["components"]
 
-        # Zone-specific schedule profiles: copy from zone dict into building_parameters
-        # so the legacy profile generator uses per-zone schedules, not global ones.
-        # Matches what multizone V1 does at zone_profile_bui construction.
-        for _pkey in ("ventilation_profile", "heating_profile", "cooling_profile",
-                      "occupancy_profile", "appliances_profile", "lighting_profile"):
+        # Forward zone-level ventilation/heating/cooling profiles when present.
+        # The legacy profile generator reads these top-level building_parameters
+        # keys; occupancy/appliances/lighting go through internal_gains instead.
+        for _pkey in ("ventilation_profile", "heating_profile", "cooling_profile"):
             _zone_prof = zone.get(_pkey)
             if _zone_prof is not None:
                 bp[_pkey] = copy.deepcopy(_zone_prof)
 
-        bp.setdefault("internal_gains", copy.deepcopy(building_object.get("building_parameters", {}).get("internal_gains", [])))
+        # Forward zone-level internal_gains (occupancy/appliances/lighting
+        # schedules) when present.  Direct assignment is required because bp is
+        # already deep-copied from global building_parameters, so setdefault()
+        # would be a no-op when the global already has the key.
+        _zone_gains = zone.get("internal_gains")
+        _global_gains = building_object.get("building_parameters", {}).get("internal_gains", [])
+        bp["internal_gains"] = copy.deepcopy(
+            _zone_gains if _zone_gains is not None else _global_gains
+        )
 
         return bui
 
@@ -6002,54 +6016,14 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
-        occupants_schedule_workdays = kwargs.get(
-            "occupants_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        occupants_schedule_weekend = kwargs.get(
-            "occupants_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_workdays = kwargs.get(
-            "appliances_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_weekend = kwargs.get(
-            "appliances_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_workdays = kwargs.get(
-            "lighting_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_weekend = kwargs.get(
-            "lighting_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
+        _sched = _make_sched_resolver(kwargs, iso16798_profiles)
+        occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
+        appliances_schedule_workdays = _sched("appliances_schedule_workdays", "appliances_schedule_workdays")
+        appliances_schedule_weekend = _sched("appliances_schedule_weekend", "appliances_schedule_weekend")
+        lighting_schedule_workdays = _sched("lighting_schedule_workdays", "lighting_schedule_workdays")
+        lighting_schedule_weekend = _sched("lighting_schedule_weekend", "lighting_schedule_weekend")
+
         h_ci_model = _resolve_internal_convection_model(
             building_object,
             kwargs.get("internal_convection_model", None),
@@ -6073,17 +6047,9 @@ class ISO52016:
 
             # INIZIALIZATION
             path_weather_file_ = kwargs.get("path_weather_file", None)
-            if kwargs.get("_precomputed_sim_df") is not None:
-                # Test bypass: skip EPW loading. Remove before upstreaming.
-                sim_df = kwargs["_precomputed_sim_df"].copy()
-                sim_df.index = pd.DatetimeIndex(sim_df.index)
-                sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
-                sim_df = sim_df.sort_index()
-            elif kwargs["weather_source"] == "pvgis":
+            if kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
-                sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
-            else:
-                sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
+            sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation
 
             # Heating and cooling Load
@@ -6410,8 +6376,6 @@ class ISO52016:
             # Temperature ground and thermal bridges
             _tth_kw = {"path_weather_file": path_weather_file_,
                         "weather_source": kwargs["weather_source"]}
-            if kwargs.get("_precomputed_sim_df") is not None:
-                _tth_kw["_precomputed_sim_df"] = kwargs["_precomputed_sim_df"]
             t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
@@ -6473,7 +6437,7 @@ class ISO52016:
         except Exception:
             country_calendar = "IT"
         gen = HourlyProfileGenerator(country=country_calendar, num_months=13, category_profiles=category_profiles)
-        profile_df = gen.generate()      
+        profile_df = gen.generate()
 
         def _has_energy(arrlike):
             a = np.asarray(arrlike, dtype=float)
@@ -7375,7 +7339,13 @@ class ISO52016:
         hourly_results["T_air"] = _t_air_arr
         hourly_results["H_ve"] = _h_ve_arr
         hourly_results["S_ve"] = _s_ve_arr
-        _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
+        _t_eq = np.full_like(_h_ve_arr, np.nan, dtype=float)
+        np.divide(
+            _s_ve_arr,
+            _h_ve_arr,
+            out=_t_eq,
+            where=_h_ve_arr > 0.0,
+        )
         hourly_results["T_ve_source_eq"] = _t_eq
         hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
 
@@ -7493,54 +7463,14 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
-        occupants_schedule_workdays = kwargs.get(
-            "occupants_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        occupants_schedule_weekend = kwargs.get(
-            "occupants_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_workdays = kwargs.get(
-            "appliances_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_weekend = kwargs.get(
-            "appliances_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_workdays = kwargs.get(
-            "lighting_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_weekend = kwargs.get(
-            "lighting_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
+        _sched = _make_sched_resolver(kwargs, iso16798_profiles)
+        occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
+        appliances_schedule_workdays = _sched("appliances_schedule_workdays", "appliances_schedule_workdays")
+        appliances_schedule_weekend = _sched("appliances_schedule_weekend", "appliances_schedule_weekend")
+        lighting_schedule_workdays = _sched("lighting_schedule_workdays", "lighting_schedule_workdays")
+        lighting_schedule_weekend = _sched("lighting_schedule_weekend", "lighting_schedule_weekend")
+
         external_heating_power_fn = kwargs.get("external_heating_power_fn", None)
         if external_heating_power_fn is not None and not callable(external_heating_power_fn):
             raise TypeError("external_heating_power_fn must be callable or None.")
@@ -7572,13 +7502,7 @@ class ISO52016:
 
             # INIZIALIZATION
             path_weather_file_ = kwargs.get("path_weather_file", None)
-            if kwargs.get("_precomputed_sim_df") is not None:
-                # Test bypass: skip EPW loading. Remove before upstreaming.
-                sim_df = kwargs["_precomputed_sim_df"].copy()
-                sim_df.index = pd.DatetimeIndex(sim_df.index)
-                sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
-                sim_df = sim_df.sort_index()
-            elif kwargs["weather_source"] == "pvgis":
+            if kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
 
             elif kwargs["weather_source"] == "epw":
@@ -7586,6 +7510,7 @@ class ISO52016:
 
             elif kwargs["weather_source"] == "climatedata":
                 path_weather_file_ = None
+
 
             sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation
@@ -7915,8 +7840,6 @@ class ISO52016:
             # Temperature ground and thermal bridges
             _tth_kw = {"path_weather_file": path_weather_file_,
                         "weather_source": kwargs["weather_source"]}
-            if kwargs.get("_precomputed_sim_df") is not None:
-                _tth_kw["_precomputed_sim_df"] = kwargs["_precomputed_sim_df"]
             t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
@@ -7978,7 +7901,7 @@ class ISO52016:
         except Exception:
             country_calendar = "IT"
         gen = HourlyProfileGenerator(country=country_calendar, num_months=13, category_profiles=category_profiles)
-        profile_df = gen.generate()      
+        profile_df = gen.generate()
 
         def _has_energy(arrlike):
             a = np.asarray(arrlike, dtype=float)
@@ -8970,7 +8893,13 @@ class ISO52016:
         hourly_results["T_air"] = _t_air_arr
         hourly_results["H_ve"] = _h_ve_arr
         hourly_results["S_ve"] = _s_ve_arr
-        _t_eq = np.where(_h_ve_arr > 0.0, _s_ve_arr / _h_ve_arr, np.nan)
+        _t_eq = np.full_like(_h_ve_arr, np.nan, dtype=float)
+        np.divide(
+            _s_ve_arr,
+            _h_ve_arr,
+            out=_t_eq,
+            where=_h_ve_arr > 0.0,
+        )
         hourly_results["T_ve_source_eq"] = _t_eq
         hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
 

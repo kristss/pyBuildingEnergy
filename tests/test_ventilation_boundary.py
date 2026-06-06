@@ -8,6 +8,13 @@ Solver identity tests verify that H_ve * T_zone - S_ve equals the physical heat 
 """
 
 import pytest
+import numpy as np
+import pandas as pd
+from contextlib import contextmanager
+from unittest.mock import patch, MagicMock
+
+from pybuildingenergy.source.utils import ISO52016, _make_sched_resolver
+from pybuildingenergy.source.generate_profile import HourlyProfileGenerator
 from pybuildingenergy.source.ventilation import (
     VentilationStream,
     VentilationBoundary,
@@ -613,12 +620,53 @@ class TestResolveVentilationBoundary:
 
 
 # ---------------------------------------------------------------------------
-# Solver integration tests
+# _make_sched_resolver unit tests
 # ---------------------------------------------------------------------------
 
-import pandas as pd
-import numpy as np
-from pybuildingenergy.source.utils import ISO52016
+class TestSchedResolver:
+    """Direct unit tests for _make_sched_resolver.
+
+    These tests prove the resolver's three required properties without running
+    the full solver:
+      1. An absent key returns the iso16798_profiles attribute default.
+      2. An explicit None returns the default (not None itself).
+      3. A falsey-but-valid value such as {} is returned unchanged (not replaced
+         by the default as the old ``v or default`` pattern would have done).
+      4. A numpy array is returned unchanged (``v or default`` raises ValueError
+         on arrays with more than one element due to ambiguous truth value).
+    """
+
+    def _resolver(self, kwargs, profile_attr_value="default_value"):
+        """Build a resolver backed by a mock iso16798_profiles object."""
+        mock_profiles = MagicMock()
+        mock_profiles.occupants_schedule_workdays = profile_attr_value
+        return _make_sched_resolver(kwargs, mock_profiles)
+
+    def test_absent_key_returns_attribute_default(self):
+        sched = self._resolver({}, profile_attr_value="from_profiles")
+        assert sched("occupants_schedule_workdays", "occupants_schedule_workdays") == "from_profiles"
+
+    def test_explicit_none_returns_attribute_default(self):
+        sched = self._resolver({"occupants_schedule_workdays": None}, profile_attr_value="from_profiles")
+        assert sched("occupants_schedule_workdays", "occupants_schedule_workdays") == "from_profiles"
+
+    def test_empty_dict_returned_unchanged(self):
+        """An empty dict is falsey; the old ``v or default`` would silently replace it."""
+        sched = self._resolver({"occupants_schedule_workdays": {}}, profile_attr_value="from_profiles")
+        result = sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        assert result == {}, f"Empty dict must be returned as-is, got {result!r}"
+
+    def test_numpy_array_returned_unchanged(self):
+        """``v or default`` raises ValueError for multi-element arrays; is-None check does not."""
+        arr = np.array([0.5] * 24)
+        sched = self._resolver({"occupants_schedule_workdays": arr}, profile_attr_value="from_profiles")
+        result = sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        np.testing.assert_array_equal(result, arr)
+
+
+# ---------------------------------------------------------------------------
+# Solver integration tests
+# ---------------------------------------------------------------------------
 
 
 def _minimal_sim_df(n=8760, t_out=-5.0):
@@ -637,6 +685,56 @@ def _minimal_sim_df(n=8760, t_out=-5.0):
         df[f"I_sol_dir_w_{_ori}"] = 0.0
         df[f"I_sol_tot_{_ori}"] = 0.0
     return df
+
+
+def _minimal_profile_df(n, extra_columns=None):
+    """Return a minimal profile DataFrame with all standard solver columns set to 1.0.
+
+    Pass extra_columns as {name: array_like} to add custom component-schedule columns.
+    All standard profiles are 1.0 (fully active) so only the injected schedule drives
+    component on/off behaviour.
+    """
+    df = pd.DataFrame({
+        "ventilation_profile": np.ones(n),
+        "heating_profile": np.ones(n),
+        "cooling_profile": np.ones(n),
+        "occupancy_profile": np.ones(n),
+        "appliances_profile": np.ones(n),
+        "lighting_profile": np.ones(n),
+    })
+    if extra_columns:
+        for col, values in extra_columns.items():
+            df[col] = np.asarray(values, dtype=float)
+    return df
+
+
+@contextmanager
+def _patched_weather(n=48, t_out=-5.0):
+    """Patch ISO52016.Weather_data_bui and Calculation_ISO_52010 to return minimal sim_df.
+
+    Replaces EPW loading in all three solver paths (multizone, legacy, causal) and in
+    Temp_calculation_of_ground without modifying production code.
+    """
+    sim_df = _minimal_sim_df(n, t_out)
+    mock_wb = MagicMock()
+    mock_wb.simulation_df = sim_df
+    mock_ci = MagicMock()
+    mock_ci.sim_df = sim_df
+    with patch.object(ISO52016, 'Weather_data_bui', return_value=mock_wb), \
+         patch('pybuildingenergy.source.utils.Calculation_ISO_52010', return_value=mock_ci):
+        yield sim_df
+
+
+@contextmanager
+def _patched_profiles(profile_df):
+    """Patch HourlyProfileGenerator.generate to return a fresh copy of profile_df.
+
+    Uses side_effect rather than return_value so each call to gen.generate() gets
+    an independent copy.  This prevents cross-call mutation when the hybrid solver
+    calls the profile generator multiple times across iterations.
+    """
+    with patch.object(HourlyProfileGenerator, 'generate', side_effect=lambda: profile_df.copy()):
+        yield profile_df
 
 
 def _adiabatic_surface(zone_name, area=100.0):
@@ -703,12 +801,11 @@ class TestSolverIntegration:
     """Verify that the affine boundary reaches the ISO52016 multizone solver."""
 
     def _run(self, building, n=48, t_out=-5.0, use_profiles=False):
-        sim_df = _minimal_sim_df(n, t_out)
-        return ISO52016.simulate_envelope_multizone_free_floating(
-            building_object=building,
-            _precomputed_sim_df=sim_df,
-            use_profiles=use_profiles,
-        )
+        with _patched_weather(n, t_out):
+            return ISO52016.simulate_envelope_multizone_free_floating(
+                building_object=building,
+                use_profiles=use_profiles,
+            )
 
     def test_legacy_custom_h_ve_appears_in_output(self):
         """H_ve column must equal the configured custom H_ve for all timesteps."""
@@ -849,14 +946,104 @@ class TestSolverIntegration:
             "enabled": True, "boost_factor": 3.0,
             "months": [6, 8], "hours": [22, 6], "delta_t_min": 0.0,
         }
-        sim_df = _minimal_sim_df(n=48, t_out=t_out)
-        out = ISO52016.simulate_envelope_multizone_free_floating(
-            building_object=bld, _precomputed_sim_df=sim_df
-        )
+        with _patched_weather(n=48, t_out=t_out):
+            out = ISO52016.simulate_envelope_multizone_free_floating(building_object=bld)
         h_ve = out["H_ve_zone1"].to_numpy()
         s_ve = out["S_ve_zone1"].to_numpy()
         # All streams (base + purge) are outdoor-air, so S_ve == H_ve * T_out
         np.testing.assert_allclose(s_ve, h_ve * t_out, rtol=1e-6)
+
+    def test_purge_h_ve_equals_boost_factor_times_base(self):
+        """When purge is active H_ve = boost_factor * H_base and S_ve = H_ve * T_out.
+
+        Uses months=[1,12] and equal hour_start/hour_end (full-day active) so the
+        purge activates on the January timestamps in _minimal_sim_df.  Tests the
+        PLAN.md item 'purge case: total H_ve unchanged vs all-outdoor pre-purge
+        baseline' — the affine sum must equal boost_factor * H_base, not just H_base.
+        """
+        h_base = 200.0
+        boost = 2.0
+        t_out = -5.0
+
+        bld = _one_zone_building(custom_h_ve=h_base)
+        bld["zones"][0]["summer_night_purge"] = {
+            "enabled": True, "boost_factor": boost,
+            "months": [1, 12],   # all year
+            "hours": [0, 0],     # equal start/end → full-day active
+            "delta_t_min": 0.5,
+        }
+        # use_profiles=False keeps ventilation_profile=1 so H_base is unscaled.
+        # With profiles on, the profile multiplier would scale H_base before the
+        # purge boost applies, making H_total vary with the hour-of-day schedule.
+        out = self._run(bld, n=24, t_out=t_out, use_profiles=False)
+        h_ve = out["H_ve_zone1"].to_numpy()
+        s_ve = out["S_ve_zone1"].to_numpy()
+
+        # From step 2: HVAC holds zone at ~21 °C; T_zone - T_out ≈ 26 °C >> 0.5
+        np.testing.assert_allclose(
+            h_ve[2:], h_base * boost, rtol=1e-4,
+            err_msg="Active purge must give H_ve = boost_factor * H_base",
+        )
+        np.testing.assert_allclose(
+            s_ve[2:], h_ve[2:] * t_out, rtol=1e-4,
+            err_msg="All purge streams are outdoor-air: S_ve must equal H_ve * T_out",
+        )
+
+    def test_q_hvac_analytical_conditioned_supply(self):
+        """Q_HVAC difference between supply and outdoor cases equals H_ve*(T_sup-T_out).
+
+        Two otherwise identical zones differ only in ventilation source temperature:
+          - Case A: prescribed supply at T_sup (S_ve = H_ve * T_sup)
+          - Case B: outdoor air at T_out     (S_ve = H_ve * T_out)
+
+        At any given zone temperature T_zone, the HVAC backsolve gives:
+          Q_A = (…) - H_ve * T_sup   (S_ve = H_ve * T_sup)
+          Q_B = (…) - H_ve * T_out   (S_ve = H_ve * T_out)
+          ΔQ  = Q_B - Q_A = H_ve * (T_sup - T_out)
+
+        Surface coupling, thermal mass, and every other term appear identically in
+        both cases and cancel in the difference.  The identity is exact from step 2
+        onward (both zones at the same steady T_sp).
+
+        This test would fail if S_ve were replaced by H_ve * T_out in the backsolve,
+        because then Q_A = Q_B and ΔQ = 0.
+        """
+        h = 400.0
+        t_sup = 18.0
+        t_out = -5.0
+        expected_delta_q = h * (t_sup - t_out)  # 9200 W
+
+        bld_supply = _one_zone_building(
+            components=[{
+                "name": "mech",
+                "ventilation_type": "prescribed",
+                "heat_transfer_coefficient_w_k": h,
+                "source_temperature_c": t_sup,
+            }]
+        )
+        bld_outdoor = _one_zone_building(custom_h_ve=h)
+
+        out_a = self._run(bld_supply, n=24, t_out=t_out, use_profiles=False)
+        out_b = self._run(bld_outdoor, n=24, t_out=t_out, use_profiles=False)
+
+        q_a = out_a["Q_HVAC_zone1"].to_numpy()
+        q_b = out_b["Q_HVAC_zone1"].to_numpy()
+
+        # Both zones must be in heating mode for the identity to hold.
+        # If one zone is in a different mode the difference cannot equal ΔQ.
+        mode_a = out_a["mode_zone1"].to_numpy()
+        mode_b = out_b["mode_zone1"].to_numpy()
+        assert (mode_a[2:] == "H").all(), "Supply case must be in heating mode from step 2"
+        assert (mode_b[2:] == "H").all(), "Outdoor case must be in heating mode from step 2"
+
+        # From step 2 both zones are at steady setpoint; surface/mass terms cancel.
+        np.testing.assert_allclose(
+            q_b[2:] - q_a[2:], expected_delta_q, rtol=1e-4,
+            err_msg=(
+                f"Q_HVAC difference must equal H*(T_sup-T_out)={expected_delta_q:.0f} W; "
+                "a mismatch means S_ve is not entering the HVAC backsolve"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +1099,88 @@ class TestCrossSolverRegressions:
         stored = bui["building"].get("zone_volume_m3")
         assert stored is None or stored != pytest.approx(9999.0), (
             f"Global volume must not be promoted to zone; got {stored}"
+        )
+
+    def _hybrid_bld_with_profiles(self, zone_extras=None, global_gains=None, zone_gains=None):
+        """Hybrid building dict with optional per-zone and global profile overrides."""
+        zone = {
+            "name": "zone_a",
+            "net_floor_area": 100.0,
+            "heating_setpoint": 21.0, "heating_setback": 15.0,
+            "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+        }
+        if zone_extras:
+            zone.update(zone_extras)
+        if zone_gains is not None:
+            zone["internal_gains"] = zone_gains
+
+        bp = {
+            "ventilation": {"ventilation_type": "custom",
+                            "custom_heat_transfer_coefficient_ventilation": 0.0,
+                            "flow_rate_per_person": 0.0},
+            "temperature_setpoints": {},
+        }
+        if global_gains is not None:
+            bp["internal_gains"] = global_gains
+
+        return {
+            "building": {
+                "net_floor_area": 200.0,
+                "building_type_class": "Residential_apartment",
+                "adj_zones_present": False,
+                "construction_class": "class_i",
+            },
+            "building_parameters": bp,
+            "building_surface": [_adiabatic_surface("zone_a")],
+            "zones": [zone],
+        }
+
+    def test_hybrid_zone_internal_gains_replace_global(self):
+        """Zone internal_gains must override global gains in the hybrid bui."""
+        global_gains = [{"name": "occupants",
+                         "weekday": [1.0] * 24, "weekend": [1.0] * 24}]
+        zone_gains = [{"name": "occupants",
+                       "weekday": [0.2] * 24, "weekend": [0.2] * 24}]
+        bui = ISO52016._build_single_zone_building_object_for_core(
+            self._hybrid_bld_with_profiles(global_gains=global_gains, zone_gains=zone_gains),
+            "zone_a",
+        )
+        result_gains = bui["building_parameters"].get("internal_gains", [])
+        occ = next((g for g in result_gains if g.get("name") == "occupants"), None)
+        assert occ is not None, "internal_gains must contain 'occupants' entry"
+        assert occ["weekday"][0] == pytest.approx(0.2), (
+            f"Zone occupants weekday[0] must be 0.2 (zone value), got {occ['weekday'][0]}"
+        )
+
+    def test_hybrid_global_internal_gains_used_when_zone_absent(self):
+        """Global internal_gains must reach the hybrid bui when the zone has none."""
+        global_gains = [{"name": "occupants",
+                         "weekday": [0.7] * 24, "weekend": [0.7] * 24}]
+        bui = ISO52016._build_single_zone_building_object_for_core(
+            self._hybrid_bld_with_profiles(global_gains=global_gains),
+            "zone_a",
+        )
+        result_gains = bui["building_parameters"].get("internal_gains", [])
+        occ = next((g for g in result_gains if g.get("name") == "occupants"), None)
+        assert occ is not None, "internal_gains must contain 'occupants' entry"
+        assert occ["weekday"][0] == pytest.approx(0.7), (
+            f"Global occupants weekday[0] must be 0.7, got {occ['weekday'][0]}"
+        )
+
+    @pytest.mark.parametrize("profile_key", [
+        "ventilation_profile", "heating_profile", "cooling_profile",
+    ])
+    def test_hybrid_zone_profile_replaces_global(self, profile_key):
+        """Zone ventilation/heating/cooling profile must override the global value."""
+        global_prof = [0.9] * 24
+        zone_prof = [0.3] * 24
+        bld = self._hybrid_bld_with_profiles(zone_extras={profile_key: zone_prof})
+        bld["building_parameters"][profile_key] = global_prof
+        bui = ISO52016._build_single_zone_building_object_for_core(bld, "zone_a")
+        stored = bui["building_parameters"].get(profile_key)
+        assert stored is not None, f"{profile_key} must be present after hybrid build"
+        assert stored[0] == pytest.approx(0.3), (
+            f"Zone {profile_key}[0] must be 0.3 (zone value), got {stored[0]}"
         )
 
     # ------------------------------------------------------------------
@@ -985,14 +1254,13 @@ class TestCrossSolverRegressions:
         }
         # Update zone proxy so the component is picked up
         bld["building_parameters"]["ventilation"] = {}
-        sim_df = _minimal_sim_df(n=4)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            ISO52016.simulate_envelope_multizone_free_floating(
-                building_object=bld,
-                _precomputed_sim_df=sim_df,
-                use_profiles=False,
-            )
+            with _patched_weather(n=4):
+                ISO52016.simulate_envelope_multizone_free_floating(
+                    building_object=bld,
+                    use_profiles=False,
+                )
         assert any("nonexistent_column" in str(w.message) for w in caught), (
             "Expected a warning about the unknown profile column"
         )
@@ -1058,20 +1326,23 @@ def _legacy_building(components, zone_vol=300.0):
     }
 
 
-def _run_legacy(building, n=48, t_out=-5.0):
-    """Run the legacy single-zone solver with a precomputed sim_df.
+def _run_legacy(building, n=48, t_out=-5.0, profile_df=None):
+    """Run the legacy single-zone solver with patched weather and optional profile.
 
-    warmup_hours=0 is required because the precomputed sim_df is short
+    warmup_hours=0 is required because the minimal sim_df is short
     (n << 744); without it Tstep_first_act == Tstepn and all output is empty.
+
+    Pass profile_df to inject a controlled profile DataFrame and test
+    component-schedule behaviour deterministically.
     """
-    sim_df = _minimal_sim_df(n, t_out)
-    result = ISO52016.Temperature_and_Energy_needs_calculation(
-        building,
-        _precomputed_sim_df=sim_df,
-        weather_source="epw",
-        path_weather_file=None,
-        warmup_hours=0,
-    )
+    pf = profile_df if profile_df is not None else _minimal_profile_df(n)
+    with _patched_weather(n, t_out), _patched_profiles(pf):
+        result = ISO52016.Temperature_and_Energy_needs_calculation(
+            building,
+            weather_source="epw",
+            path_weather_file=None,
+            warmup_hours=0,
+        )
     # Returns (hourly, annual, sankey); we want hourly
     return result[0] if isinstance(result, tuple) else result
 
@@ -1109,18 +1380,23 @@ class TestLegacyCausalSolverPaths:
             err_msg="S_ve must equal H_ve * T_supply for a prescribed non-outdoor component",
         )
 
-    def test_legacy_component_schedule_unit(self):
-        """_comp_mult_leg at utils.py ~6515 builds component_multipliers correctly.
+    def test_legacy_mixed_profile_end_to_end(self):
+        """Legacy solver end-to-end: AHU schedule toggles H_ve between two states.
 
-        Simulates the exact logic the legacy/causal path executes with a controlled
-        profile_df containing a mixed ventilation_profile (not all-zero, since
-        all-zero gets replaced with occupancy at utils.py ~6290).  Verifies that
-        a component with "profile": "ventilation_profile" is scaled by the
-        profile value while one without a profile key stays at 1.0.
+        Runs the actual solver with an injected profile DataFrame so that the
+        standard 'ventilation_profile' column alternates 1/0/1/0 over four
+        timesteps.  Infiltration has no profile key and must stay at full
+        capacity in every step.
+
+        This test would fail if the _comp_mult_leg extraction in utils.py were
+        removed, because it calls the real solver rather than resolving the
+        boundary directly.
         """
         rho, cp, ach, vol = 1.204, 1006.0, 0.015, 300.0
         h_inf = rho * cp * ach * vol / 3600.0
         h_ahu = 400.0
+        n = 4
+        ahu_sched = [1.0, 0.0, 1.0, 0.0]
 
         bld = _legacy_building([
             {"name": "infiltration", "ventilation_type": "constant_ach",
@@ -1130,79 +1406,14 @@ class TestLegacyCausalSolverPaths:
              "profile": "ventilation_profile"},
         ], zone_vol=vol)
 
-        vent_cfg = bld["building_parameters"]["ventilation"]
-        t_out = -5.0
+        profile_df = _minimal_profile_df(n, extra_columns={"ventilation_profile": ahu_sched})
+        out = _run_legacy(bld, n=n, profile_df=profile_df)
 
-        for prof_val, expected_h_ahu in [(1.0, h_ahu), (0.5, h_ahu * 0.5), (0.0, 0.0)]:
-            # Build profile_df with the given ventilation_profile value at t=0
-            profile_df = pd.DataFrame({"ventilation_profile": [prof_val]})
-
-            # Simulate the _comp_mult_leg building code (utils.py ~6515-6540)
-            comp_mult: dict = {}
-            for comp in vent_cfg.get("components", []):
-                cname = str(comp.get("name", "")).strip()
-                cprof = comp.get("profile")
-                if cname and cprof is not None:
-                    col = str(cprof)
-                    if col in profile_df.columns:
-                        comp_mult[cname] = float(profile_df[col].iloc[0])
-
-            bdy = resolve_ventilation_boundary(
-                bld, 21.0, t_out, 0.0,
-                profile_multiplier=prof_val,          # legacy stream multiplier
-                component_multipliers=comp_mult or None,
-                zone_volume_m3=vol,
-            )
-
-            h_total = bdy.heat_transfer_coefficient_w_k
-            # Infiltration must always be at full capacity (no profile key)
-            inf_h = sum(
-                s.heat_transfer_coefficient_w_k for s in bdy.streams
-                if s.name == "infiltration"
-            )
-            assert inf_h == pytest.approx(h_inf, rel=1e-4), (
-                f"prof_val={prof_val}: infiltration H_k should be {h_inf:.4f}, got {inf_h:.4f}"
-            )
-            # AHU must be scaled by the profile value
-            ahu_h = sum(
-                s.heat_transfer_coefficient_w_k for s in bdy.streams
-                if s.name == "ahu"
-            )
-            assert ahu_h == pytest.approx(expected_h_ahu, rel=1e-4 if prof_val > 0 else 1e-9), (
-                f"prof_val={prof_val}: AHU H_k should be {expected_h_ahu:.4f}, got {ahu_h:.4f}"
-            )
-
-    def test_legacy_ahu_off_via_component_multiplier_end_to_end(self):
-        """Legacy solver end-to-end: AHU off via component_multipliers, infiltration on.
-
-        Uses component_multipliers directly (not via profile) to verify the
-        affine boundary reaches the legacy solver correctly.
-        """
-        rho, cp, ach, vol = 1.204, 1006.0, 0.015, 300.0
-        h_inf = rho * cp * ach * vol / 3600.0
-        h_ahu = 400.0
-
-        bld_both = _legacy_building([
-            {"name": "infiltration", "ventilation_type": "constant_ach",
-             "air_changes_per_hour": ach},
-            {"name": "ahu", "ventilation_type": "prescribed",
-             "heat_transfer_coefficient_w_k": h_ahu, "source_temperature_c": 18.0},
-        ], zone_vol=vol)
-
-        # Run with AHU on
-        out_on = _run_legacy(bld_both, n=48)
-        assert "H_ve" in out_on.columns
-        # H_ve should be infiltration + AHU
+        assert "H_ve" in out.columns
+        expected = np.array([h_inf + h_ahu, h_inf, h_inf + h_ahu, h_inf])
         np.testing.assert_allclose(
-            out_on["H_ve"].to_numpy(), h_inf + h_ahu, rtol=1e-4,
-            err_msg="With both streams active, H_ve should equal h_inf + h_ahu",
-        )
-        # S_ve must differ from H_ve * T_outdoor (supply is 18°C, not outdoor)
-        t_out = -5.0
-        s_ve_expected = h_inf * t_out + h_ahu * 18.0
-        np.testing.assert_allclose(
-            out_on["S_ve"].to_numpy(), s_ve_expected, rtol=1e-4,
-            err_msg="S_ve must blend outdoor source for infiltration and 18°C for AHU",
+            out["H_ve"].to_numpy(), expected, rtol=1e-4,
+            err_msg="H_ve must match ahu_schedule: infiltration+AHU when on, infiltration-only when off",
         )
 
     def test_legacy_q_ve_closes(self):
@@ -1324,17 +1535,124 @@ class TestLegacyCausalSolverPaths:
             f"got {stored}"
         )
 
+    def _hybrid_zone_bld(self, components, h_ve_outdoor=0.0):
+        """Minimal multizone building for the public hybrid API tests."""
+        return {
+            "building": {
+                "net_floor_area": 100.0,
+                "building_type_class": "Residential_apartment",
+                "construction_class": "class_i",
+                "adj_zones_present": False,
+                "number_adj_zone": 0,
+                "exposed_perimeter": 40.0,
+                "wall_thickness": 0.3,
+                "slab_on_ground_area": 100.0,
+                "height": 3.0,
+                "latitude_deg": 63.4,
+                "longitude_deg": 10.4,
+                "latitude": 63.4,
+                "longitude": 10.4,
+            },
+            "building_parameters": {
+                "ventilation": {
+                    "ventilation_type": "custom",
+                    "custom_heat_transfer_coefficient_ventilation": h_ve_outdoor,
+                    "flow_rate_per_person": 0.0,
+                },
+                "temperature_setpoints": {
+                    "heating_setpoint": 21.0, "heating_setback": 15.0,
+                    "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+                },
+                "system_capacities": {
+                    # 20 kW so the outdoor-air case (≈10 kW at steady state) is not
+                    # capacity-capped and the exact affine delta can be asserted.
+                    "heating_capacity": 20000.0, "cooling_capacity": 10000.0,
+                },
+            },
+            "building_surface": [{
+                "name": "ext_wall_a", "type": "opaque", "area": 50.0,
+                "zone": "zone_a", "sky_view_factor": 0.5, "u_value": 0.5,
+                "solar_absorptance": 0.6, "thermal_capacity": 200000.0,
+                "orientation": {"azimuth": 0, "tilt": 90}, "name_adj_zone": None,
+            }],
+            "zones": [{
+                "name": "zone_a",
+                "net_floor_area": 100.0,
+                "heating_setpoint": 21.0, "heating_setback": 15.0,
+                "cooling_setpoint": 26.0, "cooling_setback": 30.0,
+                "ventilation": {"components": components},
+            }],
+        }
 
-def _run_causal(building, n=48, t_out=-5.0):
-    """Run the causal single-zone solver (_Temperature_and_Energy_needs_calculation_core_ahu_causal)."""
-    sim_df = _minimal_sim_df(n, t_out)
-    result = ISO52016._Temperature_and_Energy_needs_calculation_core_ahu_causal(
-        building,
-        _precomputed_sim_df=sim_df,
-        weather_source="epw",
-        path_weather_file=None,
-        warmup_hours=0,
-    )
+    def test_hybrid_public_api_prescribed_supply_end_to_end(self):
+        """Temperature_and_Energy_needs_calculation_multizone_hybrid exercises the affine boundary.
+
+        Two runs differ only in ventilation source temperature (18 °C vs −5 °C outdoor).
+        Once both zones reach setpoint (step 2 onward) and the capacity is not limiting,
+        the steady-state HVAC difference is exactly:
+
+            ΔQ = H * (T_sup - T_out) = 400 * 23 = 9200 W per timestep
+
+        The building uses 20 kW heating capacity so the outdoor-air case (≈10 kW at
+        steady state) is not capped and the algebraic identity can be verified.
+        """
+        h = 400.0
+        t_sup = 18.0
+        t_out = -5.0
+        n = 24
+        expected_delta = h * (t_sup - t_out)  # 9200 W
+
+        bld_supply = self._hybrid_zone_bld([{
+            "name": "mech",
+            "ventilation_type": "prescribed",
+            "heat_transfer_coefficient_w_k": h,
+            "source_temperature_c": t_sup,
+        }])
+        bld_outdoor = self._hybrid_zone_bld(
+            components=[{
+                "name": "mech",
+                "ventilation_type": "prescribed",
+                "heat_transfer_coefficient_w_k": h,
+                "source_temperature_c": t_out,
+            }]
+        )
+
+        with _patched_weather(n, t_out=t_out):
+            hourly_s, _, _ = ISO52016.Temperature_and_Energy_needs_calculation_multizone_hybrid(
+                bld_supply, weather_source="epw", path_weather_file=None, warmup_hours=0
+            )
+            hourly_o, _, _ = ISO52016.Temperature_and_Energy_needs_calculation_multizone_hybrid(
+                bld_outdoor, weather_source="epw", path_weather_file=None, warmup_hours=0
+            )
+
+        assert "Q_HC_hybrid_zone_a" in hourly_s.columns, (
+            "Hybrid output must contain Q_HC_hybrid_zone_a"
+        )
+        q_s = hourly_s["Q_HC_hybrid_zone_a"].to_numpy()
+        q_o = hourly_o["Q_HC_hybrid_zone_a"].to_numpy()
+
+        assert (q_s[2:] > 0).all(), "Supply case must be in heating mode from step 2"
+        assert (q_o[2:] > 0).all(), "Outdoor case must be in heating mode from step 2"
+        # From step 2: both zones at steady setpoint; all terms other than S_ve cancel.
+        np.testing.assert_allclose(
+            q_o[2:] - q_s[2:], expected_delta, rtol=1e-4,
+            err_msg=(
+                f"ΔQ_HC must equal H*(T_sup-T_out)={expected_delta:.0f} W; "
+                "a mismatch means S_ve is not reaching the hybrid HVAC backsolve"
+            ),
+        )
+
+
+def _run_causal(building, n=48, t_out=-5.0, profile_df=None):
+    """Run the causal single-zone solver with patched weather and optional profile."""
+    pf = profile_df if profile_df is not None else _minimal_profile_df(n)
+    with _patched_weather(n, t_out), _patched_profiles(pf):
+        result = ISO52016._Temperature_and_Energy_needs_calculation_core_ahu_causal(
+            building,
+            weather_source="epw",
+            path_weather_file=None,
+            warmup_hours=0,
+        )
     return result[0] if isinstance(result, tuple) else result
 
 
@@ -1385,11 +1703,18 @@ class TestCausalSolverPath:
         q_ve = out["Q_ve"].to_numpy()
         np.testing.assert_allclose(q_ve, h_ve * t_air - s_ve, atol=1e-6)
 
-    def test_causal_component_schedule_unit(self):
-        """Causal _comp_mult_leg (utils.py ~8072) scales AHU; infiltration stays at 1.0."""
+    def test_causal_mixed_profile_end_to_end(self):
+        """Causal solver end-to-end: AHU schedule toggles H_ve between two states.
+
+        Mirrors test_legacy_mixed_profile_end_to_end for the causal path
+        (_comp_mult_leg extraction at utils.py ~8088).  Would fail if the
+        schedule-extraction code were removed from the causal core.
+        """
         rho, cp, ach, vol = 1.204, 1006.0, 0.015, 300.0
         h_inf = rho * cp * ach * vol / 3600.0
         h_ahu = 400.0
+        n = 4
+        ahu_sched = [1.0, 0.0, 1.0, 0.0]
 
         bld = _legacy_building([
             {"name": "infiltration", "ventilation_type": "constant_ach",
@@ -1399,31 +1724,41 @@ class TestCausalSolverPath:
              "profile": "ventilation_profile"},
         ], zone_vol=vol)
 
-        vent_cfg = bld["building_parameters"]["ventilation"]
+        profile_df = _minimal_profile_df(n, extra_columns={"ventilation_profile": ahu_sched})
+        out = _run_causal(bld, n=n, profile_df=profile_df)
 
-        for prof_val, expected_ahu in [(1.0, h_ahu), (0.5, h_ahu * 0.5)]:
-            profile_df = pd.DataFrame({"ventilation_profile": [prof_val]})
-            comp_mult: dict = {}
-            for comp in vent_cfg.get("components", []):
-                cname = str(comp.get("name", "")).strip()
-                cprof = comp.get("profile")
-                if cname and cprof is not None:
-                    col = str(cprof)
-                    if col in profile_df.columns:
-                        comp_mult[cname] = float(profile_df[col].iloc[0])
+        assert "H_ve" in out.columns
+        expected = np.array([h_inf + h_ahu, h_inf, h_inf + h_ahu, h_inf])
+        np.testing.assert_allclose(
+            out["H_ve"].to_numpy(), expected, rtol=1e-4,
+            err_msg="H_ve must match ahu_schedule: infiltration+AHU when on, infiltration-only when off",
+        )
 
-            bdy = resolve_ventilation_boundary(
-                bld, 21.0, -5.0, 0.0,
-                component_multipliers=comp_mult or None,
-                zone_volume_m3=vol,
+    def test_causal_explicit_none_schedule_uses_default(self):
+        """Causal core: explicit None for schedule kwarg falls back to the built-in default.
+
+        _make_sched_resolver uses ``is None`` rather than ``or`` so a caller that
+        passes occupants_schedule_workdays=None explicitly (as the multizone hybrid
+        function does) gets the iso16798_profiles default rather than crashing with
+        TypeError inside generate_category_profile.
+        """
+        bld = _legacy_building([{
+            "name": "mech",
+            "ventilation_type": "prescribed",
+            "heat_transfer_coefficient_w_k": 100.0,
+            "source_temperature_c": 18.0,
+        }])
+        n = 4
+        pf = _minimal_profile_df(n)
+        with _patched_weather(n), _patched_profiles(pf):
+            # occupants_schedule_workdays=None is passed explicitly, mirroring the
+            # multizone hybrid caller path.
+            result = ISO52016._Temperature_and_Energy_needs_calculation_core_ahu_causal(
+                bld,
+                weather_source="epw",
+                path_weather_file=None,
+                warmup_hours=0,
+                occupants_schedule_workdays=None,
             )
-            inf_h = sum(s.heat_transfer_coefficient_w_k for s in bdy.streams
-                        if s.name == "infiltration")
-            ahu_h = sum(s.heat_transfer_coefficient_w_k for s in bdy.streams
-                        if s.name == "ahu")
-            assert inf_h == pytest.approx(h_inf, rel=1e-4), (
-                f"prof={prof_val}: infiltration must be unscaled"
-            )
-            assert ahu_h == pytest.approx(expected_ahu, rel=1e-4), (
-                f"prof={prof_val}: AHU should be {expected_ahu}"
-            )
+        out = result[0] if isinstance(result, tuple) else result
+        assert "H_ve" in out.columns, "Causal core must return H_ve when schedule kwarg is None"

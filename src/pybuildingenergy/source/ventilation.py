@@ -1,12 +1,41 @@
 '''
-Evaluation of heat transfer coefficent by ventilation using:
-- the iso 16798-7 based on natural ventilation through windows using wind velocity and temperature difference (internal - external) inputs
-- simplified method that take into account the occupancy profile
+Ventilation heat-transfer coefficient and affine boundary for ISO 52016-1 §6.5.10.
 
-# To integrate:
-- leaks 
-- cross-ventilation 
-- mechanical ventilation
+Methods implemented:
+- Natural ventilation through windows (EN 16798-7 wind/temperature-difference method)
+- Occupancy-based simplified method
+- Custom, EnergyPlus infiltration, and Sherman-Grimsrud infiltration models
+- Affine ventilation boundary: additive VentilationStream objects and VentilationBoundary
+
+Affine boundary
+---------------
+ISO 52016-1 §6.5.10 inserts ventilation into the zone energy balance as:
+
+    A_air,air += H_ve
+    B_air     += S_ve
+
+where:
+
+    H_ve = sum_k(H_k)                 [W/K]  aggregate conductance
+    S_ve = sum_k(H_k * T_source,k)    [W]    weighted source term
+
+The zone sensible ventilation heat flow (positive = heat leaving the zone) is:
+
+    Q_ve = H_ve * T_zone - S_ve
+
+No additional matrix temperature node is required.  T_supply_equivalent may be
+reported as S_ve / H_ve when H_ve > 0, but the solver must retain the pair
+(H_ve, S_ve) rather than reducing it to a single temperature or a
+state-dependent effective conductance.
+
+Existing five ventilation_type configurations resolve to one outdoor-air stream
+(backward-compatible).  The optional ``components`` configuration enables
+independent streams with per-component operation schedules.
+
+To integrate (deferred):
+- Detailed leakage and duct networks
+- Cross-ventilation and inter-zone airflow
+- Full mechanical ventilation via EN 16798-5-1 AHU module (PR 2)
 '''
 
 from dataclasses import dataclass
@@ -141,7 +170,7 @@ class VentilationInternalGains:
         """
 
         """
-        According to the ISO 16798-7:2017
+        According to EN 16798-7:2017
         calculation of air flow rate through window using wind velocity and temperature difference (6.4.3.5.4)
         
         # Single side ventilation 
@@ -247,7 +276,7 @@ class VentilationInternalGains:
             height = np.asarray(height_list, dtype=float)
             width = np.asarray(width_list, dtype=float)
 
-            # ISO 16798-7: hw_path = center height from floor; hw_fa = opening height (use full height)
+            # EN 16798-7: hw_path = center height from floor; hw_fa = opening height (use full height)
             hw_path_i = parapet + 0.5 * height
             hw_fa_i = height
 
