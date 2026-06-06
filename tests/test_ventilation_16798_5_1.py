@@ -17,6 +17,7 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     ahu_outputs_to_ventilation_stream,
     calculate_sensible_ahu_step,
     resolve_supply_temperature_setpoint,
+    sensible_ahu_config_from_dict,
 )
 from pybuildingenergy.source.ventilation import VentilationBoundary, VentilationStream
 
@@ -1060,3 +1061,80 @@ def test_integration_s_ve_sign_convention_positive_is_heat_to_zone():
     bnd_hot = VentilationBoundary([ahu_hot])
     assert out_hot.actual_supply_temperature_c > t_zone
     assert bnd_hot.sensible_heat_flow_w(t_zone) < 0.0
+
+
+# ---------------------------------------------------------------------------
+# sensible_ahu_config_from_dict — component-dict factory
+# ---------------------------------------------------------------------------
+
+def _minimal_ahu_dict(**overrides):
+    d = {
+        "sensible_heat_recovery_efficiency": 0.784,
+        "supply_temperature_setpoint_c": 18.0,
+    }
+    d.update(overrides)
+    return d
+
+
+def test_from_dict_required_fields():
+    cfg = sensible_ahu_config_from_dict(_minimal_ahu_dict())
+    assert cfg.sensible_heat_recovery_efficiency == pytest.approx(0.784)
+    assert cfg.supply_temperature_control.setpoint_c == pytest.approx(18.0)
+
+
+def test_from_dict_defaults():
+    cfg = sensible_ahu_config_from_dict(_minimal_ahu_dict())
+    assert cfg.heat_recovery_control is HeatRecoveryControl.MODULATING_BYPASS
+    assert cfg.frost_control is FrostControlMode.EXHAUST_LIMIT
+    assert cfg.frost_exhaust_limit_c == pytest.approx(-5.0)
+    assert cfg.heating_coil_max_power_w is None
+    assert cfg.cooling_coil_enabled is False
+    assert cfg.supply_fan_specific_power_w_per_m3_s == pytest.approx(0.0)
+    assert cfg.extract_fan_specific_power_w_per_m3_s == pytest.approx(0.0)
+    assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(1.0)
+    assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(1.0)
+
+
+def test_from_dict_explicit_optional_fields():
+    cfg = sensible_ahu_config_from_dict(_minimal_ahu_dict(
+        heat_recovery_control="always_on",
+        frost_control="none",
+        frost_exhaust_limit_c=-3.0,
+        heating_coil_max_power_w=5000.0,
+        supply_fan_specific_power_w_per_m3_s=200.0,
+        extract_fan_specific_power_w_per_m3_s=150.0,
+        supply_fan_heat_fraction_to_air=0.9,
+        extract_fan_heat_fraction_to_air=0.8,
+    ))
+    assert cfg.heat_recovery_control is HeatRecoveryControl.ALWAYS_ON
+    assert cfg.frost_control is FrostControlMode.NONE
+    assert cfg.frost_exhaust_limit_c == pytest.approx(-3.0)
+    assert cfg.heating_coil_max_power_w == pytest.approx(5000.0)
+    assert cfg.supply_fan_specific_power_w_per_m3_s == pytest.approx(200.0)
+    assert cfg.extract_fan_specific_power_w_per_m3_s == pytest.approx(150.0)
+    assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(0.9)
+    assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(0.8)
+
+
+def test_from_dict_missing_setpoint_raises():
+    with pytest.raises(KeyError, match="supply_temperature_setpoint_c"):
+        sensible_ahu_config_from_dict({"sensible_heat_recovery_efficiency": 0.8})
+
+
+def test_from_dict_missing_efficiency_raises():
+    with pytest.raises(KeyError):
+        sensible_ahu_config_from_dict({"supply_temperature_setpoint_c": 18.0})
+
+
+def test_from_dict_produces_runnable_config():
+    cfg = sensible_ahu_config_from_dict(_minimal_ahu_dict())
+    inp = AHUStepInputs(
+        outdoor_temperature_c=-5.0,
+        extract_temperature_c=21.0,
+        required_supply_flow_m3_h=3600.0,
+        required_extract_flow_m3_h=3600.0,
+        operation_fraction=1.0,
+        timestep_hours=1.0,
+    )
+    out = calculate_sensible_ahu_step(cfg, inp)
+    assert out.actual_supply_temperature_c == pytest.approx(18.0, abs=1e-9)

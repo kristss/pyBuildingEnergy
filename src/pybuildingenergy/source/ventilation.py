@@ -666,6 +666,7 @@ def _resolve_component_streams(
     rho_air: float,
     component_multipliers: dict = None,
     default_multiplier: float = 1.0,
+    zone_temperature_c: float = 20.0,
 ) -> list:
     """Convert a ventilation components list to VentilationStream objects.
 
@@ -673,6 +674,10 @@ def _resolve_component_streams(
     - 'constant_ach': infiltration or natural ventilation via air-change rate.
       Requires zone_volume_m3. source_temperature defaults to "outdoor".
     - 'prescribed': fixed H_k and source temperature supplied by caller (e.g. AHU).
+    - 'mechanical_supply': physics-based AHU step via EN 16798-5-1 sensible model.
+      Requires supply_flow_m3_h, sensible_heat_recovery_efficiency,
+      supply_temperature_setpoint_c. zone_temperature_c is used as the extract
+      temperature (one-step lag: T_zone from previous timestep).
 
     component_multipliers: optional per-component name -> float operation fraction.
     default_multiplier: applied to any component not in component_multipliers.
@@ -713,10 +718,36 @@ def _resolve_component_streams(
             source_temp = float(comp["source_temperature_c"])
             category = comp.get("category", "supply")
 
+        elif comp_type == "mechanical_supply":
+            # Physics-based AHU step: lazy import so ventilation.py (PR 1) does
+            # not hard-depend on the AHU module (PR 2) at import time.
+            from .ventilation_16798_5_1 import (  # noqa: PLC0415
+                AHUStepInputs,
+                ahu_outputs_to_ventilation_stream,
+                calculate_sensible_ahu_step,
+                sensible_ahu_config_from_dict,
+            )
+            supply_m3_h = float(comp["supply_flow_m3_h"])
+            extract_m3_h = float(comp.get("extract_flow_m3_h", supply_m3_h))
+            ahu_cfg = sensible_ahu_config_from_dict(comp)
+            ahu_inp = AHUStepInputs(
+                outdoor_temperature_c=outdoor_temperature_c,
+                extract_temperature_c=zone_temperature_c,  # one-step lag
+                required_supply_flow_m3_h=supply_m3_h,
+                required_extract_flow_m3_h=extract_m3_h,
+                operation_fraction=multiplier,
+                timestep_hours=1.0,
+            )
+            ahu_out = calculate_sensible_ahu_step(ahu_cfg, ahu_inp)
+            _s = ahu_outputs_to_ventilation_stream(ahu_out, name=name)
+            h_k = _s.heat_transfer_coefficient_w_k
+            source_temp = _s.source_temperature_c
+            category = "supply"
+
         else:
             raise ValueError(
                 f"Component {name!r}: unknown ventilation_type={comp_type!r}. "
-                "Supported component types: 'constant_ach', 'prescribed'."
+                "Supported component types: 'constant_ach', 'mechanical_supply', 'prescribed'."
             )
 
         streams.append(
@@ -787,6 +818,7 @@ def resolve_ventilation_boundary(
             rho_air,
             component_multipliers=component_multipliers,
             default_multiplier=1.0,
+            zone_temperature_c=zone_temperature_c,
         )
     else:
         vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()

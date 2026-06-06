@@ -14,7 +14,7 @@ This is a supervisory strategy supported by the architecture of EN 16798-5-1
 but is NOT enumerated as one of the core controller modes in EN 16798-5-1
 Table B.2 (which covers fixed, outdoor-compensated, and load-compensated
 strategies). It is implemented here as a generic piecewise-linear controller
-that produces theta_SUP_req_zV for the AHU calculation.
+that produces the required supply-air temperature for the AHU calculation.
 
 Physical constants
 ------------------
@@ -231,13 +231,14 @@ class FrostControlMode(str, Enum):
     EXHAUST_LIMIT — directly reduces the effective HR efficiency so the
                    exhaust leaving the HR core stays at or above
                    ``frost_exhaust_limit_c``.  The continuous exhaust-
-                   temperature-limit formulation is mechanistically
-                   similar to EN 16798-5-1 B108=1 DIRECT (direct
-                   effectiveness control): both reduce ηhr when frost
-                   risk is present.  It differs from B108=2 INDIRECT,
-                   which adjusts the ODA preheating temperature (JODA;fp)
-                   and leaves ηhr unchanged.  B46 (defrost mechanism:
-                   bypass, preheat, recirculation) is a separate
+                   temperature-limit formulation follows the direct
+                   frost-protection approach in EN 16798-5-1 formula (46):
+                   heat-recovery efficiency is reduced when frost risk is
+                   present.  It does not implement the indirect treatment
+                   in formulas (47b) through (49), which calculates
+                   frost-protected outdoor-air and limited heat-recovery
+                   supply temperatures.  The physical defrost mechanism
+                   (bypass, preheat, or recirculation) is a separate
                    configuration dimension not modelled here.
     """
 
@@ -397,8 +398,9 @@ class AHUStepOutputs:
     requested_supply_temperature_c: setpoint from the supply-temperature controller,
                                     or None when the AHU is off (flow = 0).
     actual_supply_temperature_c:    delivered supply temperature including fan heat.
-    heat_recovery_power_w:          rho*cp*q*(T_hr_outlet − T_outdoor).  Equals EN 16798-5-1
-                                    formula-77 Q_hr only when all of the following hold:
+    heat_recovery_power_w:          rho*cp*q*(T_hr_outlet − T_outdoor).  Equals the
+                                    EN 16798-5-1 formula (77) heat-recovery term only
+                                    when all of the following hold:
                                     balanced flow, no recirculation, no ODA preheating, and
                                     frost correction inactive.  During active EXHAUST_LIMIT
                                     frost control, the total supply heating relative to
@@ -523,9 +525,9 @@ def calculate_sensible_ahu_step(
     eta_nom = config.sensible_heat_recovery_efficiency
     dT = t_ext_at_hr - t_outdoor  # K; positive in heating mode
 
-    # Step 4: EXHAUST_LIMIT frost protection — directly reduces effective HR
-    # efficiency to keep T_EHA >= frost_exhaust_limit_c (analogous to
-    # EN 16798-5-1 B108=1 DIRECT effectiveness control).
+    # Step 4: EXHAUST_LIMIT frost protection — EN 16798-5-1 formula (46)
+    # direct effectiveness control. Reduce effective HR efficiency to keep
+    # T_EHA >= frost_exhaust_limit_c.
     # The exhaust leaving the HR (EHA) must stay >= frost_exhaust_limit_c.
     # For balanced flow: T_EHA = T_extract_at_hr - eta * dT
     # If T_EHA < limit, reduce eta_eff so T_EHA exactly equals the limit.
@@ -623,6 +625,58 @@ def calculate_sensible_ahu_step(
 # ---------------------------------------------------------------------------
 # ISO 52016-1 zone adapter
 # ---------------------------------------------------------------------------
+
+def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
+    """Build a SensibleAHUConfig from a ventilation component dict.
+
+    Required keys:
+      ``sensible_heat_recovery_efficiency`` — float in [0, 1]
+      ``supply_temperature_setpoint_c``     — fixed supply setpoint [°C]
+
+    Optional keys and their defaults:
+      ``heat_recovery_control``             — "modulating_bypass"
+      ``frost_control``                     — "exhaust_limit"
+      ``frost_exhaust_limit_c``             — -5.0 [°C]
+      ``heating_coil_max_power_w``          — None (unlimited)
+      ``cooling_coil_enabled``              — False
+      ``supply_fan_specific_power_w_per_m3_s`` — 0.0
+      ``extract_fan_specific_power_w_per_m3_s`` — 0.0
+      ``supply_fan_heat_fraction_to_air``   — 1.0
+      ``extract_fan_heat_fraction_to_air``  — 1.0
+    """
+    raw_setpoint = d.get("supply_temperature_setpoint_c")
+    if raw_setpoint is None:
+        raise KeyError(
+            "mechanical_supply component requires 'supply_temperature_setpoint_c'"
+        )
+    heating_coil_max = d.get("heating_coil_max_power_w")
+    if heating_coil_max is not None:
+        heating_coil_max = float(heating_coil_max)
+    return SensibleAHUConfig(
+        sensible_heat_recovery_efficiency=float(d["sensible_heat_recovery_efficiency"]),
+        supply_temperature_control=SupplyTemperatureControl(
+            mode=SupplyTemperatureControlMode.FIXED,
+            setpoint_c=float(raw_setpoint),
+        ),
+        heat_recovery_control=str(d.get("heat_recovery_control", "modulating_bypass")),
+        frost_control=str(d.get("frost_control", "exhaust_limit")),
+        frost_exhaust_limit_c=float(d.get("frost_exhaust_limit_c", -5.0)),
+        heating_coil_max_power_w=heating_coil_max,
+        cooling_coil_enabled=bool(d.get("cooling_coil_enabled", False)),
+        supply_fan_specific_power_w_per_m3_s=float(
+            d.get("supply_fan_specific_power_w_per_m3_s", 0.0)
+        ),
+        extract_fan_specific_power_w_per_m3_s=float(
+            d.get("extract_fan_specific_power_w_per_m3_s", 0.0)
+        ),
+        supply_fan_heat_fraction_to_air=float(
+            d.get("supply_fan_heat_fraction_to_air", 1.0)
+        ),
+        extract_fan_heat_fraction_to_air=float(
+            d.get("extract_fan_heat_fraction_to_air", 1.0)
+        ),
+    )
+
 
 def ahu_outputs_to_ventilation_stream(
     outputs: AHUStepOutputs,

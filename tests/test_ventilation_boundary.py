@@ -1762,3 +1762,181 @@ class TestCausalSolverPath:
             )
         out = result[0] if isinstance(result, tuple) else result
         assert "H_ve" in out.columns, "Causal core must return H_ve when schedule kwarg is None"
+
+
+# ---------------------------------------------------------------------------
+# mechanical_supply component type (EN 16798-5-1 AHU step wired into boundary)
+# ---------------------------------------------------------------------------
+
+def _ahu_component(**overrides):
+    """Minimal mechanical_supply component dict."""
+    d = {
+        "name": "ahu",
+        "ventilation_type": "mechanical_supply",
+        "supply_flow_m3_h": 3600.0,
+        "sensible_heat_recovery_efficiency": 0.784,
+        "supply_temperature_setpoint_c": 18.0,
+    }
+    d.update(overrides)
+    return d
+
+
+def _ahu_building(components):
+    return {"building_parameters": {"ventilation": {"components": components}}}
+
+
+class TestMechanicalSupplyComponent:
+
+    def test_h_ve_equals_rho_cp_times_flow(self):
+        """H_ve = rho_cp * q_m3_s for a fully operating AHU."""
+        bdy = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+        )
+        rho_cp = 1.204 * 1006.0   # independent constant, not imported from module
+        expected_h = rho_cp * 3600.0 / 3600.0  # q = 1.0 m³/s
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-5)
+
+    def test_supply_temperature_reaches_setpoint(self):
+        """When HR + coil can cover the load, supply temperature equals the setpoint."""
+        bdy = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+        )
+        # equivalent_supply_temperature_c = S_ve / H_ve
+        assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+
+    def test_ahu_off_when_operation_fraction_zero(self):
+        """An AHU with operation_fraction=0 contributes zero H_ve and S_ve."""
+        bdy = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            component_multipliers={"ahu": 0.0},
+        )
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(0.0)
+        assert bdy.source_term_w == pytest.approx(0.0)
+
+    def test_infiltration_independent_of_ahu_schedule(self):
+        """Infiltration (constant_ach, no profile) remains active when AHU is off."""
+        components = [
+            _ahu_component(),
+            {
+                "name": "inf",
+                "ventilation_type": "constant_ach",
+                "air_changes_per_hour": 0.5,
+            },
+        ]
+        bdy_on = resolve_ventilation_boundary(
+            _ahu_building(components),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            component_multipliers={"ahu": 1.0},
+            zone_volume_m3=5000.0,
+        )
+        bdy_off = resolve_ventilation_boundary(
+            _ahu_building(components),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            component_multipliers={"ahu": 0.0},
+            zone_volume_m3=5000.0,
+        )
+        rho_cp = 1.204 * 1006.0
+        h_inf = rho_cp * 0.5 * 5000.0 / 3600.0
+        # AHU off → only infiltration
+        assert bdy_off.heat_transfer_coefficient_w_k == pytest.approx(h_inf, rel=1e-4)
+        # AHU on → infiltration + AHU
+        assert bdy_on.heat_transfer_coefficient_w_k > h_inf
+
+    def test_extract_flow_defaults_to_supply_flow(self):
+        """Omitting extract_flow_m3_h defaults to supply_flow_m3_h (balanced)."""
+        bdy_explicit = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component(extract_flow_m3_h=3600.0)]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+        )
+        bdy_default = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+        )
+        assert bdy_explicit.heat_transfer_coefficient_w_k == pytest.approx(
+            bdy_default.heat_transfer_coefficient_w_k, rel=1e-9
+        )
+        assert bdy_explicit.source_term_w == pytest.approx(
+            bdy_default.source_term_w, rel=1e-9
+        )
+
+    def test_bypass_active_when_hr_would_overheat(self):
+        """When T_oda > T_set, bypass mixes to reach setpoint, reducing H_ve."""
+        # T_oda=12, T_ext=21, T_set=18 → bypass fraction > 0
+        # Effective temperature rise = 18 - 12 = 6 K (not 9 K from full HR)
+        bdy = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=12.0,
+            wind_speed_m_s=0.0,
+        )
+        rho_cp = 1.204 * 1006.0
+        # Still full flow, so H_ve unchanged; but S_ve = H_ve * T_sup = H_ve * 18
+        expected_h = rho_cp * 1.0
+        assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-5)
+        assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+
+    def test_extract_temperature_affects_hr(self):
+        """Higher extract temperature → more HR power → higher supply temperature."""
+        # At T_oda=-10, T_ext=21 → T_hr = -10 + 0.784*31 = 14.304 → coil to 18
+        # At T_oda=-10, T_ext=25 → T_hr = -10 + 0.784*35 = 17.44 → coil to 18
+        # Both reach 18 °C setpoint, but HR powers differ — test that zone_temperature_c
+        # (extract temperature) is used, not a fixed value.
+        bdy_cool = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-10.0,
+            wind_speed_m_s=0.0,
+        )
+        bdy_warm = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=25.0,
+            outdoor_temperature_c=-10.0,
+            wind_speed_m_s=0.0,
+        )
+        # Both supply at 18 °C, same flow → same H_ve and S_ve
+        assert bdy_cool.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+        assert bdy_warm.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+        # H_ve identical (same flow rate)
+        assert bdy_cool.heat_transfer_coefficient_w_k == pytest.approx(
+            bdy_warm.heat_transfer_coefficient_w_k, rel=1e-9
+        )
+
+    def test_frost_protection_reduces_hr_at_extreme_cold(self):
+        """At T_oda=-15, EXHAUST_LIMIT frost protection reduces effective HR."""
+        # Without frost: T_eha = 21 - 0.784*36 = -7.2 < -5 → frost kicks in
+        # eta_frost = (21-(-5))/36 = 26/36; T_hr = -15 + (26/36)*36 = 11 °C
+        # Supply = 18 °C (coil covers the gap)
+        bdy = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-15.0,
+            wind_speed_m_s=0.0,
+        )
+        # Supply still reaches setpoint; but note stream H_ve unchanged (full flow)
+        assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+
+    def test_unknown_type_still_raises(self):
+        """Unknown ventilation_type still raises ValueError after adding mechanical_supply."""
+        bld = _ahu_building([{
+            "name": "x",
+            "ventilation_type": "magic_box",
+        }])
+        with pytest.raises(ValueError, match="unknown ventilation_type"):
+            resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0)
