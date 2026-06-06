@@ -755,9 +755,10 @@ def resolve_ventilation_boundary(
 
     profile_multiplier: operation fraction applied to the legacy single stream.
     component_multipliers: optional dict mapping component name -> operation fraction.
-      Components not in the dict receive profile_multiplier as their default. Pass
-      {"infiltration": 1.0, "ahu_supply": 0.0} to keep infiltration on while the
-      AHU is off. When None, profile_multiplier is applied to all components.
+      Components not in the dict default to 1.0 (full capacity), so infiltration
+      components remain active independently of the mechanical ventilation schedule.
+      Pass {"ahu_supply": 0.0} to turn off the AHU while infiltration runs
+      unaffected. When None, all components run at 1.0.
     extra_streams: additional pre-built VentilationStream objects added by the caller
     (e.g. a summer night purge stream resolved by the timestep loop).
 

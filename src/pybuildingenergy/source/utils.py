@@ -131,6 +131,45 @@ def _make_sched_resolver(kwargs, iso16798_profiles_obj):
     return _sched
 
 
+def _resolve_single_zone_vent_boundary(building_object, T_zone, Tstepi, sim_df, profile_df):
+    """Build the affine ventilation boundary for legacy and causal single-zone solvers.
+
+    Reads zone volume and ventilation config from *building_object*, resolves per-component
+    profile multipliers from *profile_df* at timestep *Tstepi*, and delegates to
+    resolve_ventilation_boundary.  Centralises logic that is otherwise duplicated in the
+    legacy and causal solver timestep loops.
+    """
+    _bld = building_object.get("building", {})
+    _zone_vol = float(
+        _bld.get("zone_volume_m3") or _bld.get("zone_volume") or _bld.get("volume") or 0.0
+    )
+    _vent_cfg = building_object.get("building_parameters", {}).get("ventilation", {}) or {}
+    _comp_mult: dict = {}
+    for _comp in _vent_cfg.get("components", []):
+        _cname = str(_comp.get("name", "")).strip()
+        _cprof = _comp.get("profile")
+        if _cname and _cprof is not None:
+            _col = str(_cprof)
+            if _col in profile_df.columns:
+                _comp_mult[_cname] = float(profile_df[_col].iloc[Tstepi])
+            else:
+                import warnings as _w
+                _w.warn(
+                    f"Component {_cname!r}: profile column {_col!r} not in "
+                    f"profile_df; available columns: {list(profile_df.columns)}. Using 1.0.",
+                    stacklevel=3,
+                )
+    return resolve_ventilation_boundary(
+        building_object,
+        float(T_zone),
+        float(sim_df.iloc[Tstepi]["T2m"]),
+        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
+        profile_multiplier=float(profile_df["ventilation_profile"].iloc[Tstepi]),
+        component_multipliers=_comp_mult if _comp_mult else None,
+        zone_volume_m3=_zone_vol if _zone_vol > 0.0 else None,
+    )
+
+
 def _infer_timestep_hours_from_index(index, default=1.0):
     """
     Infer representative timestep duration [h] from an index.
@@ -1215,7 +1254,6 @@ class ISO52010:
     # GET DATA FROM PVGIS
     @classmethod
     def get_tmy_data_pvgis(cls, building_object) -> WeatherDataResult:
-    from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
         """
         Get Weather data from pvgis API
 
@@ -1232,6 +1270,7 @@ class ISO52010:
             In case only weather data is desired, the ``building_object`` can only have the **latitude** and **longitude** parameters.
 
         """
+        from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
 
         # Connection to PVGIS API to get weather data
         if isinstance(building_object, dict):
@@ -1408,7 +1447,6 @@ class ISO52010:
     # GET WEATHER DATA FROM .epw FILE
     @classmethod
     def get_tmy_data_epw(cls, path_weather_file):
-    from pvlib.iotools import epw  # lazy: avoids ~1.9s cold import
         """
         Get Wetaher data from epw file
 
@@ -1421,6 +1459,7 @@ class ISO52010:
             * *latitude*: latitude of the building place (type: **float**)
             * *longitude*: longitude of the building place (type: **float**)
         """
+        from pvlib.iotools import epw  # lazy: avoids ~1.9s cold import
 
         # Read EPW file
         if isinstance(path_weather_file, (bytes, bytearray)):
@@ -4912,7 +4951,6 @@ class ISO52016:
         warmup_hours=744,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Multizone hourly/annual energy-need calculation.
         This extends the multizone coupled model with profile-driven setpoints,
@@ -4927,6 +4965,7 @@ class ISO52016:
                 One row per zone with heating/cooling annual needs in Wh
                 (plus explicit kWh columns) and specific values.
         """
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         hourly_results = cls.simulate_envelope_multizone_free_floating(
             building_object=building_object,
             path_weather_file=path_weather_file,
@@ -5948,7 +5987,6 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
@@ -6016,6 +6054,7 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         _sched = _make_sched_resolver(kwargs, iso16798_profiles)
         occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
         occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
@@ -6725,44 +6764,8 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    _bld_vent = building_object.get("building", {})
-                    _zone_vol_leg = float(
-                        _bld_vent.get("zone_volume_m3")
-                        or _bld_vent.get("zone_volume")
-                        or _bld_vent.get("volume")
-                        or 0.0
-                    )
-                    # Per-component schedules: component "profile" key names a column in
-                    # profile_df.  Unknown column names warn and fall back to 1.0 so
-                    # infiltration (no profile key) always runs at full capacity.
-                    _vent_cfg_leg = (
-                        building_object.get("building_parameters", {}).get("ventilation", {})
-                        or {}
-                    )
-                    _comp_mult_leg: dict = {}
-                    for _comp in _vent_cfg_leg.get("components", []):
-                        _cname = str(_comp.get("name", "")).strip()
-                        _cprof = _comp.get("profile")
-                        if _cname and _cprof is not None:
-                            _col = str(_cprof)
-                            if _col in profile_df.columns:
-                                _comp_mult_leg[_cname] = float(profile_df[_col].iloc[Tstepi])
-                            else:
-                                import warnings as _w
-                                _w.warn(
-                                    f"Component {_cname!r}: profile column {_col!r} not in "
-                                    "profile_df; available columns: "
-                                    f"{list(profile_df.columns)}. Using 1.0.",
-                                    stacklevel=2,
-                                )
-                    _vent_bdy = resolve_ventilation_boundary(
-                        building_object,
-                        float(Theta_old[ri]),
-                        float(sim_df.iloc[Tstepi]["T2m"]),
-                        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
-                        profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
-                        component_multipliers=_comp_mult_leg if _comp_mult_leg else None,
-                        zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
+                    _vent_bdy = _resolve_single_zone_vent_boundary(
+                        building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
@@ -7395,7 +7398,6 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
@@ -7463,6 +7465,7 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         _sched = _make_sched_resolver(kwargs, iso16798_profiles)
         occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
         occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
@@ -8237,44 +8240,8 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    _bld_vent = building_object.get("building", {})
-                    _zone_vol_leg = float(
-                        _bld_vent.get("zone_volume_m3")
-                        or _bld_vent.get("zone_volume")
-                        or _bld_vent.get("volume")
-                        or 0.0
-                    )
-                    # Per-component schedules: component "profile" key names a column in
-                    # profile_df.  Unknown column names warn and fall back to 1.0 so
-                    # infiltration (no profile key) always runs at full capacity.
-                    _vent_cfg_leg = (
-                        building_object.get("building_parameters", {}).get("ventilation", {})
-                        or {}
-                    )
-                    _comp_mult_leg: dict = {}
-                    for _comp in _vent_cfg_leg.get("components", []):
-                        _cname = str(_comp.get("name", "")).strip()
-                        _cprof = _comp.get("profile")
-                        if _cname and _cprof is not None:
-                            _col = str(_cprof)
-                            if _col in profile_df.columns:
-                                _comp_mult_leg[_cname] = float(profile_df[_col].iloc[Tstepi])
-                            else:
-                                import warnings as _w
-                                _w.warn(
-                                    f"Component {_cname!r}: profile column {_col!r} not in "
-                                    "profile_df; available columns: "
-                                    f"{list(profile_df.columns)}. Using 1.0.",
-                                    stacklevel=2,
-                                )
-                    _vent_bdy = resolve_ventilation_boundary(
-                        building_object,
-                        float(Theta_old[ri]),
-                        float(sim_df.iloc[Tstepi]["T2m"]),
-                        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
-                        profile_multiplier=float(profile_df['ventilation_profile'].iloc[Tstepi]),
-                        component_multipliers=_comp_mult_leg if _comp_mult_leg else None,
-                        zone_volume_m3=_zone_vol_leg if _zone_vol_leg > 0.0 else None,
+                    _vent_bdy = _resolve_single_zone_vent_boundary(
+                        building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
