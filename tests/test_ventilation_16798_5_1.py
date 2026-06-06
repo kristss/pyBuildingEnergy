@@ -921,7 +921,7 @@ def test_adapter_zone_heat_flow_formula():
 
 
 # ---------------------------------------------------------------------------
-# Solver integration tests
+# Boundary integration tests (AHU → VentilationStream → VentilationBoundary)
 # ---------------------------------------------------------------------------
 
 def _infiltration_stream(t_outdoor_c: float, h_w_k: float = 50.0) -> VentilationStream:

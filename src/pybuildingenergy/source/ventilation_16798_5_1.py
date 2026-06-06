@@ -228,13 +228,17 @@ class FrostControlMode(str, Enum):
     """Available frost-protection strategies.
 
     NONE         — no frost protection; HR efficiency is not reduced.
-    EXHAUST_LIMIT — indirect exhaust-temperature-limit control (EN 16798-5-1
-                   B108=2 "INDIRECT" mode): the effective HR efficiency is
-                   reduced continuously so the exhaust leaving the HR core
-                   stays at or above ``frost_exhaust_limit_c``.  B108 selects
-                   the control method (B108=1 = DIRECT, B108=2 = INDIRECT);
-                   the defrost mechanism (bypass, preheat, recirculation) is a
-                   separate configuration dimension not represented here.
+    EXHAUST_LIMIT — directly reduces the effective HR efficiency so the
+                   exhaust leaving the HR core stays at or above
+                   ``frost_exhaust_limit_c``.  The continuous exhaust-
+                   temperature-limit formulation is mechanistically
+                   similar to EN 16798-5-1 B108=1 DIRECT (direct
+                   effectiveness control): both reduce ηhr when frost
+                   risk is present.  It differs from B108=2 INDIRECT,
+                   which adjusts the ODA preheating temperature (JODA;fp)
+                   and leaves ηhr unchanged.  B46 (defrost mechanism:
+                   bypass, preheat, recirculation) is a separate
+                   configuration dimension not modelled here.
     """
 
     NONE = "none"
@@ -519,7 +523,9 @@ def calculate_sensible_ahu_step(
     eta_nom = config.sensible_heat_recovery_efficiency
     dT = t_ext_at_hr - t_outdoor  # K; positive in heating mode
 
-    # Step 4: EXHAUST_LIMIT frost protection (EN 16798-5-1 B108=2 INDIRECT).
+    # Step 4: EXHAUST_LIMIT frost protection — directly reduces effective HR
+    # efficiency to keep T_EHA >= frost_exhaust_limit_c (analogous to
+    # EN 16798-5-1 B108=1 DIRECT effectiveness control).
     # The exhaust leaving the HR (EHA) must stay >= frost_exhaust_limit_c.
     # For balanced flow: T_EHA = T_extract_at_hr - eta * dT
     # If T_EHA < limit, reduce eta_eff so T_EHA exactly equals the limit.
