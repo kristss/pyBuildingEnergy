@@ -863,7 +863,7 @@ def test_adapter_default_name_and_category():
     out = calculate_sensible_ahu_step(_cfg(), _inp())
     stream = ahu_outputs_to_ventilation_stream(out)
     assert stream.name == "mechanical_supply"
-    assert stream.category == "mechanical_supply"
+    assert stream.category == "supply"
 
 
 def test_adapter_custom_name():
@@ -901,15 +901,23 @@ def test_adapter_zero_flow_source_temperature_is_finite():
 
 
 def test_adapter_zone_heat_flow_formula():
-    """Verify Q_k = H_k * (T_source - T_zone) is consistent with stream fields."""
+    """VentilationBoundary source_term_w equals H_k * actual_supply_temperature_c.
+
+    Exercises the full coupling path: AHU step → stream → VentilationBoundary,
+    then verifies both source_term_w and sensible_heat_flow_w close correctly.
+    """
     out = calculate_sensible_ahu_step(_cfg(), _inp())
     stream = ahu_outputs_to_ventilation_stream(out)
+    boundary = VentilationBoundary((stream,))
     t_zone = 21.0
-    q_stream = stream.heat_transfer_coefficient_w_k * (stream.source_temperature_c - t_zone)
-    q_direct = _RHO_CP_J_M3_K * out.actual_supply_flow_m3_h / 3600.0 * (
-        out.actual_supply_temperature_c - t_zone
-    )
-    assert q_stream == pytest.approx(q_direct)
+
+    # S_ve must equal H_k * T_actual_supply (not outdoor or requested temperature)
+    expected_s_ve = stream.heat_transfer_coefficient_w_k * out.actual_supply_temperature_c
+    assert boundary.source_term_w == pytest.approx(expected_s_ve)
+
+    # Q_ve = H_ve * T_zone - S_ve; supply at 18 °C < zone 21 °C → positive Q_ve
+    expected_q_ve = stream.heat_transfer_coefficient_w_k * t_zone - expected_s_ve
+    assert boundary.sensible_heat_flow_w(t_zone) == pytest.approx(expected_q_ve)
 
 
 # ---------------------------------------------------------------------------

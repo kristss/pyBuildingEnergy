@@ -19,7 +19,7 @@ that produces theta_SUP_req_zV for the AHU calculation.
 Physical constants
 ------------------
 Standard air at sea level, approximately 20 °C:
-  rho = 1.204 kg/m³,  cp = 1005 J/(kg·K)  →  rho*cp = 1210.02 J/(m³·K)
+  rho = 1.204 kg/m³,  cp = 1006 J/(kg·K)  →  rho*cp = 1211.224 J/(m³·K)
 
 Fan heat placement
 ------------------
@@ -42,8 +42,8 @@ from .ventilation import VentilationStream
 # ---------------------------------------------------------------------------
 
 _RHO_AIR_KG_M3: float = 1.204
-_CP_AIR_J_KG_K: float = 1005.0
-_RHO_CP_J_M3_K: float = _RHO_AIR_KG_M3 * _CP_AIR_J_KG_K  # 1210.02 J/(m³·K)
+_CP_AIR_J_KG_K: float = 1006.0
+_RHO_CP_J_M3_K: float = _RHO_AIR_KG_M3 * _CP_AIR_J_KG_K  # 1211.224 J/(m³·K)
 
 
 # ---------------------------------------------------------------------------
@@ -638,5 +638,5 @@ def ahu_outputs_to_ventilation_stream(
         name=name,
         heat_transfer_coefficient_w_k=h_w_k,
         source_temperature_c=outputs.actual_supply_temperature_c,
-        category="mechanical_supply",
+        category="supply",
     )
