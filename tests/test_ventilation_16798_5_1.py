@@ -297,9 +297,9 @@ def test_config_rejects_fan_fraction_above_one():
         _cfg(supply_fan_heat_fraction_to_air=1.1)
 
 
-def test_config_rejects_zero_heating_coil_max():
-    with pytest.raises(ValueError, match="heating_coil_max_power_w"):
-        _cfg(heating_coil_max_power_w=0.0)
+def test_config_accepts_zero_heating_coil_max():
+    cfg = _cfg(heating_coil_max_power_w=0.0)
+    assert cfg.heating_coil_max_power_w == 0.0
 
 
 def test_config_rejects_negative_heating_coil_max():
@@ -399,13 +399,13 @@ def test_zero_operation_produces_zero_flow_and_energy():
     assert out.required_heating_coil_power_w == 0.0
     assert out.actual_heating_coil_power_w == 0.0
     assert out.bypass_fraction == 0.0
-    assert not out.frost_control_active
+    assert not out.frost_protection_required
 
 
-def test_zero_operation_requested_setpoint_is_outdoor_temperature():
-    # AHU is off: no setpoint resolution; reported value is outdoor air temperature.
+def test_zero_operation_requested_setpoint_is_none():
+    # AHU is off: no setpoint resolved; None signals "not applicable".
     out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
-    assert out.requested_supply_temperature_c == pytest.approx(-9.7)
+    assert out.requested_supply_temperature_c is None
 
 
 def test_scheduled_control_off_ahu_does_not_require_setpoint():
@@ -553,7 +553,7 @@ def test_frost_control_activates_when_exhaust_would_freeze():
         _cfg(frost_exhaust_limit_c=-5.0),
         _inp(outdoor_temperature_c=-15.0, extract_temperature_c=21.0),
     )
-    assert out.frost_control_active
+    assert out.frost_protection_required
 
 
 def test_frost_control_reduces_hr_efficiency_to_keep_exhaust_at_limit():
@@ -579,14 +579,14 @@ def test_frost_control_not_active_when_exhaust_above_limit():
         _cfg(frost_exhaust_limit_c=-5.0),
         _inp(outdoor_temperature_c=-5.0, extract_temperature_c=21.0),
     )
-    assert not out.frost_control_active
+    assert not out.frost_protection_required
 
 
 def test_frost_mode_none_never_activates():
     cfg = _cfg(frost_control="none", sensible_heat_recovery_efficiency=0.9)
     # Very cold outdoor, would normally trigger frost
     out = calculate_sensible_ahu_step(cfg, _inp(outdoor_temperature_c=-20.0))
-    assert not out.frost_control_active
+    assert not out.frost_protection_required
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +652,13 @@ def test_coil_capacity_scales_with_operation_fraction():
     )
 
 
+def test_zero_coil_max_delivers_no_heat():
+    cfg = _cfg(heating_coil_max_power_w=0.0)
+    out = calculate_sensible_ahu_step(cfg, _inp())
+    assert out.actual_heating_coil_power_w == pytest.approx(0.0, abs=1e-9)
+    assert out.required_heating_coil_power_w > 0.0  # coil is needed but absent
+
+
 # ---------------------------------------------------------------------------
 # Cooling disabled — unattainable cold setpoints
 # ---------------------------------------------------------------------------
@@ -672,6 +679,15 @@ def test_disabled_cooling_full_bypass_when_setpoint_below_outdoor():
     assert out.actual_supply_temperature_c == pytest.approx(5.0, abs=1e-6)
     assert out.bypass_fraction == pytest.approx(1.0, abs=1e-9)
     assert out.required_heating_coil_power_w == pytest.approx(0.0, abs=1e-9)
+    # Cooling shortfall: full bypass delivers T_outdoor=5°C; setpoint=2°C needs 3 K more
+    expected_cooling = _rho_cp_q() * (5.0 - 2.0)
+    assert out.required_cooling_coil_power_w == pytest.approx(expected_cooling, rel=1e-6)
+
+
+def test_cooling_unmet_load_zero_in_normal_heating_mode():
+    # Normal winter: HR undershoots setpoint → heating coil needed, no cooling shortfall
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    assert out.required_cooling_coil_power_w == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

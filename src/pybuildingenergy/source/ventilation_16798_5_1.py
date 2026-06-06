@@ -296,10 +296,10 @@ class SensibleAHUConfig:
         if self.heating_coil_max_power_w is not None:
             if (
                 not math.isfinite(self.heating_coil_max_power_w)
-                or self.heating_coil_max_power_w <= 0.0
+                or self.heating_coil_max_power_w < 0.0
             ):
                 raise ValueError(
-                    "heating_coil_max_power_w must be positive and finite when provided"
+                    "heating_coil_max_power_w must be finite and non-negative when provided"
                 )
 
         for name, value in (
@@ -388,34 +388,44 @@ class AHUStepOutputs:
     Power quantities are in watts, averaged over the timestep. Energy for a
     timestep is power_w * timestep_hours / 1000 kWh.
 
-    requested_supply_temperature_c: setpoint from the supply-temperature controller.
+    requested_supply_temperature_c: setpoint from the supply-temperature controller,
+                                    or None when the AHU is off (flow = 0).
     actual_supply_temperature_c:    delivered supply temperature including fan heat.
     heat_recovery_power_w:          rho*cp*q*(T_hr_outlet − T_outdoor).  Equals EN 16798-5-1
                                     formula-77 Q_hr only when all of the following hold:
                                     balanced flow, no recirculation, no ODA preheating, and
                                     frost correction inactive.  During active EXHAUST_LIMIT
-                                    frost control, this value includes what a preheat-based
-                                    defrost configuration would split into a separate preheat
-                                    term; the total supply heating from outdoor is the same
-                                    but the attribution differs.  Positive in heating mode;
-                                    negative in economizer mode.
+                                    frost control, the total supply heating relative to
+                                    outdoor air may differ from preheat-based defrost
+                                    configurations because the effective HR outlet temperature
+                                    is determined by a different algorithm.
+                                    Positive in heating mode; negative in economizer mode.
     required_heating_coil_power_w:  coil power needed to reach setpoint.
     actual_heating_coil_power_w:    coil power actually delivered (≤ required).
+    required_cooling_coil_power_w:  cooling coil power that would be needed to reach the
+                                    setpoint but cannot be delivered (cooling_coil_enabled
+                                    is not yet implemented).  Non-zero when the requested
+                                    supply temperature is below the minimum achievable by
+                                    bypass alone.
     fan_electric_power_w:           total fan electrical power (separate from thermal).
-    bypass_fraction:                fraction of airflow bypassing the HR core [0, 1].
-    frost_control_active:           True when HR efficiency was reduced for frost.
+    bypass_fraction:                effective fraction of the HR bypassed, derived from
+                                    actual vs nominal recovery [0, 1].  Reflects efficiency
+                                    reduction rather than a physical bypass damper position.
+    frost_protection_required:      True when exhaust temperature would fall below
+                                    frost_exhaust_limit_c at nominal HR efficiency.
     """
 
-    requested_supply_temperature_c: float
+    requested_supply_temperature_c: float | None
     actual_supply_temperature_c: float
     actual_supply_flow_m3_h: float
     actual_extract_flow_m3_h: float
     required_heating_coil_power_w: float
     actual_heating_coil_power_w: float
+    required_cooling_coil_power_w: float
     fan_electric_power_w: float
     heat_recovery_power_w: float
     bypass_fraction: float
-    frost_control_active: bool
+    frost_protection_required: bool
 
 
 def calculate_sensible_ahu_step(
@@ -465,16 +475,17 @@ def calculate_sensible_ahu_step(
 
     if q_sup <= 0.0:
         return AHUStepOutputs(
-            requested_supply_temperature_c=inputs.outdoor_temperature_c,
+            requested_supply_temperature_c=None,
             actual_supply_temperature_c=inputs.outdoor_temperature_c,
             actual_supply_flow_m3_h=0.0,
             actual_extract_flow_m3_h=0.0,
             required_heating_coil_power_w=0.0,
             actual_heating_coil_power_w=0.0,
+            required_cooling_coil_power_w=0.0,
             fan_electric_power_w=0.0,
             heat_recovery_power_w=0.0,
             bypass_fraction=0.0,
-            frost_control_active=False,
+            frost_protection_required=False,
         )
 
     # Step 1: Resolve requested setpoint (only reached when AHU is actually running)
@@ -506,11 +517,11 @@ def calculate_sensible_ahu_step(
     eta_nom = config.sensible_heat_recovery_efficiency
     dT = t_ext_at_hr - t_outdoor  # K; positive in heating mode
 
-    # Step 4: Bypass frost protection
+    # Step 4: EXHAUST_LIMIT frost protection (EN 16798-5-1 B108=2 INDIRECT).
     # The exhaust leaving the HR (EHA) must stay >= frost_exhaust_limit_c.
     # For balanced flow: T_EHA = T_extract_at_hr - eta * dT
-    # If T_EHA < limit, reduce eta so T_EHA exactly equals the limit.
-    frost_active = False
+    # If T_EHA < limit, reduce eta_eff so T_EHA exactly equals the limit.
+    frost_protection_req = False
     eta_eff = eta_nom
     if (
         config.frost_control is FrostControlMode.EXHAUST_LIMIT
@@ -519,7 +530,7 @@ def calculate_sensible_ahu_step(
     ):
         t_eha = t_ext_at_hr - eta_nom * dT  # exhaust at HR outlet
         if t_eha < config.frost_exhaust_limit_c:
-            frost_active = True
+            frost_protection_req = True
             eta_frost = (t_ext_at_hr - config.frost_exhaust_limit_c) / dT
             eta_eff = max(0.0, min(eta_nom, eta_frost))
 
@@ -560,6 +571,11 @@ def calculate_sensible_ahu_step(
     # Step 7: Heat recovery power (net thermal gain to supply vs outdoor air)
     hr_power_w = rho_cp_q * (t_after_hr - t_outdoor)
 
+    # Unmet cooling: power that would be needed to reach t_target but cannot be
+    # delivered because no cooling coil is present.  Positive when bypass has been
+    # driven to its limit and the supply is still above the setpoint.
+    required_cooling_coil_w = rho_cp_q * max(0.0, t_after_hr - t_target)
+
     # Step 8: Heating coil targeting t_target so delivered temperature equals
     # requested_t_sup after supply fan heat is added in step 9.
     # For ON/OFF scheduling (operation_fraction < 1), the time-averaged available
@@ -588,8 +604,9 @@ def calculate_sensible_ahu_step(
         actual_extract_flow_m3_h=actual_extract_m3_h,
         required_heating_coil_power_w=required_heating_w,
         actual_heating_coil_power_w=actual_heating_w,
+        required_cooling_coil_power_w=required_cooling_coil_w,
         fan_electric_power_w=fan_electric_power_w,
         heat_recovery_power_w=hr_power_w,
         bypass_fraction=bypass_fraction,
-        frost_control_active=frost_active,
+        frost_protection_required=frost_protection_req,
     )
