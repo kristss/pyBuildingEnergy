@@ -149,7 +149,7 @@ This is a practical escape hatch. It lets the caller impose a prescribed ventila
 ### 4.1 Mathematical foundation
 
 ISO 52016-1 §6.5.10 inserts ventilation into the zone energy balance through a conductance
-term and a source term.  The three dataclasses and one resolver function in this module
+term and a source term.  The two dataclasses and one resolver function in this module
 are an algebraically equivalent implementation of that formulation.
 
 Each airflow stream *k* (infiltration, mechanical supply, summer purge, etc.) contributes:
@@ -207,7 +207,7 @@ Computed properties:
 |----------|---------|------|
 | `heat_transfer_coefficient_w_k` | `Σ H_k` | W/K |
 | `source_term_w` | `Σ H_k · T_source,k` | W |
-| `equivalent_supply_temperature_c` | `S_ve / H_ve` (NaN when H_ve = 0) | °C |
+| `equivalent_supply_temperature_c` | `S_ve / H_ve` (None when H_ve = 0) | °C |
 
 An empty `streams` tuple is valid and represents zero ventilation (`H_ve = 0`, `S_ve = 0`).
 
@@ -254,7 +254,7 @@ ventilation.  Each entry is a dict:
 ```python
 {
     "name": "infiltration",               # required, unique label
-    "ventilation_type": "constant_ach",   # any scalar type, or "prescribed"
+    "ventilation_type": "constant_ach",   # "constant_ach" or "prescribed"
     "profile": "ventilation_profile",     # optional — names a profile_df column
     # type-specific keys, e.g.:
     "air_changes_per_hour": 0.3,
@@ -280,7 +280,7 @@ A `components` list may combine infiltration (no profile → always active) and 
 supply (with profile → follows schedule), which is the practical purpose of the additive
 stream model and the contract required by the EN 16798-5-1 AHU module (PR 2).
 
-## 6. `internal_gains`
+## 5. `internal_gains`
 
 The second major method is `internal_gains`.
 
@@ -307,19 +307,19 @@ The calculation proceeds in layers:
 
 This design is important because it separates the baseline assumptions from the project-specific tuning. In other words, the module knows the canonical values, but it still allows a higher-level model to replace them when the building under study has more precise data.
 
-### 6.1 Local overrides
+### 5.1 Local overrides
 
 The override mechanism is straightforward: if the building object contains an `internal_gains` list, each item can replace one of the default full-load values.
 
 That makes the function compatible with project workflows in which internal gains are specified explicitly rather than inferred from the usage class alone.
 
-### 6.2 Unconditioned adjacent zones
+### 5.2 Unconditioned adjacent zones
 
 The method also contains an optional branch for nearby unconditioned zones. In that case, internal gains can be redistributed using coupling factors such as `Fztc_ztu_m` and `b_ztu`.
 
 Even though this part of the function is more specialized, the underlying idea is clear: not all internal gains remain confined to the conditioned space where they originate. Some can be transferred to adjacent zones and should therefore be handled in the energy balance.
 
-## 7. `transmission_heat_transfer_coefficient_ISO13789`
+## 6. `transmission_heat_transfer_coefficient_ISO13789`
 
 The module ends with a helper function for unconditioned-adjacent-zone transmission:
 
@@ -338,7 +338,7 @@ The function also computes an adjustment factor `b_ztu_m`, representing the shar
 
 Conceptually, this helper is a bridge between the detailed zone formulation and the simplified representation of buffer spaces. It turns geometry, transmittance, and ventilation assumptions into an aggregate thermal conductance that can be used in the broader simulation.
 
-## 8. Design Style of the Module
+## 7. Design Style of the Module
 
 What makes this module useful is not just the formulas it implements, but the way it is structured:
 
@@ -350,7 +350,7 @@ What makes this module useful is not just the formulas it implements, but the wa
 
 This makes the module well suited to engineering workflows where input data are incomplete, heterogeneous, or gradually refined over time.
 
-## 9. Practical Reading of the Code
+## 8. Practical Reading of the Code
 
 If one reads the module as part of a thermal simulation pipeline, its logic becomes easy to summarize:
 
@@ -364,7 +364,7 @@ If one reads the module as part of a thermal simulation pipeline, its logic beco
 
 Taken together, these functions define how the building exchanges heat with the air around it and with the people and equipment inside it. In a simulation context, that is enough to strongly influence both heating and cooling demand.
 
-## 10. Closing Note
+## 9. Closing Note
 
 The module is small, but it carries a disproportionate share of the physical realism of the model. Ventilation and internal gains are often treated as secondary details in simplified building analyses, yet they are among the first mechanisms that determine whether a zone remains comfortable or drifts away from setpoint.
 

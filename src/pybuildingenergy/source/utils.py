@@ -1965,6 +1965,7 @@ def Calculation_ISO_52010(building_object, path_weather_file, weather_source="pv
     # - PVGIS data are UTC -> convert to local civil time using site timezone.
     # - EPW read via pvlib is already in local weather-file time -> keep as-is.
     if weather_source == "pvgis":
+        from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
         tf = TimezoneFinder()
         tz_name = tf.timezone_at(lng=weatherData.longitude, lat=weatherData.latitude) or "UTC"
         idx = pd.DatetimeIndex(sim_df.index)
@@ -3335,6 +3336,7 @@ class ISO52016:
         sim_df.index = pd.DatetimeIndex(sim_df.index)
         sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
         sim_df = sim_df.sort_index()
+        T2m_arr = _series_to_float_array(sim_df, "T2m")
 
         # ------------------------
         # 0.1) Time profiles (occupancy/heating/cooling/ventilation)
@@ -5202,6 +5204,7 @@ class ISO52016:
         sim_df.index = pd.DatetimeIndex(sim_df.index)
         sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
         sim_df = sim_df.sort_index()
+        T2m_arr = _series_to_float_array(sim_df, "T2m")
 
         zones = building_object.get("zones", None)
         if not zones:
