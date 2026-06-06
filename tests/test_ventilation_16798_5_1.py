@@ -18,7 +18,7 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     calculate_sensible_ahu_step,
     resolve_supply_temperature_setpoint,
 )
-from pybuildingenergy.source.ventilation import VentilationStream
+from pybuildingenergy.source.ventilation import VentilationBoundary, VentilationStream
 
 
 def _point(reference_c, supply_c):
@@ -910,3 +910,145 @@ def test_adapter_zone_heat_flow_formula():
         out.actual_supply_temperature_c - t_zone
     )
     assert q_stream == pytest.approx(q_direct)
+
+
+# ---------------------------------------------------------------------------
+# Solver integration tests
+# ---------------------------------------------------------------------------
+
+def _infiltration_stream(t_outdoor_c: float, h_w_k: float = 50.0) -> VentilationStream:
+    """Outdoor-air infiltration stream at fixed conductance."""
+    return VentilationStream(
+        name="infiltration",
+        heat_transfer_coefficient_w_k=h_w_k,
+        source_temperature_c=t_outdoor_c,
+        category="outdoor_air",
+    )
+
+
+def test_integration_boundary_h_ve_is_sum_of_streams():
+    """VentilationBoundary H_ve equals infiltration plus AHU stream conductances."""
+    t_outdoor = -5.0
+    inf = _infiltration_stream(t_outdoor, h_w_k=50.0)
+    out = calculate_sensible_ahu_step(_cfg(), _inp(outdoor_temperature_c=t_outdoor))
+    ahu = ahu_outputs_to_ventilation_stream(out)
+    bnd = VentilationBoundary([inf, ahu])
+
+    assert bnd.heat_transfer_coefficient_w_k == pytest.approx(
+        inf.heat_transfer_coefficient_w_k + ahu.heat_transfer_coefficient_w_k
+    )
+
+
+def test_integration_actual_supply_temperature_enters_s_ve():
+    """S_ve includes H_ahu * actual_supply_temperature_c, not the outdoor or requested value."""
+    t_outdoor = -5.0
+    t_zone = 21.0
+    inf = _infiltration_stream(t_outdoor, h_w_k=50.0)
+    out = calculate_sensible_ahu_step(_cfg(), _inp(outdoor_temperature_c=t_outdoor))
+    ahu = ahu_outputs_to_ventilation_stream(out)
+    bnd = VentilationBoundary([inf, ahu])
+
+    expected_s_ve = (
+        inf.heat_transfer_coefficient_w_k * t_outdoor
+        + ahu.heat_transfer_coefficient_w_k * out.actual_supply_temperature_c
+    )
+    assert bnd.source_term_w == pytest.approx(expected_s_ve)
+
+    # Supply temperature is warmer than outdoor, so S_ve > H_ve * T_outdoor.
+    s_ve_if_outdoor = bnd.heat_transfer_coefficient_w_k * t_outdoor
+    assert bnd.source_term_w > s_ve_if_outdoor
+
+
+def test_integration_infiltration_active_when_ahu_off():
+    """With AHU off, infiltration stream still contributes its full conductance."""
+    t_outdoor = -5.0
+    inf = _infiltration_stream(t_outdoor, h_w_k=50.0)
+    out = calculate_sensible_ahu_step(_cfg(), _inp(outdoor_temperature_c=t_outdoor,
+                                                    operation_fraction=0.0))
+    ahu_off = ahu_outputs_to_ventilation_stream(out)
+    bnd = VentilationBoundary([inf, ahu_off])
+
+    assert ahu_off.heat_transfer_coefficient_w_k == 0.0
+    assert bnd.heat_transfer_coefficient_w_k == pytest.approx(
+        inf.heat_transfer_coefficient_w_k
+    )
+    assert bnd.source_term_w == pytest.approx(
+        inf.heat_transfer_coefficient_w_k * t_outdoor
+    )
+
+
+def test_integration_ahu_off_does_not_affect_zone_heat_flow():
+    """When AHU is off, sensible_heat_flow_w equals infiltration-only heat flow."""
+    t_outdoor = -5.0
+    t_zone = 21.0
+    inf = _infiltration_stream(t_outdoor, h_w_k=50.0)
+
+    out_on = calculate_sensible_ahu_step(_cfg(), _inp(outdoor_temperature_c=t_outdoor))
+    out_off = calculate_sensible_ahu_step(_cfg(), _inp(outdoor_temperature_c=t_outdoor,
+                                                        operation_fraction=0.0))
+    bnd_on = VentilationBoundary([inf, ahu_outputs_to_ventilation_stream(out_on)])
+    bnd_off = VentilationBoundary([inf, ahu_outputs_to_ventilation_stream(out_off)])
+
+    # AHU off → boundary = infiltration only
+    assert bnd_off.sensible_heat_flow_w(t_zone) == pytest.approx(
+        inf.heat_transfer_coefficient_w_k * t_zone - inf.heat_transfer_coefficient_w_k * t_outdoor
+    )
+    # AHU on with supply at 18 °C < zone 21 °C: supply air removes additional
+    # heat from the zone (positive Q_ve increases), so total Q_ve is higher.
+    assert bnd_on.sensible_heat_flow_w(t_zone) > bnd_off.sensible_heat_flow_w(t_zone)
+
+
+def test_integration_previous_step_extract_temperature_pattern():
+    """Verify one-step-lag coupling: T_zone_prev is passed as extract_temperature_c.
+
+    The extract temperature only affects HR heat recovery, not zone balance algebra.
+    A warmer previous-step zone temperature increases HR output and reduces coil load.
+    """
+    t_outdoor = -5.0
+    t_zone_prev_cold = 18.0
+    t_zone_prev_warm = 24.0
+
+    out_cold = calculate_sensible_ahu_step(
+        _cfg(), _inp(outdoor_temperature_c=t_outdoor,
+                     extract_temperature_c=t_zone_prev_cold)
+    )
+    out_warm = calculate_sensible_ahu_step(
+        _cfg(), _inp(outdoor_temperature_c=t_outdoor,
+                     extract_temperature_c=t_zone_prev_warm)
+    )
+
+    # Warmer previous-step zone → more HR heat → less coil required
+    assert out_warm.heat_recovery_power_w > out_cold.heat_recovery_power_w
+    assert out_warm.required_heating_coil_power_w < out_cold.required_heating_coil_power_w
+
+
+def test_integration_s_ve_sign_convention_positive_is_heat_to_zone():
+    """Q_ve = H_ve*T_zone - S_ve; positive means heat leaving the zone.
+
+    When supply is colder than zone, net ventilation removes heat from zone
+    (positive Q_ve).  When supply is warmer than zone, net flow adds heat
+    (negative Q_ve = heat into zone).
+    """
+    t_outdoor = -5.0
+    t_zone = 21.0
+
+    # Supply at 18 °C < zone 21 °C → ventilation removes heat → positive Q_ve
+    out = calculate_sensible_ahu_step(
+        _cfg(), _inp(outdoor_temperature_c=t_outdoor)
+    )
+    ahu = ahu_outputs_to_ventilation_stream(out)
+    bnd = VentilationBoundary([ahu])
+    assert out.actual_supply_temperature_c < t_zone
+    assert bnd.sensible_heat_flow_w(t_zone) > 0.0
+
+    # Supply above zone → ventilation adds heat → negative Q_ve
+    out_hot = calculate_sensible_ahu_step(
+        _cfg(supply_temperature_control=SupplyTemperatureControl(
+            mode=SupplyTemperatureControlMode.FIXED, setpoint_c=30.0
+        )),
+        _inp(outdoor_temperature_c=t_outdoor)
+    )
+    ahu_hot = ahu_outputs_to_ventilation_stream(out_hot)
+    bnd_hot = VentilationBoundary([ahu_hot])
+    assert out_hot.actual_supply_temperature_c > t_zone
+    assert bnd_hot.sensible_heat_flow_w(t_zone) < 0.0
