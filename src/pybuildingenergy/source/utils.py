@@ -3873,6 +3873,11 @@ class ISO52016:
                 }
             )
 
+        # Per-zone AHU output buffers: keyed by (zone_index, component_name).
+        # Populated lazily on first encounter so unknown component sets don't need pre-scanning.
+        # Keys: "Q_coil" [W actual], "Q_hr" [W], "P_fan" [W], "T_sup" [°C], "frost" [0/1].
+        _ahu_buffers: dict = {}  # (zi, comp_name) -> {"Q_coil": np.array, ...}
+
         # ------------------------
         # 7) Ground virtual temperature (optional)
         # ------------------------
@@ -4217,10 +4222,11 @@ class ISO52016:
             theta_air_prev: float,
             tstep: int,
             T_out: float,
-        ) -> tuple:  # (VentilationBoundary, float, int)
+        ) -> tuple:  # (VentilationBoundary, float, int, dict)
             _empty = VentilationBoundary(streams=())
+            _empty_ahu: dict = {}
             if not include_ventilation:
-                return _empty, 1.0, 0
+                return _empty, 1.0, 0, _empty_ahu
 
             zname = str(zone_obj.get("name", zone_names[0]))
             if zname not in zone_proxies:
@@ -4232,7 +4238,7 @@ class ISO52016:
             has_components = "components" in vent_cfg
 
             if not has_components and vent_type in ("none", "off", "disabled", ""):
-                return _empty, 1.0, 0
+                return _empty, 1.0, 0, _empty_ahu
 
             ws = float(sim_df["WS10m"].iloc[tstep]) if "WS10m" in sim_df.columns else 0.0
             profile_mult = _profile_value(zname, "ventilation_profile", tstep, 1.0)
@@ -4274,6 +4280,7 @@ class ISO52016:
                         )
                     _comp_mult[_cname] = _profile_value(zname, _prof, tstep, 1.0)
 
+            _ahu_coll: dict = {}
             try:
                 base_bdy = resolve_ventilation_boundary(
                     proxy,
@@ -4283,6 +4290,7 @@ class ISO52016:
                     profile_multiplier=profile_mult,
                     component_multipliers=_comp_mult if _comp_mult else None,
                     zone_volume_m3=zone_vol if zone_vol > 0.0 else None,
+                    ahu_outputs_collector=_ahu_coll,
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -4395,7 +4403,7 @@ class ISO52016:
                         purge_factor_applied = float(boost_factor)
                         purge_active = 1
 
-            return base_bdy, purge_factor_applied, purge_active
+            return base_bdy, purge_factor_applied, purge_active, _ahu_coll
 
         def _zone_solar_transmitted_w(tstep: int) -> np.ndarray:
             phi_sol = np.zeros(Z, dtype=float)
@@ -4720,11 +4728,27 @@ class ISO52016:
             purge_active_z_t = np.zeros(Z, dtype=int)
             for zi, zone in enumerate(zones):
                 phi_int_z_t[zi] = _zone_internal_gain_w(zone, t)
-                vent_bdy, purge_factor_z_t[zi], purge_active_z_t[zi] = _zone_ventilation_h_wk(
-                    zone, Theta[zi], t, T_out
+                vent_bdy, purge_factor_z_t[zi], purge_active_z_t[zi], _ahu_step = (
+                    _zone_ventilation_h_wk(zone, Theta[zi], t, T_out)
                 )
                 h_ve_z_t[zi] = vent_bdy.heat_transfer_coefficient_w_k
                 s_ve_z_t[zi] = vent_bdy.source_term_w
+                for _cn, _ao in _ahu_step.items():
+                    _key = (zi, _cn)
+                    if _key not in _ahu_buffers:
+                        _ahu_buffers[_key] = {
+                            "Q_coil": np.full(Tstepn, np.nan),
+                            "Q_hr": np.full(Tstepn, np.nan),
+                            "P_fan": np.full(Tstepn, np.nan),
+                            "T_sup": np.full(Tstepn, np.nan),
+                            "frost": np.zeros(Tstepn, dtype=np.int8),
+                        }
+                    _buf = _ahu_buffers[_key]
+                    _buf["Q_coil"][t] = _ao.actual_heating_coil_power_w
+                    _buf["Q_hr"][t] = _ao.heat_recovery_power_w
+                    _buf["P_fan"][t] = _ao.fan_electric_power_w
+                    _buf["T_sup"][t] = _ao.actual_supply_temperature_c
+                    _buf["frost"][t] = int(_ao.frost_protection_required)
             phi_sol_z_t = _zone_solar_transmitted_w(t)
 
             # Base matrix for this timestep
@@ -4938,6 +4962,16 @@ class ISO52016:
             out_data[f"Q_ground_surface_{surface_out['surface_token']}"] = surface_out["Q_ground"]
         for surface_out in opaque_inside_surface_output_buffers:
             out_data[f"Q_opaque_inside_surface_{surface_out['surface_token']}"] = surface_out["Q_inside"]
+
+        # AHU component outputs: Q_ahu_coil, Q_ahu_hr, P_ahu_fan, T_ahu_sup, ahu_frost
+        # Columns appear only when at least one mechanical_supply component ran.
+        for (zi, comp_name), _buf in _ahu_buffers.items():
+            _zn = zone_names[zi]
+            out_data[f"Q_ahu_coil_{comp_name}_{_zn}"] = _buf["Q_coil"]
+            out_data[f"Q_ahu_hr_{comp_name}_{_zn}"] = _buf["Q_hr"]
+            out_data[f"P_ahu_fan_{comp_name}_{_zn}"] = _buf["P_fan"]
+            out_data[f"T_ahu_sup_{comp_name}_{_zn}"] = _buf["T_sup"]
+            out_data[f"ahu_frost_{comp_name}_{_zn}"] = _buf["frost"]
 
         out = pd.DataFrame(out_data, index=sim_df.index)
         out = out.iloc[start_idx:].copy()

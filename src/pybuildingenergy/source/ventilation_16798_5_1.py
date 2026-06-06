@@ -626,12 +626,26 @@ def calculate_sensible_ahu_step(
 # ISO 52016-1 zone adapter
 # ---------------------------------------------------------------------------
 
+def _opt_float(v) -> "float | None":
+    return None if v is None else float(v)
+
+
 def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
     """Build a SensibleAHUConfig from a ventilation component dict.
 
     Required keys:
       ``sensible_heat_recovery_efficiency`` — float in [0, 1]
-      ``supply_temperature_setpoint_c``     — fixed supply setpoint [°C]
+
+    Supply temperature control — choose one mode:
+
+    Fixed (default; use when ``supply_temperature_mode`` is absent or "fixed"):
+      ``supply_temperature_setpoint_c``     — fixed setpoint [°C]
+
+    Outdoor-compensated (``supply_temperature_mode = "outdoor_compensated"``):
+      ``supply_temperature_points``         — list of [T_oda, T_sup] pairs, e.g.
+                                             [[-20, 19], [15, 17]] for ZEBlab
+      ``supply_temperature_minimum_c``      — optional clamp [°C]
+      ``supply_temperature_maximum_c``      — optional clamp [°C]
 
     Optional keys and their defaults:
       ``heat_recovery_control``             — "modulating_bypass"
@@ -644,20 +658,52 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
       ``supply_fan_heat_fraction_to_air``   — 1.0
       ``extract_fan_heat_fraction_to_air``  — 1.0
     """
-    raw_setpoint = d.get("supply_temperature_setpoint_c")
-    if raw_setpoint is None:
-        raise KeyError(
-            "mechanical_supply component requires 'supply_temperature_setpoint_c'"
-        )
     heating_coil_max = d.get("heating_coil_max_power_w")
     if heating_coil_max is not None:
         heating_coil_max = float(heating_coil_max)
-    return SensibleAHUConfig(
-        sensible_heat_recovery_efficiency=float(d["sensible_heat_recovery_efficiency"]),
-        supply_temperature_control=SupplyTemperatureControl(
+
+    ctrl_mode_str = str(d.get("supply_temperature_mode", "fixed")).strip().lower()
+    if ctrl_mode_str in ("fixed", ""):
+        raw_setpoint = d.get("supply_temperature_setpoint_c")
+        if raw_setpoint is None:
+            raise KeyError(
+                "fixed supply control requires 'supply_temperature_setpoint_c'"
+            )
+        supply_ctrl = SupplyTemperatureControl(
             mode=SupplyTemperatureControlMode.FIXED,
             setpoint_c=float(raw_setpoint),
-        ),
+            minimum_c=_opt_float(d.get("supply_temperature_minimum_c")),
+            maximum_c=_opt_float(d.get("supply_temperature_maximum_c")),
+        )
+    elif ctrl_mode_str == "outdoor_compensated":
+        raw_pts = d.get("supply_temperature_points")
+        if not raw_pts:
+            raise KeyError(
+                "outdoor_compensated control requires 'supply_temperature_points' "
+                "(list of [T_oda, T_sup] pairs)"
+            )
+        points = tuple(
+            CompensationPoint(
+                reference_temperature_c=float(p[0]),
+                supply_temperature_c=float(p[1]),
+            )
+            for p in raw_pts
+        )
+        supply_ctrl = SupplyTemperatureControl(
+            mode=SupplyTemperatureControlMode.OUTDOOR_COMPENSATED,
+            points=points,
+            minimum_c=_opt_float(d.get("supply_temperature_minimum_c")),
+            maximum_c=_opt_float(d.get("supply_temperature_maximum_c")),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported supply_temperature_mode: {ctrl_mode_str!r}. "
+            "Supported: 'fixed', 'outdoor_compensated'."
+        )
+
+    return SensibleAHUConfig(
+        sensible_heat_recovery_efficiency=float(d["sensible_heat_recovery_efficiency"]),
+        supply_temperature_control=supply_ctrl,
         heat_recovery_control=str(d.get("heat_recovery_control", "modulating_bypass")),
         frost_control=str(d.get("frost_control", "exhaust_limit")),
         frost_exhaust_limit_c=float(d.get("frost_exhaust_limit_c", -5.0)),

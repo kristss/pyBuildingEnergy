@@ -667,6 +667,7 @@ def _resolve_component_streams(
     component_multipliers: dict = None,
     default_multiplier: float = 1.0,
     zone_temperature_c: float = 20.0,
+    ahu_outputs_collector: dict = None,
 ) -> list:
     """Convert a ventilation components list to VentilationStream objects.
 
@@ -739,6 +740,8 @@ def _resolve_component_streams(
                 timestep_hours=1.0,
             )
             ahu_out = calculate_sensible_ahu_step(ahu_cfg, ahu_inp)
+            if ahu_outputs_collector is not None:
+                ahu_outputs_collector[name] = ahu_out
             _s = ahu_outputs_to_ventilation_stream(ahu_out, name=name)
             h_k = _s.heat_transfer_coefficient_w_k
             source_temp = _s.source_temperature_c
@@ -773,6 +776,7 @@ def resolve_ventilation_boundary(
     extra_streams=(),
     c_air: float = 1006.0,
     rho_air: float = 1.204,
+    ahu_outputs_collector: dict = None,
 ) -> VentilationBoundary:
     """Resolve building/zone configuration into an ISO 52016-1 VentilationBoundary.
 
@@ -819,6 +823,7 @@ def resolve_ventilation_boundary(
             component_multipliers=component_multipliers,
             default_multiplier=1.0,
             zone_temperature_c=zone_temperature_c,
+            ahu_outputs_collector=ahu_outputs_collector,
         )
     else:
         vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()

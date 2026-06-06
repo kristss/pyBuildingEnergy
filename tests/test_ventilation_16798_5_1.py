@@ -14,6 +14,7 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     SupplyTemperatureControl,
     SupplyTemperatureControlMode,
     _RHO_CP_J_M3_K,
+    _opt_float,
     ahu_outputs_to_ventilation_stream,
     calculate_sensible_ahu_step,
     resolve_supply_temperature_setpoint,
@@ -1138,3 +1139,63 @@ def test_from_dict_produces_runnable_config():
     )
     out = calculate_sensible_ahu_step(cfg, inp)
     assert out.actual_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+
+
+def test_from_dict_outdoor_compensated_mode():
+    """outdoor_compensated mode with two-point curve."""
+    # Points: T_oda=-20 → T_sup=19, T_oda=+15 → T_sup=17 (ZEBlab-like curve)
+    cfg = sensible_ahu_config_from_dict({
+        "sensible_heat_recovery_efficiency": 0.784,
+        "supply_temperature_mode": "outdoor_compensated",
+        "supply_temperature_points": [[-20, 19], [15, 17]],
+    })
+    assert cfg.supply_temperature_control.mode is SupplyTemperatureControlMode.OUTDOOR_COMPENSATED
+    assert len(cfg.supply_temperature_control.points) == 2
+
+
+def test_from_dict_outdoor_compensated_delivers_interpolated_setpoint():
+    """At T_oda=0, interpolated setpoint = 17 + (15-0)/(15-(-20)) * (19-17) = 17 + 15/35*2 ≈ 17.857."""
+    cfg = sensible_ahu_config_from_dict({
+        "sensible_heat_recovery_efficiency": 0.784,
+        "supply_temperature_mode": "outdoor_compensated",
+        "supply_temperature_points": [[-20, 19], [15, 17]],
+    })
+    inp = AHUStepInputs(
+        outdoor_temperature_c=0.0,
+        extract_temperature_c=21.0,
+        required_supply_flow_m3_h=3600.0,
+        required_extract_flow_m3_h=3600.0,
+        operation_fraction=1.0,
+        timestep_hours=1.0,
+    )
+    out = calculate_sensible_ahu_step(cfg, inp)
+    expected_setpoint = 17.0 + (15.0 - 0.0) / (15.0 - (-20.0)) * (19.0 - 17.0)
+    assert out.requested_supply_temperature_c == pytest.approx(expected_setpoint, rel=1e-6)
+    # Actual supply reaches the setpoint (HR+coil can cover T_oda=0 → setpoint≈17.86)
+    assert out.actual_supply_temperature_c == pytest.approx(expected_setpoint, abs=0.1)
+
+
+def test_from_dict_outdoor_compensated_missing_points_raises():
+    with pytest.raises(KeyError, match="supply_temperature_points"):
+        sensible_ahu_config_from_dict({
+            "sensible_heat_recovery_efficiency": 0.784,
+            "supply_temperature_mode": "outdoor_compensated",
+        })
+
+
+def test_from_dict_unknown_mode_raises():
+    with pytest.raises(ValueError, match="Unsupported supply_temperature_mode"):
+        sensible_ahu_config_from_dict({
+            "sensible_heat_recovery_efficiency": 0.784,
+            "supply_temperature_mode": "magic",
+            "supply_temperature_setpoint_c": 18.0,
+        })
+
+
+def test_opt_float_returns_none_for_none():
+    assert _opt_float(None) is None
+
+
+def test_opt_float_converts_numeric():
+    assert _opt_float(17.5) == pytest.approx(17.5)
+    assert _opt_float("18") == pytest.approx(18.0)

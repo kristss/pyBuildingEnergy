@@ -1893,44 +1893,95 @@ class TestMechanicalSupplyComponent:
         assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
 
     def test_extract_temperature_affects_hr(self):
-        """Higher extract temperature → more HR power → higher supply temperature."""
-        # At T_oda=-10, T_ext=21 → T_hr = -10 + 0.784*31 = 14.304 → coil to 18
-        # At T_oda=-10, T_ext=25 → T_hr = -10 + 0.784*35 = 17.44 → coil to 18
-        # Both reach 18 °C setpoint, but HR powers differ — test that zone_temperature_c
-        # (extract temperature) is used, not a fixed value.
-        bdy_cool = resolve_ventilation_boundary(
-            _ahu_building([_ahu_component()]),
+        """zone_temperature_c is passed as extract temperature — different T_ext → different supply.
+
+        With no heating coil the supply equals the HR outlet, which depends on extract
+        temperature.  An unlimited coil would hide the difference by topping up to 18 °C
+        in both cases; this test uses heating_coil_max_power_w=0 to expose the physics.
+
+        T_oda=-10, T_ext=21: T_hr = -10 + 0.784*31 = 14.304 °C  (no frost: T_eha = -3.3 > -5)
+        T_oda=-10, T_ext=25: T_hr = -10 + 0.784*35 = 17.44  °C  (no frost: T_eha = -2.4 > -5)
+        """
+        no_coil = dict(heating_coil_max_power_w=0.0)
+        bdy_21 = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component(**no_coil)]),
             zone_temperature_c=21.0,
             outdoor_temperature_c=-10.0,
             wind_speed_m_s=0.0,
         )
-        bdy_warm = resolve_ventilation_boundary(
-            _ahu_building([_ahu_component()]),
+        bdy_25 = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component(**no_coil)]),
             zone_temperature_c=25.0,
             outdoor_temperature_c=-10.0,
             wind_speed_m_s=0.0,
         )
-        # Both supply at 18 °C, same flow → same H_ve and S_ve
-        assert bdy_cool.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
-        assert bdy_warm.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
-        # H_ve identical (same flow rate)
-        assert bdy_cool.heat_transfer_coefficient_w_k == pytest.approx(
-            bdy_warm.heat_transfer_coefficient_w_k, rel=1e-9
-        )
+        # Without a coil, supply = T_hr exactly
+        assert bdy_21.equivalent_supply_temperature_c == pytest.approx(-10 + 0.784 * 31, rel=1e-5)
+        assert bdy_25.equivalent_supply_temperature_c == pytest.approx(-10 + 0.784 * 35, rel=1e-5)
+        # Higher extract → more HR → warmer supply
+        assert bdy_25.equivalent_supply_temperature_c > bdy_21.equivalent_supply_temperature_c
 
     def test_frost_protection_reduces_hr_at_extreme_cold(self):
-        """At T_oda=-15, EXHAUST_LIMIT frost protection reduces effective HR."""
-        # Without frost: T_eha = 21 - 0.784*36 = -7.2 < -5 → frost kicks in
-        # eta_frost = (21-(-5))/36 = 26/36; T_hr = -15 + (26/36)*36 = 11 °C
-        # Supply = 18 °C (coil covers the gap)
-        bdy = resolve_ventilation_boundary(
-            _ahu_building([_ahu_component()]),
+        """EXHAUST_LIMIT frost protection actively reduces effective HR efficiency.
+
+        With no heating coil the frost-limited HR outlet is directly observable as
+        the delivered supply temperature.  Comparing against frost_control='none'
+        confirms the efficiency reduction is real, not masked by the coil.
+
+        T_oda=-15, T_ext=21, eta=0.784, frost_limit=-5 (default):
+          T_eha_nom = 21 - 0.784*36 = -7.224 °C  < -5  → frost active
+          eta_frost  = (21 - (-5)) / 36 = 26/36
+          T_hr_frost = -15 + (26/36)*36 = 11.0 °C
+        Without frost (mode='none'):
+          T_hr       = -15 + 0.784*36  = 13.224 °C
+        """
+        no_coil = dict(heating_coil_max_power_w=0.0)
+        bdy_frost = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component(**no_coil)]),
             zone_temperature_c=21.0,
             outdoor_temperature_c=-15.0,
             wind_speed_m_s=0.0,
         )
-        # Supply still reaches setpoint; but note stream H_ve unchanged (full flow)
-        assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+        bdy_no_frost = resolve_ventilation_boundary(
+            _ahu_building([_ahu_component(**no_coil, frost_control="none")]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-15.0,
+            wind_speed_m_s=0.0,
+        )
+        assert bdy_frost.equivalent_supply_temperature_c == pytest.approx(11.0, abs=1e-6)
+        assert bdy_no_frost.equivalent_supply_temperature_c == pytest.approx(
+            -15 + 0.784 * 36, rel=1e-5
+        )
+        assert bdy_frost.equivalent_supply_temperature_c < bdy_no_frost.equivalent_supply_temperature_c
+
+    def test_ahu_outputs_collector_captures_step_results(self):
+        """ahu_outputs_collector receives AHUStepOutputs for every mechanical_supply component."""
+        coll = {}
+        resolve_ventilation_boundary(
+            _ahu_building([_ahu_component()]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            ahu_outputs_collector=coll,
+        )
+        assert "ahu" in coll
+        from pybuildingenergy.source.ventilation_16798_5_1 import AHUStepOutputs
+        assert isinstance(coll["ahu"], AHUStepOutputs)
+        assert coll["ahu"].actual_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
+        assert coll["ahu"].actual_heating_coil_power_w >= 0.0
+        assert coll["ahu"].heat_recovery_power_w >= 0.0
+
+    def test_ahu_outputs_collector_empty_when_no_mechanical_supply(self):
+        """No mechanical_supply components → collector is untouched."""
+        coll = {}
+        bld = {
+            "building_parameters": {"ventilation": {"components": [
+                {"name": "inf", "ventilation_type": "constant_ach", "air_changes_per_hour": 0.5},
+            ]}}
+        }
+        resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0, zone_volume_m3=1000.0,
+                                     ahu_outputs_collector=coll)
+        assert coll == {}
 
     def test_unknown_type_still_raises(self):
         """Unknown ventilation_type still raises ValueError after adding mechanical_supply."""
