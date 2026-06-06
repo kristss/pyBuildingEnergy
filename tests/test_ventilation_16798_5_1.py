@@ -14,9 +14,11 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     SupplyTemperatureControl,
     SupplyTemperatureControlMode,
     _RHO_CP_J_M3_K,
+    ahu_outputs_to_ventilation_stream,
     calculate_sensible_ahu_step,
     resolve_supply_temperature_setpoint,
 )
+from pybuildingenergy.source.ventilation import VentilationStream
 
 
 def _point(reference_c, supply_c):
@@ -845,3 +847,66 @@ def test_partial_load_scales_all_power_outputs():
     assert out_half.required_heating_coil_power_w == pytest.approx(
         0.5 * out_full.required_heating_coil_power_w, rel=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# VentilationStream adapter tests
+# ---------------------------------------------------------------------------
+
+def test_adapter_returns_ventilation_stream():
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out)
+    assert isinstance(stream, VentilationStream)
+
+
+def test_adapter_default_name_and_category():
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out)
+    assert stream.name == "mechanical_supply"
+    assert stream.category == "mechanical_supply"
+
+
+def test_adapter_custom_name():
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out, name="ahu_zone_1")
+    assert stream.name == "ahu_zone_1"
+
+
+def test_adapter_conductance_matches_rho_cp_q():
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out)
+    expected_h = _RHO_CP_J_M3_K * out.actual_supply_flow_m3_h / 3600.0
+    assert stream.heat_transfer_coefficient_w_k == pytest.approx(expected_h)
+
+
+def test_adapter_source_temperature_matches_actual_supply():
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out)
+    assert stream.source_temperature_c == pytest.approx(out.actual_supply_temperature_c)
+
+
+def test_adapter_zero_flow_gives_zero_conductance():
+    """AHU off: H_k = 0 so stream contributes nothing to zone balance."""
+    out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
+    assert out.actual_supply_flow_m3_h == 0.0
+    stream = ahu_outputs_to_ventilation_stream(out)
+    assert stream.heat_transfer_coefficient_w_k == 0.0
+
+
+def test_adapter_zero_flow_source_temperature_is_finite():
+    """Zero-conductance stream must still carry a finite source temperature."""
+    out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
+    stream = ahu_outputs_to_ventilation_stream(out)
+    assert math.isfinite(stream.source_temperature_c)
+
+
+def test_adapter_zone_heat_flow_formula():
+    """Verify Q_k = H_k * (T_source - T_zone) is consistent with stream fields."""
+    out = calculate_sensible_ahu_step(_cfg(), _inp())
+    stream = ahu_outputs_to_ventilation_stream(out)
+    t_zone = 21.0
+    q_stream = stream.heat_transfer_coefficient_w_k * (stream.source_temperature_c - t_zone)
+    q_direct = _RHO_CP_J_M3_K * out.actual_supply_flow_m3_h / 3600.0 * (
+        out.actual_supply_temperature_c - t_zone
+    )
+    assert q_stream == pytest.approx(q_direct)

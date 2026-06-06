@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
+from .ventilation import VentilationStream
+
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -609,4 +611,32 @@ def calculate_sensible_ahu_step(
         heat_recovery_power_w=hr_power_w,
         bypass_fraction=bypass_fraction,
         frost_protection_required=frost_protection_req,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ISO 52016-1 zone adapter
+# ---------------------------------------------------------------------------
+
+def ahu_outputs_to_ventilation_stream(
+    outputs: AHUStepOutputs,
+    name: str = "mechanical_supply",
+) -> VentilationStream:
+    """Convert AHU step outputs into a VentilationStream for ISO 52016-1 §6.5.10.
+
+    The stream conductance and source temperature couple the AHU into the
+    zone affine ventilation boundary:
+
+        H_k = rho_air * cp_air * actual_supply_flow [W/K]
+        T_source,k = actual_supply_temperature [°C]
+
+    When the AHU is off (zero flow), H_k = 0 so the stream contributes
+    nothing to the zone balance regardless of source temperature.
+    """
+    h_w_k = _RHO_CP_J_M3_K * outputs.actual_supply_flow_m3_h / 3600.0
+    return VentilationStream(
+        name=name,
+        heat_transfer_coefficient_w_k=h_w_k,
+        source_temperature_c=outputs.actual_supply_temperature_c,
+        category="mechanical_supply",
     )
