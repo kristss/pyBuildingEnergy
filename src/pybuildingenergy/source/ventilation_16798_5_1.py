@@ -223,20 +223,29 @@ class HeatRecoveryControl(str, Enum):
 
 
 class FrostControlMode(str, Enum):
-    """Available frost-protection strategies."""
+    """Available frost-protection strategies.
+
+    NONE         — no frost protection; HR efficiency is not reduced.
+    EXHAUST_LIMIT — indirect exhaust-temperature-limit control (EN 16798-5-1
+                   B108=2 "DIRECT" mode): the effective HR efficiency is
+                   reduced continuously so the exhaust leaving the HR core
+                   stays at or above ``frost_exhaust_limit_c``.  This is
+                   equivalent to an effective partial bypass but is physically
+                   distinct from a full-bypass damper (B108=1).
+    """
 
     NONE = "none"
-    BYPASS = "bypass"
+    EXHAUST_LIMIT = "exhaust_limit"
 
 
 @dataclass(frozen=True)
 class SensibleAHUConfig:
     """Configuration for the sensible EN 16798-5-1 AHU timestep model.
 
-    Covers balanced scheduled CAV with sensible heat recovery, bypass frost
-    control, modulating-bypass economizer, and a heating coil. Cooling coil
-    support is reserved for future implementation; setting cooling_coil_enabled
-    to True is accepted but has no effect in this version.
+    Covers balanced scheduled CAV with sensible heat recovery,
+    EXHAUST_LIMIT frost protection, modulating-bypass economizer, and a
+    heating coil. Cooling coil support is not yet implemented;
+    ``cooling_coil_enabled`` must be False.
     """
 
     sensible_heat_recovery_efficiency: float
@@ -311,6 +320,11 @@ class SensibleAHUConfig:
         if not math.isfinite(self.frost_exhaust_limit_c):
             raise ValueError("frost_exhaust_limit_c must be finite")
 
+        if self.cooling_coil_enabled:
+            raise NotImplementedError(
+                "cooling_coil_enabled=True is not yet implemented; set to False"
+            )
+
 
 @dataclass(frozen=True)
 class AHUStepInputs:
@@ -339,6 +353,17 @@ class AHUStepInputs:
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
 
+        q_sup = self.required_supply_flow_m3_h
+        q_ext = self.required_extract_flow_m3_h
+        if q_sup != q_ext:
+            larger = max(q_sup, q_ext)
+            if larger == 0.0 or abs(q_sup - q_ext) / larger > 1e-6:
+                raise ValueError(
+                    "required_supply_flow_m3_h and required_extract_flow_m3_h must be "
+                    "equal: unequal supply and extract flow is outside the balanced-flow "
+                    "scope"
+                )
+
         if (
             not math.isfinite(self.operation_fraction)
             or not (0.0 <= self.operation_fraction <= 1.0)
@@ -364,7 +389,12 @@ class AHUStepOutputs:
 
     requested_supply_temperature_c: setpoint from the supply-temperature controller.
     actual_supply_temperature_c:    delivered supply temperature including fan heat.
-    heat_recovery_power_w:          net sensible heat transferred to supply (positive).
+    heat_recovery_power_w:          net sensible heat transferred to supply air by the HR
+                                    unit, relative to raw outdoor air: rho*cp*q*(T_hr−T_oda).
+                                    Equals EN 16798-5-1 formula-77 Q_hr for balanced flow
+                                    without recirculation or ODA preheating.  Positive in
+                                    heating mode; negative in economizer mode (ALWAYS_ON HR
+                                    or partial MODULATING_BYPASS cooling).
     required_heating_coil_power_w:  coil power needed to reach setpoint.
     actual_heating_coil_power_w:    coil power actually delivered (≤ required).
     fan_electric_power_w:           total fan electrical power (separate from thermal).
@@ -392,17 +422,24 @@ def calculate_sensible_ahu_step(
 
     Calculation sequence
     --------------------
-    1.  Resolve requested supply-temperature setpoint from config controller.
-    2.  Scale flows by operation_fraction (scheduled CAV, balanced).
+    1.  Scale flows by operation_fraction (scheduled CAV, balanced).  Return
+        zero-flow result immediately if AHU is off — avoids requiring a
+        scheduled setpoint when the AHU is not running.
+    2.  Resolve requested supply-temperature setpoint from config controller.
     3.  Compute fan electricity; add extract fan heat to extract before HR,
         accumulate supply fan heat for addition after HR and coil.
-    4.  Apply bypass frost protection: reduce effective HR efficiency so the
-        exhaust leaving the HR stays at or above frost_exhaust_limit_c.
+    4.  Apply EXHAUST_LIMIT frost protection: reduce effective HR efficiency
+        so the exhaust leaving the HR stays at or above frost_exhaust_limit_c.
     5.  Compute HR outlet temperature from outdoor and frost-limited efficiency.
-    6.  Apply modulating bypass (if configured) to track supply setpoint without
-        overshooting in either heating or economizer direction.
+    6.  Compute fan-adjusted internal coil target: subtract downstream supply fan
+        heat from requested setpoint so that delivered temperature equals requested
+        after the fan addition.  Apply modulating bypass (clamped to [0, 1]) to
+        reach internal target; full bypass yields outdoor air, no bypass yields HR
+        outlet.  Compute total bypass_fraction combining frost and modulation.
     7.  Compute heat recovery power (net thermal gain to supply vs outdoor).
     8.  Compute required and actual heating-coil power; raise supply temperature.
+        Available coil power = heating_coil_max_power_w * operation_fraction
+        (ON/OFF scheduling: coil runs at rated power only during the ON fraction).
     9.  Add supply fan heat to supply after coil.
     10. Return AHUStepOutputs with all quantities separated.
 
@@ -414,15 +451,8 @@ def calculate_sensible_ahu_step(
     if not isinstance(inputs, AHUStepInputs):
         raise TypeError("inputs must be an AHUStepInputs")
 
-    # Step 1: Resolve requested setpoint
-    requested_t_sup = resolve_supply_temperature_setpoint(
-        config.supply_temperature_control,
-        inputs.outdoor_temperature_c,
-        inputs.extract_temperature_c,
-        inputs.scheduled_setpoint_c,
-    )
-
-    # Step 2: Actual flows (balanced scheduled CAV)
+    # Step 2 first: Actual flows — needed to detect zero-flow before resolving setpoint
+    # so that scheduled control with no setpoint does not raise when the AHU is off.
     op = inputs.operation_fraction
     actual_supply_m3_h = op * inputs.required_supply_flow_m3_h
     actual_extract_m3_h = op * inputs.required_extract_flow_m3_h
@@ -431,7 +461,7 @@ def calculate_sensible_ahu_step(
 
     if q_sup <= 0.0:
         return AHUStepOutputs(
-            requested_supply_temperature_c=requested_t_sup,
+            requested_supply_temperature_c=inputs.outdoor_temperature_c,
             actual_supply_temperature_c=inputs.outdoor_temperature_c,
             actual_supply_flow_m3_h=0.0,
             actual_extract_flow_m3_h=0.0,
@@ -442,6 +472,14 @@ def calculate_sensible_ahu_step(
             bypass_fraction=0.0,
             frost_control_active=False,
         )
+
+    # Step 1: Resolve requested setpoint (only reached when AHU is actually running)
+    requested_t_sup = resolve_supply_temperature_setpoint(
+        config.supply_temperature_control,
+        inputs.outdoor_temperature_c,
+        inputs.extract_temperature_c,
+        inputs.scheduled_setpoint_c,
+    )
 
     rho_cp_q = _RHO_CP_J_M3_K * q_sup  # W/K for supply stream
 
@@ -471,7 +509,7 @@ def calculate_sensible_ahu_step(
     frost_active = False
     eta_eff = eta_nom
     if (
-        config.frost_control is FrostControlMode.BYPASS
+        config.frost_control is FrostControlMode.EXHAUST_LIMIT
         and eta_nom > 0.0
         and abs(dT) > 1e-9
     ):
@@ -484,32 +522,58 @@ def calculate_sensible_ahu_step(
     # Step 5: HR outlet temperature (before modulation)
     t_after_hr = t_outdoor + eta_eff * dT
 
-    # Step 6: Modulating bypass to track requested setpoint
-    # Bypass mixes raw outdoor air with HR output.  The formula
-    #   bp = (T_hr - T_set) / (T_hr - T_oda)
-    # applies in both heating mode (HR overshoots setpoint) and economizer
-    # mode (HR overcools below setpoint when T_oda > T_extract).
-    # Bypass is only triggered when T_set lies strictly between T_oda and T_hr.
-    bypass_fraction = 0.0
+    # Step 6: Modulating bypass and total bypass_fraction.
+    # Internal target: subtract downstream supply fan heat so delivered temperature
+    # equals requested_t_sup after the fan addition in step 9.
+    t_target = requested_t_sup - dt_sup_fan
+
+    # Bypass formula: bp = (T_hr - T_target) / (T_hr - T_outdoor), clamped to [0, 1].
+    # bp = 1 → full bypass, delivers T_outdoor.  bp = 0 → no bypass, delivers T_hr.
+    # Clamping handles setpoints outside the achievable mixing range: when the
+    # setpoint is below T_outdoor (heating mode, no cooling), full bypass delivers
+    # the closest attainable temperature; when the setpoint is above T_outdoor
+    # (economizer mode overshoot), full bypass delivers T_outdoor.
+    #
+    # Reference deviation: EN 16798-5-1 Table B.2 modes B91=2 (FIXED) and B91=3
+    # (ODA_COMP) fully bypass the HR in economizer mode (T_outdoor > T_extract),
+    # delivering T_outdoor regardless of the setpoint. Our implementation modulates
+    # to the setpoint using partial HR, which is physically more accurate. The
+    # reference LOAD_COMP mode (B91=4, closest to EXTRACT_COMPENSATED) does allow
+    # partial HR in economizer mode and aligns with our behaviour.
     if config.heat_recovery_control is HeatRecoveryControl.MODULATING_BYPASS:
         dT_hr_oda = t_after_hr - t_outdoor  # = eta_eff * dT
         if abs(dT_hr_oda) > 1e-9:
-            t_low = min(t_outdoor, t_after_hr)
-            t_high = max(t_outdoor, t_after_hr)
-            if t_low < requested_t_sup < t_high:
-                bypass_fraction = (t_after_hr - requested_t_sup) / dT_hr_oda
-                bypass_fraction = max(0.0, min(1.0, bypass_fraction))
-                t_after_hr = requested_t_sup  # setpoint achieved by mixing
+            bp = (t_after_hr - t_target) / dT_hr_oda
+            bp = max(0.0, min(1.0, bp))
+            t_after_hr = t_outdoor * bp + t_after_hr * (1.0 - bp)
+
+    # Total effective bypass fraction: fraction of supply air bypassing the HR core
+    # due to both frost protection (step 4) and setpoint modulation above.
+    if eta_nom > 0.0 and abs(dT) > 1e-9:
+        bypass_fraction = max(
+            0.0, min(1.0, 1.0 - (t_after_hr - t_outdoor) / (eta_nom * dT))
+        )
+    else:
+        bypass_fraction = 0.0
 
     # Step 7: Heat recovery power (net thermal gain to supply vs outdoor air)
     hr_power_w = rho_cp_q * (t_after_hr - t_outdoor)
 
-    # Step 8: Heating coil
-    required_heating_w = rho_cp_q * max(0.0, requested_t_sup - t_after_hr)
-    if config.heating_coil_max_power_w is None:
+    # Step 8: Heating coil targeting t_target so delivered temperature equals
+    # requested_t_sup after supply fan heat is added in step 9.
+    # For ON/OFF scheduling (operation_fraction < 1), the time-averaged available
+    # coil power is coil_max * op: the coil runs at rated power only during the ON
+    # fraction, so the timestep-average is proportionally reduced.
+    required_heating_w = rho_cp_q * max(0.0, t_target - t_after_hr)
+    available_heating_w = (
+        config.heating_coil_max_power_w * op
+        if config.heating_coil_max_power_w is not None
+        else None
+    )
+    if available_heating_w is None:
         actual_heating_w = required_heating_w
     else:
-        actual_heating_w = min(required_heating_w, config.heating_coil_max_power_w)
+        actual_heating_w = min(required_heating_w, available_heating_w)
 
     t_after_coil = t_after_hr + actual_heating_w / rho_cp_q
 

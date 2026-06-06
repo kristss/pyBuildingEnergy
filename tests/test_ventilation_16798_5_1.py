@@ -223,7 +223,7 @@ def _cfg(**kw) -> SensibleAHUConfig:
         sensible_heat_recovery_efficiency=0.75,
         supply_temperature_control=_FIXED_18,
         heat_recovery_control="modulating_bypass",
-        frost_control="bypass",
+        frost_control="exhaust_limit",
         heating_coil_max_power_w=None,
         cooling_coil_enabled=False,
         supply_fan_specific_power_w_per_m3_s=0.0,
@@ -317,6 +317,16 @@ def test_config_rejects_wrong_supply_temperature_control_type():
         _cfg(supply_temperature_control="fixed:18")
 
 
+def test_config_rejects_cooling_coil_enabled():
+    with pytest.raises(NotImplementedError, match="cooling_coil_enabled"):
+        _cfg(cooling_coil_enabled=True)
+
+
+def test_config_accepts_exhaust_limit_frost_control():
+    cfg = _cfg(frost_control="exhaust_limit")
+    assert cfg.frost_control is FrostControlMode.EXHAUST_LIMIT
+
+
 # ---------------------------------------------------------------------------
 # AHUStepInputs validation
 # ---------------------------------------------------------------------------
@@ -351,8 +361,14 @@ def test_inputs_rejects_non_finite_scheduled_setpoint():
         _inp(scheduled_setpoint_c=math.inf)
 
 
-def test_inputs_zero_extract_flow_accepted():
-    inp = _inp(required_extract_flow_m3_h=0.0)
+def test_inputs_unbalanced_flows_rejected():
+    with pytest.raises(ValueError, match="balanced-flow"):
+        _inp(required_extract_flow_m3_h=0.0)  # supply=1350, extract=0 — unbalanced
+
+
+def test_inputs_both_zero_flows_accepted():
+    inp = _inp(required_supply_flow_m3_h=0.0, required_extract_flow_m3_h=0.0)
+    assert inp.required_supply_flow_m3_h == 0.0
     assert inp.required_extract_flow_m3_h == 0.0
 
 
@@ -386,9 +402,19 @@ def test_zero_operation_produces_zero_flow_and_energy():
     assert not out.frost_control_active
 
 
-def test_zero_operation_still_resolves_requested_setpoint():
+def test_zero_operation_requested_setpoint_is_outdoor_temperature():
+    # AHU is off: no setpoint resolution; reported value is outdoor air temperature.
     out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
-    assert out.requested_supply_temperature_c == pytest.approx(18.0)
+    assert out.requested_supply_temperature_c == pytest.approx(-9.7)
+
+
+def test_scheduled_control_off_ahu_does_not_require_setpoint():
+    # Scheduled mode with no setpoint must not raise when AHU is off.
+    ctrl = SupplyTemperatureControl(mode="scheduled")
+    cfg = _cfg(supply_temperature_control=ctrl)
+    out = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=0.0))
+    assert out.actual_supply_flow_m3_h == 0.0
+    assert out.actual_heating_coil_power_w == pytest.approx(0.0)
 
 
 def test_zero_required_flow_equivalent_to_zero_operation():
@@ -456,8 +482,9 @@ def test_bypass_activates_when_hr_overshoots_setpoint_in_heating_mode():
     # T_outdoor=10, T_extract=22, eta=0.75 → T_hr=10+0.75*12=19°C > setpoint=16°C
     ctrl = SupplyTemperatureControl(mode="fixed", setpoint_c=16.0)
     cfg = _cfg(sensible_heat_recovery_efficiency=0.75, supply_temperature_control=ctrl)
-    out = calculate_sensible_ahu_step(cfg, _inp(outdoor_temperature_c=10.0, extract_temperature_c=22.0))
-
+    out = calculate_sensible_ahu_step(
+        cfg, _inp(outdoor_temperature_c=10.0, extract_temperature_c=22.0)
+    )
     t_hr_full = 10.0 + 0.75 * 12.0  # 19.0°C
     expected_bp = (t_hr_full - 16.0) / (t_hr_full - 10.0)
     assert out.bypass_fraction == pytest.approx(expected_bp, rel=1e-6)
@@ -595,14 +622,44 @@ def test_no_heating_needed_when_hr_meets_setpoint_exactly():
     assert out.actual_heating_coil_power_w == pytest.approx(0.0, abs=1e-9)
 
 
+def test_coil_capacity_scales_with_operation_fraction():
+    """Time-averaged available coil power = rated_power * operation_fraction.
+
+    For ON/OFF scheduling the coil runs at rated power during the ON period.
+    The supply temperature rise during that period is coil_max / rho_cp_q_nominal,
+    identical to full operation — only the time-averaged energy differs.
+    """
+    # Choose coil_max < required_at_full so the coil is capacity-limited.
+    t_oda = -9.7
+    t_hr = t_oda + 0.75 * (21.0 - t_oda)  # 13.325°C (no bypass, setpoint > t_hr)
+    rho_cp_q_nom = _RHO_CP_J_M3_K * _Q_M3_S
+    required_at_full = rho_cp_q_nom * (18.0 - t_hr)  # ~2 233 W
+    coil_max = required_at_full * 0.6  # definitely capacity-limited at any op fraction
+
+    cfg = _cfg(heating_coil_max_power_w=coil_max)
+
+    out_full = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=1.0))
+    out_half = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=0.5))
+
+    # At full op: actual = coil_max * 1.0
+    assert out_full.actual_heating_coil_power_w == pytest.approx(coil_max, rel=1e-9)
+    # At half op: time-averaged actual = coil_max * 0.5
+    assert out_half.actual_heating_coil_power_w == pytest.approx(coil_max * 0.5, rel=1e-9)
+    # Supply temperature during the ON period is the same (coil_max / rho_cp_q_nom
+    # temperature rise regardless of duty cycle) — both ops reach the same T_supply.
+    assert out_half.actual_supply_temperature_c == pytest.approx(
+        out_full.actual_supply_temperature_c, abs=1e-6
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cooling disabled — unattainable cold setpoints
 # ---------------------------------------------------------------------------
 
-def test_disabled_cooling_leaves_supply_at_hr_output_when_setpoint_below_outdoor():
-    # T_outdoor=5, T_extract=22, setpoint=2°C < T_outdoor — unattainable without cooling
-    # T_hr = 5 + 0.75*17 = 17.75°C; setpoint (2°C) is below T_outdoor (5°C)
-    # Neither bypass nor coil can cool; actual supply stays at T_hr
+def test_disabled_cooling_full_bypass_when_setpoint_below_outdoor():
+    # T_outdoor=5, T_extract=22, setpoint=2°C < T_outdoor — unattainable without cooling.
+    # MODULATING_BYPASS: bp = (17.75 - 2) / (17.75 - 5) = 1.235 → clamped to 1.0.
+    # Full bypass delivers T_outdoor (5°C); coil has nothing to do.
     ctrl = SupplyTemperatureControl(mode="fixed", setpoint_c=2.0)
     cfg = _cfg(
         sensible_heat_recovery_efficiency=0.75,
@@ -612,10 +669,9 @@ def test_disabled_cooling_leaves_supply_at_hr_output_when_setpoint_below_outdoor
     out = calculate_sensible_ahu_step(
         cfg, _inp(outdoor_temperature_c=5.0, extract_temperature_c=22.0)
     )
-    t_hr = 5.0 + 0.75 * (22.0 - 5.0)
-    assert out.actual_supply_temperature_c == pytest.approx(t_hr, rel=1e-6)
+    assert out.actual_supply_temperature_c == pytest.approx(5.0, abs=1e-6)
+    assert out.bypass_fraction == pytest.approx(1.0, abs=1e-9)
     assert out.required_heating_coil_power_w == pytest.approx(0.0, abs=1e-9)
-    assert out.bypass_fraction == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -667,8 +723,8 @@ def test_extract_fan_heat_zero_fraction_does_not_affect_hr():
     assert out_zero_frac.fan_electric_power_w > out_no_fan.fan_electric_power_w
 
 
-def test_supply_fan_heat_adds_to_supply_after_coil():
-    """Supply fan heat raises actual supply above setpoint."""
+def test_supply_fan_heat_absorbed_by_coil_target_adjustment():
+    """Coil targets setpoint minus fan heat rise so delivered equals setpoint."""
     sfp = 500.0
     p_sup = _Q_M3_S * sfp
     dt_sup = p_sup / (_RHO_CP_J_M3_K * _Q_M3_S)
@@ -679,8 +735,10 @@ def test_supply_fan_heat_adds_to_supply_after_coil():
     )
     out = calculate_sensible_ahu_step(cfg, _inp())
 
-    # Setpoint is 18°C; supply fan adds dt_sup on top
-    assert out.actual_supply_temperature_c == pytest.approx(18.0 + dt_sup, rel=1e-5)
+    # Fan is downstream of the coil; the coil targets setpoint - dt_sup so that
+    # actual delivered temperature equals the 18°C setpoint after fan heat.
+    assert out.actual_supply_temperature_c == pytest.approx(18.0, abs=1e-5)
+    assert out.fan_electric_power_w == pytest.approx(p_sup, rel=1e-9)
 
 
 def test_supply_fan_zero_heat_fraction_does_not_raise_supply():
