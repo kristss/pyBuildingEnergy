@@ -227,11 +227,12 @@ class FrostControlMode(str, Enum):
 
     NONE         — no frost protection; HR efficiency is not reduced.
     EXHAUST_LIMIT — indirect exhaust-temperature-limit control (EN 16798-5-1
-                   B108=2 "DIRECT" mode): the effective HR efficiency is
+                   B108=2 "INDIRECT" mode): the effective HR efficiency is
                    reduced continuously so the exhaust leaving the HR core
-                   stays at or above ``frost_exhaust_limit_c``.  This is
-                   equivalent to an effective partial bypass but is physically
-                   distinct from a full-bypass damper (B108=1).
+                   stays at or above ``frost_exhaust_limit_c``.  B108 selects
+                   the control method (B108=1 = DIRECT, B108=2 = INDIRECT);
+                   the defrost mechanism (bypass, preheat, recirculation) is a
+                   separate configuration dimension not represented here.
     """
 
     NONE = "none"
@@ -389,12 +390,15 @@ class AHUStepOutputs:
 
     requested_supply_temperature_c: setpoint from the supply-temperature controller.
     actual_supply_temperature_c:    delivered supply temperature including fan heat.
-    heat_recovery_power_w:          net sensible heat transferred to supply air by the HR
-                                    unit, relative to raw outdoor air: rho*cp*q*(T_hr−T_oda).
-                                    Equals EN 16798-5-1 formula-77 Q_hr for balanced flow
-                                    without recirculation or ODA preheating.  Positive in
-                                    heating mode; negative in economizer mode (ALWAYS_ON HR
-                                    or partial MODULATING_BYPASS cooling).
+    heat_recovery_power_w:          rho*cp*q*(T_hr_outlet − T_outdoor).  Equals EN 16798-5-1
+                                    formula-77 Q_hr only when all of the following hold:
+                                    balanced flow, no recirculation, no ODA preheating, and
+                                    frost correction inactive.  During active EXHAUST_LIMIT
+                                    frost control, this value includes what a preheat-based
+                                    defrost configuration would split into a separate preheat
+                                    term; the total supply heating from outdoor is the same
+                                    but the attribution differs.  Positive in heating mode;
+                                    negative in economizer mode.
     required_heating_coil_power_w:  coil power needed to reach setpoint.
     actual_heating_coil_power_w:    coil power actually delivered (≤ required).
     fan_electric_power_w:           total fan electrical power (separate from thermal).
@@ -532,14 +536,11 @@ def calculate_sensible_ahu_step(
     # Clamping handles setpoints outside the achievable mixing range: when the
     # setpoint is below T_outdoor (heating mode, no cooling), full bypass delivers
     # the closest attainable temperature; when the setpoint is above T_outdoor
-    # (economizer mode overshoot), full bypass delivers T_outdoor.
+    # (economizer mode), full bypass delivers T_outdoor.
     #
-    # Reference deviation: EN 16798-5-1 Table B.2 modes B91=2 (FIXED) and B91=3
-    # (ODA_COMP) fully bypass the HR in economizer mode (T_outdoor > T_extract),
-    # delivering T_outdoor regardless of the setpoint. Our implementation modulates
-    # to the setpoint using partial HR, which is physically more accurate. The
-    # reference LOAD_COMP mode (B91=4, closest to EXTRACT_COMPENSATED) does allow
-    # partial HR in economizer mode and aligns with our behaviour.
+    # Design choice: in economizer mode (T_outdoor > T_extract) we modulate the HR
+    # continuously to track the setpoint rather than switching to full outdoor bypass.
+    # This keeps supply delivery consistent across all conditions without a mode switch.
     if config.heat_recovery_control is HeatRecoveryControl.MODULATING_BYPASS:
         dT_hr_oda = t_after_hr - t_outdoor  # = eta_eff * dT
         if abs(dT_hr_oda) > 1e-9:
