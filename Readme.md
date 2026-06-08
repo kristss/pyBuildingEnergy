@@ -12,6 +12,12 @@
 
 Check our **new documentation** in GitHub Pages: [pybuildingenergy docs](https://eurac-eebgroup.github.io/pybuildingenergy-docs/).
 
+## Find Us
+Where to find our works:
+- [pysimhub](https://pysimhub.io/) .
+- [relife project](https://relife.test.ctic.es/) - Under development
+...
+
 ## Features
 
 The new EPBD recast provides an update on building performance assessment through a methodology that must take into account various aspects such as the thermal characteristics of the building, the use of energy from renewable sources, building automation and control systems, ventilation, cooling, energy recovery, etc.
