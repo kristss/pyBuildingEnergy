@@ -1971,6 +1971,41 @@ class TestMechanicalSupplyComponent:
         assert coll["ahu"].actual_heating_coil_power_w >= 0.0
         assert coll["ahu"].heat_recovery_power_w >= 0.0
 
+    def test_component_multiplier_is_flow_fraction_for_en16798_fan(self):
+        """Component schedules reduce flow, not timestep availability."""
+        component = _ahu_component(
+            supply_fan_specific_power_w_per_m3_s=500.0,
+            extract_fan_specific_power_w_per_m3_s=0.0,
+            fan_performance_model="en16798_5_1",
+        )
+        coll_full = {}
+        bdy_full = resolve_ventilation_boundary(
+            _ahu_building([component]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            component_multipliers={"ahu": 1.0},
+            ahu_outputs_collector=coll_full,
+        )
+        coll_part = {}
+        bdy_part = resolve_ventilation_boundary(
+            _ahu_building([component]),
+            zone_temperature_c=21.0,
+            outdoor_temperature_c=-5.0,
+            wind_speed_m_s=0.0,
+            component_multipliers={"ahu": 0.25},
+            ahu_outputs_collector=coll_part,
+        )
+
+        assert bdy_part.heat_transfer_coefficient_w_k == pytest.approx(
+            0.25 * bdy_full.heat_transfer_coefficient_w_k,
+            rel=1e-9,
+        )
+        assert coll_part["ahu"].fan_electric_power_w == pytest.approx(
+            coll_full["ahu"].fan_electric_power_w * 0.25 ** 2.5,
+            rel=1e-9,
+        )
+
     def test_ahu_outputs_collector_empty_when_no_mechanical_supply(self):
         """No mechanical_supply components → collector is untouched."""
         coll = {}
@@ -1991,3 +2026,105 @@ class TestMechanicalSupplyComponent:
         }])
         with pytest.raises(ValueError, match="unknown ventilation_type"):
             resolve_ventilation_boundary(bld, 21.0, -5.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# _ahu_coll_to_columns integration: column contract, types, and edge cases
+# ---------------------------------------------------------------------------
+
+from pybuildingenergy.source.ventilation_16798_5_1 import AHUStepOutputs
+from pybuildingenergy.source.utils import _ahu_coll_to_columns
+
+
+def _make_step_outputs(**overrides) -> AHUStepOutputs:
+    defaults = dict(
+        requested_supply_temperature_c=18.5,
+        actual_supply_temperature_c=18.5,
+        actual_supply_flow_m3_h=1000.0,
+        actual_extract_flow_m3_h=1000.0,
+        required_heating_coil_power_w=500.0,
+        actual_heating_coil_power_w=500.0,
+        required_cooling_coil_power_w=0.0,
+        fan_electric_power_w=200.0,
+        heat_recovery_power_w=3000.0,
+        bypass_fraction=0.0,
+        frost_protection_required=False,
+    )
+    defaults.update(overrides)
+    return AHUStepOutputs(**defaults)
+
+
+class TestAhuCollToColumns:
+    """_ahu_coll_to_columns — column contract, types, warm-up slicing, off-hours."""
+
+    def test_expected_column_names_single_component(self):
+        out = _make_step_outputs()
+        cols = _ahu_coll_to_columns([{"ahu": out}])
+        expected = {
+            "Q_ahu_coil_ahu", "Q_ahu_coil_req_ahu", "Q_ahu_cool_req_ahu",
+            "Q_ahu_hr_ahu", "P_ahu_fan_ahu",
+            "T_ahu_sup_ahu", "T_ahu_sup_req_ahu",
+            "q_sup_m3h_ahu", "q_ext_m3h_ahu",
+            "ahu_bypass_ahu", "ahu_frost_ahu",
+        }
+        assert set(cols.keys()) == expected
+
+    def test_frost_is_integer_not_float(self):
+        out = _make_step_outputs(frost_protection_required=True)
+        cols = _ahu_coll_to_columns([{"ahu": out}])
+        assert cols["ahu_frost_ahu"].dtype == np.dtype("int64")
+        assert cols["ahu_frost_ahu"][0] == 1
+
+    def test_frost_false_gives_zero(self):
+        out = _make_step_outputs(frost_protection_required=False)
+        cols = _ahu_coll_to_columns([{"ahu": out}])
+        assert cols["ahu_frost_ahu"][0] == 0
+
+    def test_requested_temp_none_when_ahu_off_is_nan(self):
+        out_off = _make_step_outputs(requested_supply_temperature_c=None)
+        cols = _ahu_coll_to_columns([{"ahu": out_off}])
+        assert np.isnan(cols["T_ahu_sup_req_ahu"][0])
+
+    def test_values_match_step_outputs_fields(self):
+        out = _make_step_outputs()
+        cols = _ahu_coll_to_columns([{"ahu": out}])
+        assert cols["Q_ahu_coil_ahu"][0]    == pytest.approx(500.0)
+        assert cols["Q_ahu_hr_ahu"][0]      == pytest.approx(3000.0)
+        assert cols["P_ahu_fan_ahu"][0]     == pytest.approx(200.0)
+        assert cols["T_ahu_sup_ahu"][0]     == pytest.approx(18.5)
+        assert cols["T_ahu_sup_req_ahu"][0] == pytest.approx(18.5)
+        assert cols["q_sup_m3h_ahu"][0]     == pytest.approx(1000.0)
+        assert cols["q_ext_m3h_ahu"][0]     == pytest.approx(1000.0)
+        assert cols["ahu_bypass_ahu"][0]    == pytest.approx(0.0)
+
+    def test_multiple_components_produce_separate_suffixes(self):
+        out1 = _make_step_outputs(actual_supply_temperature_c=19.0)
+        out2 = _make_step_outputs(actual_supply_temperature_c=17.0)
+        cols = _ahu_coll_to_columns([{"ahu1": out1, "ahu2": out2}])
+        assert "T_ahu_sup_ahu1" in cols
+        assert "T_ahu_sup_ahu2" in cols
+        assert cols["T_ahu_sup_ahu1"][0] == pytest.approx(19.0)
+        assert cols["T_ahu_sup_ahu2"][0] == pytest.approx(17.0)
+
+    def test_warmup_slice_alignment_matches_timestep_count(self):
+        """When a warm-up period is sliced away, column arrays must match the slice length."""
+        n_warmup = 744   # December warm-up (31 days)
+        n_year   = 8760
+        on = _make_step_outputs()
+        full_coll = [{"ahu": on}] * (n_warmup + n_year)
+        act_slice = slice(n_warmup, None)
+        cols = _ahu_coll_to_columns(full_coll[act_slice])
+        assert len(cols["Q_ahu_coil_ahu"]) == n_year
+
+    def test_missing_component_in_some_timesteps_gives_nan(self):
+        """Component absent from a timestep dict should yield NaN for that hour."""
+        on  = _make_step_outputs(actual_heating_coil_power_w=999.0)
+        off = {}   # AHU off — component not in dict
+        cols = _ahu_coll_to_columns([{"ahu": on}, off, {"ahu": on}])
+        assert cols["Q_ahu_coil_ahu"][0] == pytest.approx(999.0)
+        assert np.isnan(cols["Q_ahu_coil_ahu"][1])
+        assert cols["Q_ahu_coil_ahu"][2] == pytest.approx(999.0)
+
+    def test_empty_collector_returns_empty_dict(self):
+        assert _ahu_coll_to_columns([]) == {}
+        assert _ahu_coll_to_columns([{}, {}]) == {}

@@ -1,5 +1,10 @@
 """Sensible air-handling calculations based on EN 16798-5-1.
 
+The aim is to evaluate and demonstrate the calculation proposed by the standard.
+This work does not replace the standard; it should be used alongside the EPB standard.
+
+Acknowledgments: The work was developed from the standard and the spreadsheet created by EPB Center.
+
 The module is intentionally independent of the ISO 52016 zone solver. Supply
 temperature control is resolved before the EN 16798-5-1 thermodynamic
 calculation so that fixed, scheduled, outdoor-compensated, and
@@ -23,9 +28,11 @@ Standard air at sea level, approximately 20 °C:
 
 Fan heat placement
 ------------------
-Extract fan heat is added to extract air BEFORE the heat exchanger, increasing
-the temperature of air entering the HR core. Supply fan heat is added to
-supply air AFTER the heat exchanger and heating coil, just before delivery.
+The configured extract-fan heat fraction is added to extract air before the
+heat exchanger. Set ``extract_fan_heat_fraction_to_air=0`` for an extract fan
+located downstream of heat recovery or whose heat is otherwise not returned to
+the HR inlet. The configured supply-fan heat fraction is added after the heat
+exchanger and heating coil, just before delivery.
 """
 
 from __future__ import annotations
@@ -246,6 +253,21 @@ class FrostControlMode(str, Enum):
     EXHAUST_LIMIT = "exhaust_limit"
 
 
+class FanPerformanceModel(str, Enum):
+    """Fan power and temperature-rise calculation method.
+
+    EN16798_5_1 applies the single-zone no-control fan relations used by the
+    EN 16798-5-1 reference implementation: pressure varies with the square of
+    the flow ratio and fan efficiency follows the product-data square-root
+    correction.
+
+    CONSTANT_SFP retains the legacy relation P = q * SFP at every flow.
+    """
+
+    EN16798_5_1 = "en16798_5_1"
+    CONSTANT_SFP = "constant_sfp"
+
+
 @dataclass(frozen=True)
 class SensibleAHUConfig:
     """Configuration for the sensible EN 16798-5-1 AHU timestep model.
@@ -254,6 +276,20 @@ class SensibleAHUConfig:
     EXHAUST_LIMIT frost protection, modulating-bypass economizer, and a
     heating coil. Cooling coil support is not yet implemented;
     ``cooling_coil_enabled`` must be False.
+
+    Fan model:
+      ``supply_fan_specific_power_w_per_m3_s`` and
+      ``extract_fan_specific_power_w_per_m3_s`` are the **nominal** SFP values
+      at design flow. The default ``en16798_5_1`` model derives design pressure
+      from nominal SFP and nominal fan efficiency unless an explicit design
+      pressure is supplied. At part load it applies the EN 16798-5-1
+      single-zone no-control pressure relation and product-data efficiency
+      correction:
+
+      ``delta_p = delta_p_design * (q / q_design)**2``
+      ``eta = eta_ref * sqrt(q / q_ref)``
+
+      ``constant_sfp`` retains the legacy ``P = q * SFP`` relation.
     """
 
     sensible_heat_recovery_efficiency: float
@@ -267,6 +303,15 @@ class SensibleAHUConfig:
     supply_fan_heat_fraction_to_air: float
     extract_fan_heat_fraction_to_air: float
     frost_exhaust_limit_c: float = -5.0
+    fan_performance_model: FanPerformanceModel | str = FanPerformanceModel.EN16798_5_1
+    supply_fan_design_pressure_pa: float | None = None
+    extract_fan_design_pressure_pa: float | None = None
+    supply_fan_nominal_efficiency: float = 0.72
+    extract_fan_nominal_efficiency: float = 0.78
+    supply_fan_reference_flow_m3_h: float | None = None
+    extract_fan_reference_flow_m3_h: float | None = None
+    supply_fan_reference_efficiency: float | None = None
+    extract_fan_reference_efficiency: float | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -287,6 +332,17 @@ class SensibleAHUConfig:
         except ValueError as exc:
             raise ValueError(
                 f"Unsupported frost_control: {self.frost_control!r}"
+            ) from exc
+
+        try:
+            object.__setattr__(
+                self,
+                "fan_performance_model",
+                FanPerformanceModel(self.fan_performance_model),
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported fan_performance_model: {self.fan_performance_model!r}"
             ) from exc
 
         eta = self.sensible_heat_recovery_efficiency
@@ -319,6 +375,26 @@ class SensibleAHUConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
 
         for name, value in (
+            ("supply_fan_design_pressure_pa", self.supply_fan_design_pressure_pa),
+            ("extract_fan_design_pressure_pa", self.extract_fan_design_pressure_pa),
+            ("supply_fan_reference_flow_m3_h", self.supply_fan_reference_flow_m3_h),
+            ("extract_fan_reference_flow_m3_h", self.extract_fan_reference_flow_m3_h),
+        ):
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be positive and finite when provided")
+
+        for name, value in (
+            ("supply_fan_nominal_efficiency", self.supply_fan_nominal_efficiency),
+            ("extract_fan_nominal_efficiency", self.extract_fan_nominal_efficiency),
+            ("supply_fan_reference_efficiency", self.supply_fan_reference_efficiency),
+            ("extract_fan_reference_efficiency", self.extract_fan_reference_efficiency),
+        ):
+            if value is not None and (
+                not math.isfinite(value) or value <= 0.0 or value > 1.0
+            ):
+                raise ValueError(f"{name} must be in (0, 1] when provided")
+
+        for name, value in (
             ("supply_fan_heat_fraction_to_air", self.supply_fan_heat_fraction_to_air),
             ("extract_fan_heat_fraction_to_air", self.extract_fan_heat_fraction_to_air),
         ):
@@ -336,7 +412,13 @@ class SensibleAHUConfig:
 
 @dataclass(frozen=True)
 class AHUStepInputs:
-    """Time-varying inputs for one AHU timestep."""
+    """Time-varying inputs for one AHU timestep.
+
+    ``operation_fraction`` is the fraction of the timestep for which the AHU
+    operates. ``flow_fraction`` is the continuous operating-flow ratio relative
+    to the required/design flow. Keeping these separate distinguishes ON/OFF
+    duty averaging from true fan-speed reduction.
+    """
 
     outdoor_temperature_c: float
     extract_temperature_c: float
@@ -345,6 +427,7 @@ class AHUStepInputs:
     operation_fraction: float
     timestep_hours: float
     scheduled_setpoint_c: float | None = None
+    flow_fraction: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -377,6 +460,12 @@ class AHUStepInputs:
             or not (0.0 <= self.operation_fraction <= 1.0)
         ):
             raise ValueError("operation_fraction must be finite and in [0, 1]")
+
+        if (
+            not math.isfinite(self.flow_fraction)
+            or not (0.0 <= self.flow_fraction <= 1.0)
+        ):
+            raise ValueError("flow_fraction must be finite and in [0, 1]")
 
         if not math.isfinite(self.timestep_hours) or self.timestep_hours <= 0.0:
             raise ValueError("timestep_hours must be positive and finite")
@@ -436,6 +525,74 @@ class AHUStepOutputs:
     frost_protection_required: bool
 
 
+def _fan_power_and_temperature_rise(
+    *,
+    model: FanPerformanceModel,
+    operating_flow_m3_h: float,
+    design_flow_m3_h: float,
+    operation_fraction: float,
+    nominal_specific_power_w_per_m3_s: float,
+    design_pressure_pa: float | None,
+    nominal_efficiency: float,
+    reference_flow_m3_h: float | None,
+    reference_efficiency: float | None,
+    heat_fraction_to_air: float,
+) -> tuple[float, float]:
+    """Return timestep-average fan electric power [W] and operating delta-T [K].
+
+    The EN 16798-5-1 mode follows the same pressure and fan-efficiency
+    relations as the recirc reference implementation. The temperature rise is
+    evaluated while the fan is operating; electric power is averaged over the
+    timestep using ``operation_fraction``.
+    """
+    if (
+        operating_flow_m3_h <= 0.0
+        or design_flow_m3_h <= 0.0
+        or operation_fraction <= 0.0
+    ):
+        return 0.0, 0.0
+
+    q_operating_m3_s = operating_flow_m3_h / 3600.0
+    if model is FanPerformanceModel.CONSTANT_SFP:
+        power_operating_w = (
+            q_operating_m3_s * nominal_specific_power_w_per_m3_s
+        )
+    else:
+        pressure_design_pa = (
+            design_pressure_pa
+            if design_pressure_pa is not None
+            else nominal_specific_power_w_per_m3_s * nominal_efficiency
+        )
+        if pressure_design_pa <= 0.0:
+            return 0.0, 0.0
+
+        q_ratio = operating_flow_m3_h / design_flow_m3_h
+        pressure_pa = pressure_design_pa * q_ratio ** 2
+
+        q_ref_m3_h = (
+            reference_flow_m3_h
+            if reference_flow_m3_h is not None
+            else design_flow_m3_h
+        )
+        eta_ref = (
+            reference_efficiency
+            if reference_efficiency is not None
+            else nominal_efficiency
+        )
+        efficiency = (
+            nominal_efficiency
+            * (eta_ref / nominal_efficiency)
+            * math.sqrt(operating_flow_m3_h / q_ref_m3_h)
+        )
+        power_operating_w = q_operating_m3_s * pressure_pa / efficiency
+
+    temperature_rise_k = (
+        power_operating_w * heat_fraction_to_air
+        / (_RHO_CP_J_M3_K * q_operating_m3_s)
+    )
+    return power_operating_w * operation_fraction, temperature_rise_k
+
+
 def calculate_sensible_ahu_step(
     config: SensibleAHUConfig,
     inputs: AHUStepInputs,
@@ -444,9 +601,9 @@ def calculate_sensible_ahu_step(
 
     Calculation sequence
     --------------------
-    1.  Scale flows by operation_fraction (scheduled CAV, balanced).  Return
-        zero-flow result immediately if AHU is off — avoids requiring a
-        scheduled setpoint when the AHU is not running.
+    1.  Scale operating flows by flow_fraction and timestep-average quantities
+        by operation_fraction. Return a zero-flow result immediately if the AHU
+        is off.
     2.  Resolve requested supply-temperature setpoint from config controller.
     3.  Compute fan electricity; add extract fan heat to extract before HR,
         accumulate supply fan heat for addition after HR and coil.
@@ -460,28 +617,32 @@ def calculate_sensible_ahu_step(
         outlet.  Compute total bypass_fraction combining frost and modulation.
     7.  Compute heat recovery power (net thermal gain to supply vs outdoor).
     8.  Compute required and actual heating-coil power; raise supply temperature.
-        Available coil power = heating_coil_max_power_w * operation_fraction
-        (ON/OFF scheduling: coil runs at rated power only during the ON fraction).
+        Coil capacity applies while operating; required and delivered powers are
+        then averaged over the timestep with operation_fraction.
     9.  Add supply fan heat to supply after coil.
     10. Return AHUStepOutputs with all quantities separated.
 
-    When operation_fraction is zero or required supply flow is zero, all flow
-    and energy outputs are zero and actual supply temperature equals outdoor.
+    When operation_fraction, flow_fraction, or required supply flow is zero,
+    all flow and energy outputs are zero and actual supply temperature equals
+    outdoor.
     """
     if not isinstance(config, SensibleAHUConfig):
         raise TypeError("config must be a SensibleAHUConfig")
     if not isinstance(inputs, AHUStepInputs):
         raise TypeError("inputs must be an AHUStepInputs")
 
-    # Step 2 first: Actual flows — needed to detect zero-flow before resolving setpoint
-    # so that scheduled control with no setpoint does not raise when the AHU is off.
+    # Step 1: distinguish operating flow from timestep-average flow. This keeps
+    # reduced fan speed separate from ON/OFF duty averaging.
     op = inputs.operation_fraction
-    actual_supply_m3_h = op * inputs.required_supply_flow_m3_h
-    actual_extract_m3_h = op * inputs.required_extract_flow_m3_h
-    q_sup = actual_supply_m3_h / 3600.0  # m³/s
-    q_eta = actual_extract_m3_h / 3600.0  # m³/s
+    flow_fraction = inputs.flow_fraction
+    operating_supply_m3_h = flow_fraction * inputs.required_supply_flow_m3_h
+    operating_extract_m3_h = flow_fraction * inputs.required_extract_flow_m3_h
+    actual_supply_m3_h = op * operating_supply_m3_h
+    actual_extract_m3_h = op * operating_extract_m3_h
+    q_sup = operating_supply_m3_h / 3600.0  # m³/s while operating
+    q_eta = operating_extract_m3_h / 3600.0  # m³/s while operating
 
-    if q_sup <= 0.0:
+    if op <= 0.0 or q_sup <= 0.0:
         return AHUStepOutputs(
             requested_supply_temperature_c=None,
             actual_supply_temperature_c=inputs.outdoor_temperature_c,
@@ -506,19 +667,37 @@ def calculate_sensible_ahu_step(
 
     rho_cp_q = _RHO_CP_J_M3_K * q_sup  # W/K for supply stream
 
-    # Step 3: Fan electricity and temperature rises
-    p_sup_fan = q_sup * config.supply_fan_specific_power_w_per_m3_s
-    p_eta_fan = q_eta * config.extract_fan_specific_power_w_per_m3_s
-    fan_electric_power_w = p_sup_fan + p_eta_fan
-
-    # Extract fan heat warms extract entering the HR
-    dt_eta_fan = (
-        p_eta_fan * config.extract_fan_heat_fraction_to_air / (_RHO_CP_J_M3_K * q_eta)
-        if q_eta > 0.0
-        else 0.0
+    # Step 3: fan electricity and temperature rises. Power outputs are
+    # timestep averages; temperature rises describe the operating airstream.
+    p_sup_fan, dt_sup_fan = _fan_power_and_temperature_rise(
+        model=config.fan_performance_model,
+        operating_flow_m3_h=operating_supply_m3_h,
+        design_flow_m3_h=inputs.required_supply_flow_m3_h,
+        operation_fraction=op,
+        nominal_specific_power_w_per_m3_s=(
+            config.supply_fan_specific_power_w_per_m3_s
+        ),
+        design_pressure_pa=config.supply_fan_design_pressure_pa,
+        nominal_efficiency=config.supply_fan_nominal_efficiency,
+        reference_flow_m3_h=config.supply_fan_reference_flow_m3_h,
+        reference_efficiency=config.supply_fan_reference_efficiency,
+        heat_fraction_to_air=config.supply_fan_heat_fraction_to_air,
     )
-    # Supply fan heat is applied after coil (accumulated now, used at step 9)
-    dt_sup_fan = p_sup_fan * config.supply_fan_heat_fraction_to_air / rho_cp_q
+    p_eta_fan, dt_eta_fan = _fan_power_and_temperature_rise(
+        model=config.fan_performance_model,
+        operating_flow_m3_h=operating_extract_m3_h,
+        design_flow_m3_h=inputs.required_extract_flow_m3_h,
+        operation_fraction=op,
+        nominal_specific_power_w_per_m3_s=(
+            config.extract_fan_specific_power_w_per_m3_s
+        ),
+        design_pressure_pa=config.extract_fan_design_pressure_pa,
+        nominal_efficiency=config.extract_fan_nominal_efficiency,
+        reference_flow_m3_h=config.extract_fan_reference_flow_m3_h,
+        reference_efficiency=config.extract_fan_reference_efficiency,
+        heat_fraction_to_air=config.extract_fan_heat_fraction_to_air,
+    )
+    fan_electric_power_w = p_sup_fan + p_eta_fan
 
     t_outdoor = inputs.outdoor_temperature_c
     t_ext_at_hr = inputs.extract_temperature_c + dt_eta_fan
@@ -579,30 +758,25 @@ def calculate_sensible_ahu_step(
         bypass_fraction = 0.0
 
     # Step 7: Heat recovery power (net thermal gain to supply vs outdoor air)
-    hr_power_w = rho_cp_q * (t_after_hr - t_outdoor)
+    hr_power_operating_w = rho_cp_q * (t_after_hr - t_outdoor)
 
     # Unmet cooling: power that would be needed to reach t_target but cannot be
     # delivered because no cooling coil is present.  Positive when bypass has been
     # driven to its limit and the supply is still above the setpoint.
-    required_cooling_coil_w = rho_cp_q * max(0.0, t_after_hr - t_target)
+    required_cooling_operating_w = rho_cp_q * max(0.0, t_after_hr - t_target)
 
     # Step 8: Heating coil targeting t_target so delivered temperature equals
     # requested_t_sup after supply fan heat is added in step 9.
-    # For ON/OFF scheduling (operation_fraction < 1), the time-averaged available
-    # coil power is coil_max * op: the coil runs at rated power only during the ON
-    # fraction, so the timestep-average is proportionally reduced.
-    required_heating_w = rho_cp_q * max(0.0, t_target - t_after_hr)
-    available_heating_w = (
-        config.heating_coil_max_power_w * op
-        if config.heating_coil_max_power_w is not None
-        else None
-    )
-    if available_heating_w is None:
-        actual_heating_w = required_heating_w
+    required_heating_operating_w = rho_cp_q * max(0.0, t_target - t_after_hr)
+    if config.heating_coil_max_power_w is None:
+        actual_heating_operating_w = required_heating_operating_w
     else:
-        actual_heating_w = min(required_heating_w, available_heating_w)
+        actual_heating_operating_w = min(
+            required_heating_operating_w,
+            config.heating_coil_max_power_w,
+        )
 
-    t_after_coil = t_after_hr + actual_heating_w / rho_cp_q
+    t_after_coil = t_after_hr + actual_heating_operating_w / rho_cp_q
 
     # Step 9: Supply fan heat (after HR and coil, before zone delivery)
     t_actual_supply = t_after_coil + dt_sup_fan
@@ -612,11 +786,11 @@ def calculate_sensible_ahu_step(
         actual_supply_temperature_c=t_actual_supply,
         actual_supply_flow_m3_h=actual_supply_m3_h,
         actual_extract_flow_m3_h=actual_extract_m3_h,
-        required_heating_coil_power_w=required_heating_w,
-        actual_heating_coil_power_w=actual_heating_w,
-        required_cooling_coil_power_w=required_cooling_coil_w,
+        required_heating_coil_power_w=required_heating_operating_w * op,
+        actual_heating_coil_power_w=actual_heating_operating_w * op,
+        required_cooling_coil_power_w=required_cooling_operating_w * op,
         fan_electric_power_w=fan_electric_power_w,
-        heat_recovery_power_w=hr_power_w,
+        heat_recovery_power_w=hr_power_operating_w * op,
         bypass_fraction=bypass_fraction,
         frost_protection_required=frost_protection_req,
     )
@@ -653,10 +827,17 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
       ``frost_exhaust_limit_c``             — -5.0 [°C]
       ``heating_coil_max_power_w``          — None (unlimited)
       ``cooling_coil_enabled``              — False
-      ``supply_fan_specific_power_w_per_m3_s`` — 0.0
-      ``extract_fan_specific_power_w_per_m3_s`` — 0.0
+      ``supply_fan_specific_power_w_per_m3_s`` — 0.0  (nominal SFP at design flow)
+      ``extract_fan_specific_power_w_per_m3_s`` — 0.0  (nominal SFP at design flow)
       ``supply_fan_heat_fraction_to_air``   — 1.0
       ``extract_fan_heat_fraction_to_air``  — 1.0
+      ``fan_performance_model``              — "en16798_5_1"
+      ``supply_fan_design_pressure_pa``      — derived from nominal SFP and efficiency
+      ``extract_fan_design_pressure_pa``     — derived from nominal SFP and efficiency
+      ``supply_fan_nominal_efficiency``      — 0.72
+      ``extract_fan_nominal_efficiency``     — 0.78
+      ``*_fan_reference_flow_m3_h``          — required/design flow for the timestep
+      ``*_fan_reference_efficiency``         — corresponding nominal efficiency
     """
     heating_coil_max = d.get("heating_coil_max_power_w")
     if heating_coil_max is not None:
@@ -675,12 +856,17 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
             minimum_c=_opt_float(d.get("supply_temperature_minimum_c")),
             maximum_c=_opt_float(d.get("supply_temperature_maximum_c")),
         )
-    elif ctrl_mode_str == "outdoor_compensated":
+    elif ctrl_mode_str in ("outdoor_compensated", "extract_compensated"):
+        mode_enum = (
+            SupplyTemperatureControlMode.OUTDOOR_COMPENSATED
+            if ctrl_mode_str == "outdoor_compensated"
+            else SupplyTemperatureControlMode.EXTRACT_COMPENSATED
+        )
         raw_pts = d.get("supply_temperature_points")
         if not raw_pts:
             raise KeyError(
-                "outdoor_compensated control requires 'supply_temperature_points' "
-                "(list of [T_oda, T_sup] pairs)"
+                f"{ctrl_mode_str} control requires 'supply_temperature_points' "
+                "(list of [T_ref, T_sup] pairs, e.g. [[21, 19], [24, 17]] for ZEBlab)"
             )
         points = tuple(
             CompensationPoint(
@@ -690,7 +876,7 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
             for p in raw_pts
         )
         supply_ctrl = SupplyTemperatureControl(
-            mode=SupplyTemperatureControlMode.OUTDOOR_COMPENSATED,
+            mode=mode_enum,
             points=points,
             minimum_c=_opt_float(d.get("supply_temperature_minimum_c")),
             maximum_c=_opt_float(d.get("supply_temperature_maximum_c")),
@@ -698,7 +884,7 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
     else:
         raise ValueError(
             f"Unsupported supply_temperature_mode: {ctrl_mode_str!r}. "
-            "Supported: 'fixed', 'outdoor_compensated'."
+            "Supported: 'fixed', 'outdoor_compensated', 'extract_compensated'."
         )
 
     return SensibleAHUConfig(
@@ -720,6 +906,33 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
         ),
         extract_fan_heat_fraction_to_air=float(
             d.get("extract_fan_heat_fraction_to_air", 1.0)
+        ),
+        fan_performance_model=str(
+            d.get("fan_performance_model", "en16798_5_1")
+        ),
+        supply_fan_design_pressure_pa=_opt_float(
+            d.get("supply_fan_design_pressure_pa")
+        ),
+        extract_fan_design_pressure_pa=_opt_float(
+            d.get("extract_fan_design_pressure_pa")
+        ),
+        supply_fan_nominal_efficiency=float(
+            d.get("supply_fan_nominal_efficiency", 0.72)
+        ),
+        extract_fan_nominal_efficiency=float(
+            d.get("extract_fan_nominal_efficiency", 0.78)
+        ),
+        supply_fan_reference_flow_m3_h=_opt_float(
+            d.get("supply_fan_reference_flow_m3_h")
+        ),
+        extract_fan_reference_flow_m3_h=_opt_float(
+            d.get("extract_fan_reference_flow_m3_h")
+        ),
+        supply_fan_reference_efficiency=_opt_float(
+            d.get("supply_fan_reference_efficiency")
+        ),
+        extract_fan_reference_efficiency=_opt_float(
+            d.get("extract_fan_reference_efficiency")
         ),
     )
 

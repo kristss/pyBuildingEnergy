@@ -736,8 +736,9 @@ def _resolve_component_streams(
                 extract_temperature_c=zone_temperature_c,  # one-step lag
                 required_supply_flow_m3_h=supply_m3_h,
                 required_extract_flow_m3_h=extract_m3_h,
-                operation_fraction=multiplier,
+                operation_fraction=1.0,
                 timestep_hours=1.0,
+                flow_fraction=multiplier,
             )
             ahu_out = calculate_sensible_ahu_step(ahu_cfg, ahu_inp)
             if ahu_outputs_collector is not None:

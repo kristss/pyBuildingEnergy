@@ -131,13 +131,21 @@ def _make_sched_resolver(kwargs, iso16798_profiles_obj):
     return _sched
 
 
-def _resolve_single_zone_vent_boundary(building_object, T_zone, Tstepi, sim_df, profile_df):
+def _resolve_single_zone_vent_boundary(
+    building_object, T_zone, Tstepi, sim_df, profile_df,
+    ahu_outputs_collector=None,
+):
     """Build the affine ventilation boundary for legacy and causal single-zone solvers.
 
     Reads zone volume and ventilation config from *building_object*, resolves per-component
     profile multipliers from *profile_df* at timestep *Tstepi*, and delegates to
     resolve_ventilation_boundary.  Centralises logic that is otherwise duplicated in the
     legacy and causal solver timestep loops.
+
+    When *ahu_outputs_collector* is a dict it is passed through to
+    resolve_ventilation_boundary → _resolve_component_streams, which will write
+    {component_name: AHUStepOutputs} entries for every mechanical_supply component.
+    The caller is responsible for snapshotting the dict after each timestep.
     """
     _bld = building_object.get("building", {})
     _zone_vol = float(
@@ -167,7 +175,52 @@ def _resolve_single_zone_vent_boundary(building_object, T_zone, Tstepi, sim_df, 
         profile_multiplier=float(profile_df["ventilation_profile"].iloc[Tstepi]),
         component_multipliers=_comp_mult if _comp_mult else None,
         zone_volume_m3=_zone_vol if _zone_vol > 0.0 else None,
+        ahu_outputs_collector=ahu_outputs_collector,
     )
+
+
+def _ahu_coll_to_columns(ahu_coll_act):
+    """Convert per-timestep {component_name: AHUStepOutputs} dicts to hourly column arrays.
+
+    Returns {col_name: np.array} for all mechanical_supply components found in the list.
+    Only called when at least one such component is present.
+
+    AHU coil energy is NOT added to the zone Sankey.  Adding it would conflict
+    with the zone-boundary energy balance, because the ventilation loss term
+    already uses the conditioned supply temperature.
+    """
+    names = sorted({k for d in ahu_coll_act for k in d})
+    if not names:
+        return {}
+
+    cols: dict = {}
+    n = len(ahu_coll_act)
+    for name in names:
+        sfx = f"_{name}"
+        vv = [d.get(name) for d in ahu_coll_act]
+
+        def _arr(attr, _vv=vv, dtype=float):
+            a = np.empty(n, dtype=dtype)
+            for i, v in enumerate(_vv):
+                raw = getattr(v, attr) if v is not None else None
+                if dtype == float:
+                    a[i] = float(raw) if raw is not None else np.nan
+                else:
+                    a[i] = int(bool(raw)) if raw is not None else 0
+            return a
+
+        cols[f"Q_ahu_coil{sfx}"]     = _arr("actual_heating_coil_power_w")
+        cols[f"Q_ahu_coil_req{sfx}"] = _arr("required_heating_coil_power_w")
+        cols[f"Q_ahu_cool_req{sfx}"] = _arr("required_cooling_coil_power_w")
+        cols[f"Q_ahu_hr{sfx}"]       = _arr("heat_recovery_power_w")
+        cols[f"P_ahu_fan{sfx}"]      = _arr("fan_electric_power_w")
+        cols[f"T_ahu_sup{sfx}"]      = _arr("actual_supply_temperature_c")
+        cols[f"T_ahu_sup_req{sfx}"]  = _arr("requested_supply_temperature_c")
+        cols[f"q_sup_m3h{sfx}"]      = _arr("actual_supply_flow_m3_h")
+        cols[f"q_ext_m3h{sfx}"]      = _arr("actual_extract_flow_m3_h")
+        cols[f"ahu_bypass{sfx}"]     = _arr("bypass_fraction")
+        cols[f"ahu_frost{sfx}"]      = _arr("frost_protection_required", dtype=int)
+    return cols
 
 
 def _infer_timestep_hours_from_index(index, default=1.0):
@@ -6484,6 +6537,7 @@ class ISO52016:
         """
         H_ve_nat_all = [0]
         S_ve_nat_all = [0.0]
+        _ahu_coll_all: list = []   # per-timestep {comp_name: AHUStepOutputs}; appended once per timestep after HVAC loop
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -6734,6 +6788,7 @@ class ISO52016:
                 iterate = True
                 _H_ve_nat_tstep = 0.0
                 _S_ve_nat_tstep = 0.0
+                _ahu_coll_tstep: dict = {}   # overwritten each while iteration; final value captured after loop
                 while iterate:
 
                     iterate = False
@@ -6803,6 +6858,7 @@ class ISO52016:
 
                     _vent_bdy = _resolve_single_zone_vent_boundary(
                         building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
+                        ahu_outputs_collector=_ahu_coll_tstep,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
@@ -7213,6 +7269,7 @@ class ISO52016:
                 # while loop so HVAC re-solving iterations do not duplicate entries).
                 H_ve_nat_all.append(_H_ve_nat_tstep)
                 S_ve_nat_all.append(_S_ve_nat_tstep)
+                _ahu_coll_all.append(dict(_ahu_coll_tstep))
                 H_ve_nat = _H_ve_nat_tstep
                 S_ve_nat = _S_ve_nat_tstep
 
@@ -7388,6 +7445,12 @@ class ISO52016:
         )
         hourly_results["T_ve_source_eq"] = _t_eq
         hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
+
+        # AHU per-component diagnostics — only populated when mechanical_supply
+        # components are present. NOT added to the Sankey: AHU coil heat crosses
+        # the zone boundary from the system side and must not double-count Q_HC.
+        for _col_name, _col_arr in _ahu_coll_to_columns(_ahu_coll_all[act_slice]).items():
+            hourly_results[_col_name] = _col_arr
 
         # separate H/C
         hourly_results["Q_H"] = 0.0
@@ -7912,6 +7975,7 @@ class ISO52016:
         """
         H_ve_nat_all = [0]
         S_ve_nat_all = [0.0]
+        _ahu_coll_all: list = []   # per-timestep {comp_name: AHUStepOutputs}; appended once per timestep after HVAC loop
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -8210,6 +8274,7 @@ class ISO52016:
                 iterate = True
                 _H_ve_nat_tstep = 0.0
                 _S_ve_nat_tstep = 0.0
+                _ahu_coll_tstep: dict = {}   # overwritten each while iteration; final value captured after loop
                 while iterate:
 
                     iterate = False
@@ -8279,6 +8344,7 @@ class ISO52016:
 
                     _vent_bdy = _resolve_single_zone_vent_boundary(
                         building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
+                        ahu_outputs_collector=_ahu_coll_tstep,
                     )
                     H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
                     S_ve_nat = _vent_bdy.source_term_w
@@ -8726,6 +8792,7 @@ class ISO52016:
                 # while loop so HVAC re-solving iterations do not duplicate entries).
                 H_ve_nat_all.append(_H_ve_nat_tstep)
                 S_ve_nat_all.append(_S_ve_nat_tstep)
+                _ahu_coll_all.append(dict(_ahu_coll_tstep))
                 H_ve_nat = _H_ve_nat_tstep
                 S_ve_nat = _S_ve_nat_tstep
 
@@ -8906,6 +8973,12 @@ class ISO52016:
         )
         hourly_results["T_ve_source_eq"] = _t_eq
         hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
+
+        # AHU per-component diagnostics — only populated when mechanical_supply
+        # components are present. NOT added to the Sankey: AHU coil heat crosses
+        # the zone boundary from the system side and must not double-count Q_HC.
+        for _col_name, _col_arr in _ahu_coll_to_columns(_ahu_coll_all[act_slice]).items():
+            hourly_results[_col_name] = _col_arr
 
         # separate H/C
         hourly_results["Q_H"] = 0.0

@@ -8,6 +8,7 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     AHUStepInputs,
     AHUStepOutputs,
     CompensationPoint,
+    FanPerformanceModel,
     FrostControlMode,
     HeatRecoveryControl,
     SensibleAHUConfig,
@@ -234,6 +235,7 @@ def _cfg(**kw) -> SensibleAHUConfig:
         extract_fan_specific_power_w_per_m3_s=0.0,
         supply_fan_heat_fraction_to_air=1.0,
         extract_fan_heat_fraction_to_air=0.0,
+        fan_performance_model="en16798_5_1",
     )
     defaults.update(kw)
     return SensibleAHUConfig(**defaults)
@@ -348,6 +350,16 @@ def test_inputs_rejects_operation_fraction_above_one():
 def test_inputs_rejects_negative_operation_fraction():
     with pytest.raises(ValueError, match="operation_fraction"):
         _inp(operation_fraction=-0.1)
+
+
+def test_inputs_rejects_flow_fraction_above_one():
+    with pytest.raises(ValueError, match="flow_fraction"):
+        _inp(flow_fraction=1.1)
+
+
+def test_inputs_rejects_negative_flow_fraction():
+    with pytest.raises(ValueError, match="flow_fraction"):
+        _inp(flow_fraction=-0.1)
 
 
 def test_inputs_rejects_zero_timestep():
@@ -798,6 +810,140 @@ def test_fan_electricity_zero_when_no_fans_configured():
     assert out.fan_electric_power_w == pytest.approx(0.0, abs=1e-9)
 
 
+def test_en16798_fan_part_load_matches_reference_relations():
+    """Pressure follows r² and efficiency follows sqrt(r), as in recirc."""
+    flow_fraction = 0.25
+    sfp = 500.0
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.0,
+        heating_coil_max_power_w=0.0,
+        supply_fan_specific_power_w_per_m3_s=sfp,
+        supply_fan_heat_fraction_to_air=1.0,
+        fan_performance_model="en16798_5_1",
+    )
+
+    out_design = calculate_sensible_ahu_step(cfg, _inp())
+    out_part = calculate_sensible_ahu_step(
+        cfg,
+        _inp(flow_fraction=flow_fraction),
+    )
+
+    # With q_ref=q_design and eta_ref=eta_nom:
+    # P/P_design = r * r² / sqrt(r) = r**2.5.
+    assert out_part.fan_electric_power_w == pytest.approx(
+        out_design.fan_electric_power_w * flow_fraction ** 2.5,
+        rel=1e-9,
+    )
+
+    dt_design = out_design.actual_supply_temperature_c - (-9.7)
+    dt_part = out_part.actual_supply_temperature_c - (-9.7)
+    # Delta-T = delta_p/(rho*cp*eta), hence r²/sqrt(r) = r**1.5.
+    assert dt_part == pytest.approx(dt_design * flow_fraction ** 1.5, rel=1e-9)
+
+
+def test_en16798_fan_explicit_product_data_matches_recirc_equations():
+    flow_fraction = 0.4
+    design_pressure_pa = 500.0
+    eta_nom = 0.72
+    q_ref_m3_h = 900.0
+    eta_ref = 0.68
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.0,
+        heating_coil_max_power_w=0.0,
+        supply_fan_specific_power_w_per_m3_s=0.0,
+        supply_fan_design_pressure_pa=design_pressure_pa,
+        supply_fan_nominal_efficiency=eta_nom,
+        supply_fan_reference_flow_m3_h=q_ref_m3_h,
+        supply_fan_reference_efficiency=eta_ref,
+        supply_fan_heat_fraction_to_air=1.0,
+        fan_performance_model="en16798_5_1",
+    )
+    out = calculate_sensible_ahu_step(cfg, _inp(flow_fraction=flow_fraction))
+
+    q_actual_m3_h = _Q_M3_H * flow_fraction
+    q_actual_m3_s = q_actual_m3_h / 3600.0
+    pressure_pa = design_pressure_pa * flow_fraction ** 2
+    efficiency = eta_nom * (eta_ref / eta_nom) * math.sqrt(
+        q_actual_m3_h / q_ref_m3_h
+    )
+    expected_power_w = q_actual_m3_s * pressure_pa / efficiency
+    expected_dt_k = pressure_pa / (_RHO_CP_J_M3_K * efficiency)
+
+    assert out.fan_electric_power_w == pytest.approx(expected_power_w, rel=1e-9)
+    assert out.actual_supply_temperature_c - (-9.7) == pytest.approx(
+        expected_dt_k,
+        rel=1e-9,
+    )
+
+
+def test_constant_sfp_mode_remains_available():
+    flow_fraction = 0.25
+    sfp = 500.0
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.0,
+        heating_coil_max_power_w=0.0,
+        supply_fan_specific_power_w_per_m3_s=sfp,
+        supply_fan_heat_fraction_to_air=1.0,
+        fan_performance_model="constant_sfp",
+    )
+    out_design = calculate_sensible_ahu_step(cfg, _inp())
+    out_part = calculate_sensible_ahu_step(
+        cfg,
+        _inp(flow_fraction=flow_fraction),
+    )
+
+    assert out_part.fan_electric_power_w == pytest.approx(
+        out_design.fan_electric_power_w * flow_fraction,
+        rel=1e-9,
+    )
+    assert out_part.actual_supply_temperature_c == pytest.approx(
+        out_design.actual_supply_temperature_c,
+        abs=1e-9,
+    )
+
+
+def test_operation_fraction_averages_power_without_changing_fan_temperature_rise():
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.0,
+        heating_coil_max_power_w=0.0,
+        supply_fan_specific_power_w_per_m3_s=500.0,
+        supply_fan_heat_fraction_to_air=1.0,
+    )
+    out_full = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=1.0))
+    out_half_time = calculate_sensible_ahu_step(
+        cfg,
+        _inp(operation_fraction=0.5),
+    )
+
+    assert out_half_time.fan_electric_power_w == pytest.approx(
+        0.5 * out_full.fan_electric_power_w,
+        rel=1e-9,
+    )
+    assert out_half_time.actual_supply_temperature_c == pytest.approx(
+        out_full.actual_supply_temperature_c,
+        abs=1e-9,
+    )
+
+
+def test_extract_fan_zero_heat_fraction_supported_in_en16798_mode_at_part_load():
+    cfg_with_fan = _cfg(
+        extract_fan_specific_power_w_per_m3_s=500.0,
+        extract_fan_heat_fraction_to_air=0.0,
+        fan_performance_model="en16798_5_1",
+    )
+    cfg_without_fan = _cfg(extract_fan_specific_power_w_per_m3_s=0.0)
+    inp = _inp(flow_fraction=0.25)
+
+    out_with_fan = calculate_sensible_ahu_step(cfg_with_fan, inp)
+    out_without_fan = calculate_sensible_ahu_step(cfg_without_fan, inp)
+
+    assert out_with_fan.fan_electric_power_w > 0.0
+    assert out_with_fan.heat_recovery_power_w == pytest.approx(
+        out_without_fan.heat_recovery_power_w,
+        rel=1e-9,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scheduled supply-temperature control in AHU step
 # ---------------------------------------------------------------------------
@@ -1094,6 +1240,9 @@ def test_from_dict_defaults():
     assert cfg.extract_fan_specific_power_w_per_m3_s == pytest.approx(0.0)
     assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(1.0)
     assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(1.0)
+    assert cfg.fan_performance_model is FanPerformanceModel.EN16798_5_1
+    assert cfg.supply_fan_nominal_efficiency == pytest.approx(0.72)
+    assert cfg.extract_fan_nominal_efficiency == pytest.approx(0.78)
 
 
 def test_from_dict_explicit_optional_fields():
@@ -1106,6 +1255,15 @@ def test_from_dict_explicit_optional_fields():
         extract_fan_specific_power_w_per_m3_s=150.0,
         supply_fan_heat_fraction_to_air=0.9,
         extract_fan_heat_fraction_to_air=0.8,
+        fan_performance_model="constant_sfp",
+        supply_fan_design_pressure_pa=450.0,
+        extract_fan_design_pressure_pa=350.0,
+        supply_fan_nominal_efficiency=0.70,
+        extract_fan_nominal_efficiency=0.75,
+        supply_fan_reference_flow_m3_h=1000.0,
+        extract_fan_reference_flow_m3_h=900.0,
+        supply_fan_reference_efficiency=0.68,
+        extract_fan_reference_efficiency=0.73,
     ))
     assert cfg.heat_recovery_control is HeatRecoveryControl.ALWAYS_ON
     assert cfg.frost_control is FrostControlMode.NONE
@@ -1115,6 +1273,15 @@ def test_from_dict_explicit_optional_fields():
     assert cfg.extract_fan_specific_power_w_per_m3_s == pytest.approx(150.0)
     assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(0.9)
     assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(0.8)
+    assert cfg.fan_performance_model is FanPerformanceModel.CONSTANT_SFP
+    assert cfg.supply_fan_design_pressure_pa == pytest.approx(450.0)
+    assert cfg.extract_fan_design_pressure_pa == pytest.approx(350.0)
+    assert cfg.supply_fan_nominal_efficiency == pytest.approx(0.70)
+    assert cfg.extract_fan_nominal_efficiency == pytest.approx(0.75)
+    assert cfg.supply_fan_reference_flow_m3_h == pytest.approx(1000.0)
+    assert cfg.extract_fan_reference_flow_m3_h == pytest.approx(900.0)
+    assert cfg.supply_fan_reference_efficiency == pytest.approx(0.68)
+    assert cfg.extract_fan_reference_efficiency == pytest.approx(0.73)
 
 
 def test_from_dict_missing_setpoint_raises():
