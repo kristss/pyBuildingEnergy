@@ -1,15 +1,45 @@
 '''
-Evaluation of heat transfer coefficent by ventilation using:
-- the iso 16798-7 based on natural ventilation through windows using wind velocity and temperature difference (internal - external) inputs
-- simplified method that take into account the occupancy profile
+Ventilation heat-transfer coefficient and affine boundary for ISO 52016-1 §6.5.10.
 
-# To integrate:
-- leaks 
-- cross-ventilation 
-- mechanical ventilation
+Methods implemented:
+- Natural ventilation through windows (EN 16798-7 wind/temperature-difference method)
+- Occupancy-based simplified method
+- Custom, EnergyPlus infiltration, and Sherman-Grimsrud infiltration models
+- Affine ventilation boundary: additive VentilationStream objects and VentilationBoundary
+
+Affine boundary
+---------------
+ISO 52016-1 §6.5.10 inserts ventilation into the zone energy balance as:
+
+    A_air,air += H_ve
+    B_air     += S_ve
+
+where:
+
+    H_ve = sum_k(H_k)                 [W/K]  aggregate conductance
+    S_ve = sum_k(H_k * T_source,k)    [W]    weighted source term
+
+The zone sensible ventilation heat flow (positive = heat leaving the zone) is:
+
+    Q_ve = H_ve * T_zone - S_ve
+
+No additional matrix temperature node is required.  T_supply_equivalent may be
+reported as S_ve / H_ve when H_ve > 0, but the solver must retain the pair
+(H_ve, S_ve) rather than reducing it to a single temperature or a
+state-dependent effective conductance.
+
+Existing five ventilation_type configurations resolve to one outdoor-air stream
+(backward-compatible).  The optional ``components`` configuration enables
+independent streams with per-component operation schedules.
+
+To integrate (deferred):
+- Detailed leakage and duct networks
+- Cross-ventilation and inter-zone airflow
+- Full mechanical ventilation via EN 16798-5-1 AHU module (PR 2)
 '''
 
 from dataclasses import dataclass
+import math
 import numpy as np
 import warnings
 from .table_iso_16798_1 import *
@@ -17,6 +47,90 @@ from .table_iso_16798_1 import *
 @dataclass
 class h_natural_vent:
     H_ve_nat: np.ndarray
+
+
+@dataclass(frozen=True)
+class VentilationStream:
+    """Single additive airflow element for the ISO 52016-1 §6.5.10 ventilation term.
+
+    Sensible heat delivered to the zone from this stream (positive = heat into zone):
+        Q_k = H_k * (T_source,k - T_zone)
+    """
+    name: str
+    heat_transfer_coefficient_w_k: float   # H_k [W/K], must be >= 0 and finite
+    source_temperature_c: float            # T_source,k [°C], must be finite
+    category: str = "outdoor_air"
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("VentilationStream name must be non-empty")
+        if not math.isfinite(self.heat_transfer_coefficient_w_k):
+            raise ValueError(
+                f"Stream {self.name!r}: H_k must be finite, "
+                f"got {self.heat_transfer_coefficient_w_k}"
+            )
+        if self.heat_transfer_coefficient_w_k < 0.0:
+            raise ValueError(
+                f"Stream {self.name!r}: H_k must be >= 0, "
+                f"got {self.heat_transfer_coefficient_w_k}"
+            )
+        if not math.isfinite(self.source_temperature_c):
+            raise ValueError(
+                f"Stream {self.name!r}: source_temperature_c must be finite, "
+                f"got {self.source_temperature_c}"
+            )
+
+
+@dataclass(frozen=True)
+class VentilationBoundary:
+    """Aggregate affine ventilation boundary for one ISO 52016-1 zone at one timestep.
+
+    ISO 52016-1 §6.5.10 zone-air matrix assembly:
+        A_air,air += H_ve          (= sum of all stream H_k)
+        B_air     += S_ve          (= sum of H_k * T_source,k across all streams)
+
+    Zone sensible ventilation heat flow, positive = heat leaving the zone:
+        Q_ve = H_ve * T_zone - S_ve
+    """
+    streams: tuple  # tuple[VentilationStream, ...]
+
+    def __post_init__(self):
+        # Coerce any iterable to tuple so the boundary is truly immutable
+        object.__setattr__(self, "streams", tuple(self.streams))
+        for s in self.streams:
+            if not isinstance(s, VentilationStream):
+                raise TypeError(
+                    f"streams must contain VentilationStream instances, got {type(s)}"
+                )
+        names = [s.name for s in self.streams]
+        if len(names) != len(set(names)):
+            dupes = [n for n in set(names) if names.count(n) > 1]
+            raise ValueError(f"Duplicate stream names in boundary: {dupes}")
+
+    @property
+    def heat_transfer_coefficient_w_k(self) -> float:
+        """Aggregate H_ve = sum(H_k) [W/K]."""
+        return sum(s.heat_transfer_coefficient_w_k for s in self.streams)
+
+    @property
+    def source_term_w(self) -> float:
+        """Aggregate S_ve = sum(H_k * T_source,k) [W]."""
+        return sum(
+            s.heat_transfer_coefficient_w_k * s.source_temperature_c
+            for s in self.streams
+        )
+
+    @property
+    def equivalent_supply_temperature_c(self):
+        """Flow-weighted equivalent source temperature S_ve / H_ve [°C], or None when H_ve = 0."""
+        h = self.heat_transfer_coefficient_w_k
+        if h == 0.0:
+            return None
+        return self.source_term_w / h
+
+    def sensible_heat_flow_w(self, zone_temperature_c: float) -> float:
+        """Zone ventilation heat flow [W]; positive = heat leaving the zone."""
+        return self.heat_transfer_coefficient_w_k * zone_temperature_c - self.source_term_w
 
 class VentilationInternalGains:
     def __init__(self, building_object):
@@ -56,7 +170,7 @@ class VentilationInternalGains:
         """
 
         """
-        According to the ISO 16798-7:2017
+        According to EN 16798-7:2017
         calculation of air flow rate through window using wind velocity and temperature difference (6.4.3.5.4)
         
         # Single side ventilation 
@@ -162,7 +276,7 @@ class VentilationInternalGains:
             height = np.asarray(height_list, dtype=float)
             width = np.asarray(width_list, dtype=float)
 
-            # ISO 16798-7: hw_path = center height from floor; hw_fa = opening height (use full height)
+            # EN 16798-7: hw_path = center height from floor; hw_fa = opening height (use full height)
             hw_path_i = parapet + 0.5 * height
             hw_fa_i = height
 
@@ -521,6 +635,201 @@ class VentilationInternalGains:
                 Phi_int_z_t +=Phi_int_dir_z_t + (1-b_ztu)*Fztc_ztu_m * Phi_int_dir_z_t
         
         return float(Phi_int_z_t)
+
+
+# ---------------------------------------------------------------------------
+# Affine ventilation boundary resolver (ISO 52016-1 §6.5.10)
+# ---------------------------------------------------------------------------
+
+def _parse_source_temperature(spec, outdoor_temperature_c: float) -> float:
+    """Resolve a source_temperature specification to a float [°C].
+
+    Accepts:
+    - the string "outdoor" (case-insensitive) → outdoor_temperature_c
+    - any numeric value → that value cast to float
+    """
+    if isinstance(spec, str):
+        if spec.strip().lower() == "outdoor":
+            return outdoor_temperature_c
+        try:
+            return float(spec)
+        except ValueError:
+            raise ValueError(f"Unknown source_temperature string: {spec!r}")
+    return float(spec)
+
+
+def _resolve_component_streams(
+    components: list,
+    outdoor_temperature_c: float,
+    zone_volume_m3,
+    c_air: float,
+    rho_air: float,
+    component_multipliers: dict = None,
+    default_multiplier: float = 1.0,
+) -> list:
+    """Convert a ventilation components list to VentilationStream objects.
+
+    Supported component ventilation_type values:
+    - 'constant_ach': infiltration or natural ventilation via air-change rate.
+      Requires zone_volume_m3. source_temperature defaults to "outdoor".
+    - 'prescribed': fixed H_k and source temperature supplied by caller (e.g. AHU).
+
+    component_multipliers: optional per-component name -> float operation fraction.
+    default_multiplier: applied to any component not in component_multipliers.
+    Note: infiltration components should typically use a multiplier of 1.0 so they
+    remain active when the mechanical profile is off. Pass component_multipliers
+    explicitly to give each stream an independent schedule.
+    """
+    streams = []
+    seen_names: set = set()
+    cm = component_multipliers or {}
+    for comp in components:
+        name = str(comp.get("name", "")).strip()
+        if not name:
+            raise ValueError("Each ventilation component must have a non-empty 'name'")
+        if name in seen_names:
+            raise ValueError(f"Duplicate ventilation component name: {name!r}")
+        seen_names.add(name)
+
+        comp_type = str(comp.get("ventilation_type", "")).strip().lower()
+        multiplier = float(cm.get(name, default_multiplier))
+
+        if comp_type == "constant_ach":
+            if zone_volume_m3 is None or float(zone_volume_m3) <= 0.0:
+                raise ValueError(
+                    f"Component {name!r}: ventilation_type='constant_ach' "
+                    "requires a positive zone_volume_m3"
+                )
+            ach = float(comp["air_changes_per_hour"])
+            q_m3_s = ach * float(zone_volume_m3) / 3600.0
+            h_k = rho_air * c_air * q_m3_s * multiplier
+            source_temp = _parse_source_temperature(
+                comp.get("source_temperature", "outdoor"), outdoor_temperature_c
+            )
+            category = "outdoor_air"
+
+        elif comp_type == "prescribed":
+            h_k = float(comp["heat_transfer_coefficient_w_k"]) * multiplier
+            source_temp = float(comp["source_temperature_c"])
+            category = comp.get("category", "supply")
+
+        else:
+            raise ValueError(
+                f"Component {name!r}: unknown ventilation_type={comp_type!r}. "
+                "Supported component types: 'constant_ach', 'prescribed'."
+            )
+
+        streams.append(
+            VentilationStream(
+                name=name,
+                heat_transfer_coefficient_w_k=h_k,
+                source_temperature_c=source_temp,
+                category=category,
+            )
+        )
+    return streams
+
+
+def resolve_ventilation_boundary(
+    building_object,
+    zone_temperature_c: float,
+    outdoor_temperature_c: float,
+    wind_speed_m_s: float,
+    profile_multiplier: float = 1.0,
+    component_multipliers: dict = None,
+    zone_volume_m3=None,
+    altitude_m=None,
+    extra_streams=(),
+    c_air: float = 1006.0,
+    rho_air: float = 1.204,
+) -> VentilationBoundary:
+    """Resolve building/zone configuration into an ISO 52016-1 VentilationBoundary.
+
+    When the ventilation configuration contains a 'components' list, each entry
+    becomes an independent VentilationStream with its own source temperature.
+
+    When no 'components' key is present, the legacy scalar ventilation_type path
+    is used, producing a single outdoor-air stream scaled by profile_multiplier.
+    All five existing ventilation_type calculations (temp_wind, occupancy, custom,
+    eplus_infiltration_ext_area, sherman_grimsrud_like) are supported via this path.
+
+    profile_multiplier: operation fraction applied to the legacy single stream.
+    component_multipliers: optional dict mapping component name -> operation fraction.
+      Components not in the dict default to 1.0 (full capacity), so infiltration
+      components remain active independently of the mechanical ventilation schedule.
+      Pass {"ahu_supply": 0.0} to turn off the AHU while infiltration runs
+      unaffected. When None, all components run at 1.0.
+    extra_streams: additional pre-built VentilationStream objects added by the caller
+    (e.g. a summer night purge stream resolved by the timestep loop).
+
+    Raises RuntimeError or ValueError on invalid configuration; does not silently
+    substitute zero for invalid H_k or non-finite temperatures.
+    """
+    vent_cfg: dict = {}
+    if isinstance(building_object, dict):
+        vent_cfg = (
+            building_object.get("building_parameters", {}).get("ventilation", {})
+            or building_object.get("ventilation", {})
+            or {}
+        )
+
+    components = vent_cfg.get("components", None)
+
+    if components is not None:
+        # For component streams, each stream uses its own schedule (1.0 default)
+        # so infiltration components remain active when a mechanical schedule is
+        # off.  profile_multiplier is only applied to the legacy single stream.
+        streams = _resolve_component_streams(
+            components,
+            outdoor_temperature_c,
+            zone_volume_m3,
+            c_air,
+            rho_air,
+            component_multipliers=component_multipliers,
+            default_multiplier=1.0,
+        )
+    else:
+        vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()
+        if vent_type in ("none", "off", "disabled", ""):
+            streams = []
+        else:
+            try:
+                h_ve = VentilationInternalGains.heat_transfer_coefficient_by_ventilation(
+                    building_object,
+                    zone_temperature_c,
+                    outdoor_temperature_c,
+                    wind_speed_m_s,
+                    type_ventilation=vent_type,
+                    flowrate_person=float(vent_cfg.get("flow_rate_per_person", 0.0)),
+                    custom_Hve_k_t=float(
+                        vent_cfg.get("custom_heat_transfer_coefficient_ventilation", 0.0)
+                    ),
+                    altitude=altitude_m,
+                )
+                h_ve = float(np.ravel(np.asarray(h_ve))[0])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to resolve ventilation boundary for "
+                    f"ventilation_type={vent_type!r}: {exc}"
+                ) from exc
+            if not math.isfinite(h_ve) or h_ve < 0.0:
+                raise ValueError(
+                    f"Ventilation resolved to invalid H_ve={h_ve!r} "
+                    f"for ventilation_type={vent_type!r}"
+                )
+            h_ve_scaled = h_ve * profile_multiplier
+            streams = (
+                [VentilationStream(
+                    name="ventilation",
+                    heat_transfer_coefficient_w_k=h_ve_scaled,
+                    source_temperature_c=outdoor_temperature_c,
+                    category="outdoor_air",
+                )]
+                if h_ve_scaled > 0.0
+                else []
+            )
+
+    return VentilationBoundary(streams=tuple(streams) + tuple(extra_streams))
 
 
 def transmission_heat_transfer_coefficient_ISO13789(adj_zone, n_ue=0.5, qui=0):

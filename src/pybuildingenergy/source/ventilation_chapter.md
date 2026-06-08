@@ -76,7 +76,7 @@ This makes the method resilient to different calling conventions. It reduces boi
 
 ### 3.3 The `temp_wind` model
 
-When `type_ventilation == "temp_wind"`, the method evaluates a natural ventilation formulation based on the combined effect of wind and stack pressure, following the ISO 16798-7 logic documented in the source comments.
+When `type_ventilation == "temp_wind"`, the method evaluates a natural ventilation formulation based on the combined effect of wind and stack pressure, following the EN 16798-7 logic documented in the source comments.
 
 The implementation:
 
@@ -144,7 +144,143 @@ The simplest path is `custom`. In this case the method does not derive the venti
 
 This is a practical escape hatch. It lets the caller impose a prescribed ventilation conductance when the desired behavior is known externally or when the simulation needs a controlled reference value.
 
-## 4. `internal_gains`
+## 4. Affine Ventilation Boundary (ISO 52016-1 §6.5.10)
+
+### 4.1 Mathematical foundation
+
+ISO 52016-1 §6.5.10 inserts ventilation into the zone energy balance through a conductance
+term and a source term.  The two dataclasses and one resolver function in this module
+are an algebraically equivalent implementation of that formulation.
+
+Each airflow stream *k* (infiltration, mechanical supply, summer purge, etc.) contributes:
+
+```
+Q_k = H_k · (T_source,k − T_zone)   [W, positive = heat into zone]
+```
+
+Summing over all active streams gives the aggregate boundary passed to the solver:
+
+```
+H_ve = Σ H_k          [W/K]   conductance
+S_ve = Σ H_k · T_source,k   [W]    weighted source term
+
+Q_ve = H_ve · T_zone − S_ve  (positive = heat leaving zone)
+```
+
+The solver receives `(H_ve, S_ve)` and inserts them directly into the zone matrix without
+adding a supply-air temperature node.  The equivalent supply temperature `S_ve / H_ve`
+is available as a diagnostic but must not replace the pair in the solver.
+
+All existing single-stream configurations (any `ventilation_type` value) produce
+`S_ve = H_ve · T_outdoor`, so existing result columns retain their meaning; the new
+`S_ve` and `Q_ve` diagnostic columns are additive.
+
+### 4.2 `VentilationStream`
+
+A frozen dataclass representing one additive airflow element:
+
+```python
+@dataclass(frozen=True)
+class VentilationStream:
+    name: str                           # unique label
+    heat_transfer_coefficient_w_k: float  # H_k [W/K], must be ≥ 0 and finite
+    source_temperature_c: float         # T_source,k [°C], must be finite
+    category: str = "outdoor_air"       # "outdoor_air" | "supply" | other
+```
+
+`__post_init__` enforces finite, non-negative `H_k` and finite `source_temperature_c`.
+Zero conductance is allowed (stream is inactive) but negative conductance is rejected.
+
+### 4.3 `VentilationBoundary`
+
+A frozen dataclass holding the complete set of active streams for one zone at one timestep:
+
+```python
+@dataclass(frozen=True)
+class VentilationBoundary:
+    streams: tuple[VentilationStream, ...]
+```
+
+Computed properties:
+
+| Property | Formula | Unit |
+|----------|---------|------|
+| `heat_transfer_coefficient_w_k` | `Σ H_k` | W/K |
+| `source_term_w` | `Σ H_k · T_source,k` | W |
+| `equivalent_supply_temperature_c` | `S_ve / H_ve` (None when H_ve = 0) | °C |
+
+An empty `streams` tuple is valid and represents zero ventilation (`H_ve = 0`, `S_ve = 0`).
+
+### 4.4 `resolve_ventilation_boundary`
+
+The main entry point called by the solver at each timestep:
+
+```python
+resolve_ventilation_boundary(
+    building_object,
+    zone_temperature_c,
+    outdoor_temperature_c,
+    wind_speed_m_s,
+    profile_multiplier=1.0,
+    component_multipliers=None,
+    extra_streams=(),
+    zone_volume_m3=None,
+    altitude_m=None,
+    c_air=1006.0,
+    rho_air=1.204,
+) -> VentilationBoundary
+```
+
+Dispatch logic:
+
+1. If `building_parameters.ventilation.components` is present, each entry becomes an
+   independent `VentilationStream` via `_resolve_component_streams`.  Components absent
+   from `component_multipliers` default to 1.0 (full capacity), so infiltration streams
+   remain active when the mechanical schedule is off.
+2. Otherwise the legacy scalar path is used: `ventilation_type` is resolved through
+   `VentilationInternalGains.heat_transfer_coefficient_by_ventilation` and scaled by
+   `profile_multiplier`, producing one outdoor-air stream.  All five existing
+   `ventilation_type` values are supported.
+3. `extra_streams` (e.g. a summer night purge) are appended after dispatch.
+
+Raises `RuntimeError` or `ValueError` on invalid configuration; does not silently
+substitute zero for a non-finite or negative `H_k`.
+
+### 4.5 `components` configuration schema
+
+The `components` key under `building_parameters.ventilation` enables multi-stream
+ventilation.  Each entry is a dict:
+
+```python
+{
+    "name": "infiltration",               # required, unique label
+    "ventilation_type": "constant_ach",   # "constant_ach" or "prescribed"
+    "profile": "ventilation_profile",     # optional — names a profile_df column
+    # type-specific keys, e.g.:
+    "air_changes_per_hour": 0.3,
+}
+```
+
+The `"prescribed"` type accepts `heat_transfer_coefficient_w_k` and
+`source_temperature_c` directly, bypassing the scalar airflow models.  This is the
+primary mechanism for modelling a supply-air stream at a fixed temperature (e.g. an
+AHU delivering 18 °C supply air):
+
+```python
+{
+    "name": "ahu_supply",
+    "ventilation_type": "prescribed",
+    "heat_transfer_coefficient_w_k": 815.0,
+    "source_temperature_c": 18.0,
+    "profile": "ventilation_profile",   # AHU off outside operating hours
+}
+```
+
+A `components` list may combine infiltration (no profile → always active) and mechanical
+supply (with profile → follows schedule), which is the practical purpose of the additive
+stream model and the contract required by the EN 16798-5-1 AHU module (PR 2).
+
+## 5. `internal_gains`
 
 The second major method is `internal_gains`.
 
@@ -171,19 +307,19 @@ The calculation proceeds in layers:
 
 This design is important because it separates the baseline assumptions from the project-specific tuning. In other words, the module knows the canonical values, but it still allows a higher-level model to replace them when the building under study has more precise data.
 
-### 4.1 Local overrides
+### 5.1 Local overrides
 
 The override mechanism is straightforward: if the building object contains an `internal_gains` list, each item can replace one of the default full-load values.
 
 That makes the function compatible with project workflows in which internal gains are specified explicitly rather than inferred from the usage class alone.
 
-### 4.2 Unconditioned adjacent zones
+### 5.2 Unconditioned adjacent zones
 
 The method also contains an optional branch for nearby unconditioned zones. In that case, internal gains can be redistributed using coupling factors such as `Fztc_ztu_m` and `b_ztu`.
 
 Even though this part of the function is more specialized, the underlying idea is clear: not all internal gains remain confined to the conditioned space where they originate. Some can be transferred to adjacent zones and should therefore be handled in the energy balance.
 
-## 5. `transmission_heat_transfer_coefficient_ISO13789`
+## 6. `transmission_heat_transfer_coefficient_ISO13789`
 
 The module ends with a helper function for unconditioned-adjacent-zone transmission:
 
@@ -202,7 +338,7 @@ The function also computes an adjustment factor `b_ztu_m`, representing the shar
 
 Conceptually, this helper is a bridge between the detailed zone formulation and the simplified representation of buffer spaces. It turns geometry, transmittance, and ventilation assumptions into an aggregate thermal conductance that can be used in the broader simulation.
 
-## 6. Design Style of the Module
+## 7. Design Style of the Module
 
 What makes this module useful is not just the formulas it implements, but the way it is structured:
 
@@ -214,7 +350,7 @@ What makes this module useful is not just the formulas it implements, but the wa
 
 This makes the module well suited to engineering workflows where input data are incomplete, heterogeneous, or gradually refined over time.
 
-## 7. Practical Reading of the Code
+## 8. Practical Reading of the Code
 
 If one reads the module as part of a thermal simulation pipeline, its logic becomes easy to summarize:
 
@@ -228,7 +364,7 @@ If one reads the module as part of a thermal simulation pipeline, its logic beco
 
 Taken together, these functions define how the building exchanges heat with the air around it and with the people and equipment inside it. In a simulation context, that is enough to strongly influence both heating and cooling demand.
 
-## 8. Closing Note
+## 9. Closing Note
 
 The module is small, but it carries a disproportionate share of the physical realism of the model. Ventilation and internal gains are often treated as secondary details in simplified building analyses, yet they are among the first mechanisms that determine whether a zone remains comfortable or drifts away from setpoint.
 

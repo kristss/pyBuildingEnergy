@@ -22,7 +22,12 @@ import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
 # pvlib imported lazily -- avoids ~1.9s startup cost
-from .ventilation import VentilationInternalGains   
+from .ventilation import (
+    VentilationInternalGains,
+    VentilationStream,
+    VentilationBoundary,
+    resolve_ventilation_boundary,
+)
 from .functions import *
 # generate_profile imported lazily -- avoids ~0.8s startup cost
 from .table_iso_16798_1 import * 
@@ -105,6 +110,64 @@ class h_vent_and_int_gains:
 @dataclass
 class h_natural_vent:
     H_ve_nat: np.array
+
+
+def _make_sched_resolver(kwargs, iso16798_profiles_obj):
+    """Return a schedule-kwarg resolver that handles explicit None correctly.
+
+    ``kwargs.get(key, default)`` only returns *default* when the key is absent;
+    it returns ``None`` when the caller passes the key explicitly as ``None``
+    (e.g. the multizone hybrid caller always passes ``occupants_schedule_workdays=None``).
+    Using an explicit ``is None`` check avoids this and also avoids the ``v or default``
+    anti-pattern, which silently replaces falsey-but-valid inputs such as ``{}`` and
+    raises ``ValueError`` for array-like inputs whose truth value is ambiguous.
+    """
+    def _sched(key, attr):
+        v = kwargs.get(key)
+        return (
+            getattr(iso16798_profiles_obj, attr, {"Residential_apartment": [1.0] * 24})
+            if v is None else v
+        )
+    return _sched
+
+
+def _resolve_single_zone_vent_boundary(building_object, T_zone, Tstepi, sim_df, profile_df):
+    """Build the affine ventilation boundary for legacy and causal single-zone solvers.
+
+    Reads zone volume and ventilation config from *building_object*, resolves per-component
+    profile multipliers from *profile_df* at timestep *Tstepi*, and delegates to
+    resolve_ventilation_boundary.  Centralises logic that is otherwise duplicated in the
+    legacy and causal solver timestep loops.
+    """
+    _bld = building_object.get("building", {})
+    _zone_vol = float(
+        _bld.get("zone_volume_m3") or _bld.get("zone_volume") or _bld.get("volume") or 0.0
+    )
+    _vent_cfg = building_object.get("building_parameters", {}).get("ventilation", {}) or {}
+    _comp_mult: dict = {}
+    for _comp in _vent_cfg.get("components", []):
+        _cname = str(_comp.get("name", "")).strip()
+        _cprof = _comp.get("profile")
+        if _cname and _cprof is not None:
+            _col = str(_cprof)
+            if _col in profile_df.columns:
+                _comp_mult[_cname] = float(profile_df[_col].iloc[Tstepi])
+            else:
+                import warnings as _w
+                _w.warn(
+                    f"Component {_cname!r}: profile column {_col!r} not in "
+                    f"profile_df; available columns: {list(profile_df.columns)}. Using 1.0.",
+                    stacklevel=3,
+                )
+    return resolve_ventilation_boundary(
+        building_object,
+        float(T_zone),
+        float(sim_df.iloc[Tstepi]["T2m"]),
+        float(sim_df.iloc[Tstepi].get("WS10m", 0.0) or 0.0),
+        profile_multiplier=float(profile_df["ventilation_profile"].iloc[Tstepi]),
+        component_multipliers=_comp_mult if _comp_mult else None,
+        zone_volume_m3=_zone_vol if _zone_vol > 0.0 else None,
+    )
 
 
 def _infer_timestep_hours_from_index(index, default=1.0):
@@ -1191,7 +1254,6 @@ class ISO52010:
     # GET DATA FROM PVGIS
     @classmethod
     def get_tmy_data_pvgis(cls, building_object) -> WeatherDataResult:
-    from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
         """
         Get Weather data from pvgis API
 
@@ -1208,6 +1270,7 @@ class ISO52010:
             In case only weather data is desired, the ``building_object`` can only have the **latitude** and **longitude** parameters.
 
         """
+        from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
 
         # Connection to PVGIS API to get weather data
         if isinstance(building_object, dict):
@@ -1384,7 +1447,6 @@ class ISO52010:
     # GET WEATHER DATA FROM .epw FILE
     @classmethod
     def get_tmy_data_epw(cls, path_weather_file):
-    from pvlib.iotools import epw  # lazy: avoids ~1.9s cold import
         """
         Get Wetaher data from epw file
 
@@ -1397,6 +1459,7 @@ class ISO52010:
             * *latitude*: latitude of the building place (type: **float**)
             * *longitude*: longitude of the building place (type: **float**)
         """
+        from pvlib.iotools import epw  # lazy: avoids ~1.9s cold import
 
         # Read EPW file
         if isinstance(path_weather_file, (bytes, bytearray)):
@@ -1902,6 +1965,7 @@ def Calculation_ISO_52010(building_object, path_weather_file, weather_source="pv
     # - PVGIS data are UTC -> convert to local civil time using site timezone.
     # - EPW read via pvlib is already in local weather-file time -> keep as-is.
     if weather_source == "pvgis":
+        from timezonefinder import TimezoneFinder  # lazy: avoids ~0.7s cold import
         tf = TimezoneFinder()
         tz_name = tf.timezone_at(lng=weatherData.longitude, lat=weatherData.latitude) or "UTC"
         idx = pd.DatetimeIndex(sim_df.index)
@@ -3272,6 +3336,7 @@ class ISO52016:
         sim_df.index = pd.DatetimeIndex(sim_df.index)
         sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
         sim_df = sim_df.sort_index()
+        T2m_arr = _series_to_float_array(sim_df, "T2m")
 
         # ------------------------
         # 0.1) Time profiles (occupancy/heating/cooling/ventilation)
@@ -3798,6 +3863,9 @@ class ISO52016:
                     "mode": np.empty(Tstepn, dtype=object),
                     "Phi_int": np.empty(Tstepn, dtype=float),
                     "H_ve": np.empty(Tstepn, dtype=float),
+                    "S_ve": np.empty(Tstepn, dtype=float),
+                    "T_ve_source_eq": np.full(Tstepn, np.nan, dtype=float),
+                    "Q_ve": np.empty(Tstepn, dtype=float),
                     "H_ground": np.empty(Tstepn, dtype=float),
                     "Q_ground": np.empty(Tstepn, dtype=float),
                     "night_purge_factor": np.empty(Tstepn, dtype=float),
@@ -4083,6 +4151,24 @@ class ISO52016:
                     zone.get("infiltration_schedule_multiplier", 1.0)
                 ),
             }
+            # Components: zone-local overrides global; global is the fallback
+            _zone_vent_obj = zone.get("ventilation", {})
+            if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
+                zone_vent_params["components"] = _zone_vent_obj["components"]
+            elif "components" in global_vent:
+                zone_vent_params["components"] = global_vent["components"]
+
+            # Store zone-specific volume so constant_ach uses per-zone air not
+            # building-total air.  Must be set before building the proxy so the
+            # bld dict carries the correct value.
+            _zone_vol_raw = (
+                zone.get("zone_volume_m3")
+                or zone.get("zone_volume")
+                or zone.get("volume")
+            )
+            if _zone_vol_raw is not None:
+                bld["zone_volume_m3"] = float(_zone_vol_raw)
+
             zone_proxies[zname] = {
                 "zone_name": zname,
                 "building": bld,
@@ -4131,41 +4217,84 @@ class ISO52016:
             theta_air_prev: float,
             tstep: int,
             T_out: float,
-        ) -> tuple[float, float, int]:
+        ) -> tuple:  # (VentilationBoundary, float, int)
+            _empty = VentilationBoundary(streams=())
             if not include_ventilation:
-                return 0.0, 1.0, 0
-
-            vent_type = str(zone_obj.get("ventilation_type", "none")).strip().lower()
-            if vent_type in ("none", "off", "disabled", ""):
-                return 0.0, 1.0, 0
+                return _empty, 1.0, 0
 
             zname = str(zone_obj.get("name", zone_names[0]))
             if zname not in zone_proxies:
                 zname = zone_names[0]
+
+            proxy = zone_proxies[zname]
+            vent_cfg = proxy.get("building_parameters", {}).get("ventilation", {})
+            vent_type = str(vent_cfg.get("ventilation_type", "none")).strip().lower()
+            has_components = "components" in vent_cfg
+
+            if not has_components and vent_type in ("none", "off", "disabled", ""):
+                return _empty, 1.0, 0
+
             ws = float(sim_df["WS10m"].iloc[tstep]) if "WS10m" in sim_df.columns else 0.0
+            profile_mult = _profile_value(zname, "ventilation_profile", tstep, 1.0)
+
+            # Zone volume: zone-specific keys only; do NOT fall back to the
+            # global building volume (proxy["building"] is a copy of the global
+            # building dict and would give full-building air to every zone).
+            _bld = proxy.get("building", {})
+            zone_vol = float(
+                zone_obj.get("zone_volume_m3")
+                or zone_obj.get("zone_volume")
+                or zone_obj.get("volume")
+                or _bld.get("zone_volume_m3")  # set from zone data during proxy build
+                or 0.0
+            )
+
+            # Per-component schedules: each component may have a "profile" key
+            # naming a profile in the profile registry.  Components without a
+            # profile key always run at full capacity (1.0) so infiltration
+            # remains active independently of the mechanical schedule.
+            # Only the six standard profile columns are supported; unknown names
+            # warn once and fall back to 1.0.
+            _known_profiles = {
+                "occupancy_profile", "appliances_profile", "lighting_profile",
+                "heating_profile", "cooling_profile", "ventilation_profile",
+            }
+            _comp_mult: dict = {}
+            for _comp in vent_cfg.get("components", []):
+                _cname = str(_comp.get("name", "")).strip()
+                _prof = _comp.get("profile")
+                if _cname and _prof is not None:
+                    if _prof not in _known_profiles:
+                        import warnings as _w
+                        _w.warn(
+                            f"Zone {zname!r} component {_cname!r}: profile {_prof!r} is not "
+                            f"one of the supported profile columns {sorted(_known_profiles)}. "
+                            "Using 1.0.",
+                            stacklevel=2,
+                        )
+                    _comp_mult[_cname] = _profile_value(zname, _prof, tstep, 1.0)
+
             try:
-                h_ve = VentilationInternalGains(zone_proxies[zname]).heat_transfer_coefficient_by_ventilation(
-                    zone_proxies[zname],
+                base_bdy = resolve_ventilation_boundary(
+                    proxy,
                     float(theta_air_prev),
                     float(T_out),
                     float(ws),
-                    type_ventilation=vent_type,
-                    flowrate_person=float(zone_obj.get("flow_rate_per_person", 0.0)),
-                    custom_Hve_k_t=float(zone_obj.get("custom_heat_transfer_coefficient_ventilation", 0.0)),
+                    profile_multiplier=profile_mult,
+                    component_multipliers=_comp_mult if _comp_mult else None,
+                    zone_volume_m3=zone_vol if zone_vol > 0.0 else None,
                 )
-                h_ve = float(np.ravel(np.asarray(h_ve))[0])
-            except Exception:
-                h_ve = 0.0
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Zone {zname!r}: ventilation boundary resolution failed "
+                    f"(ventilation_type={vent_type!r}): {exc}"
+                ) from exc
 
-            if not np.isfinite(h_ve) or h_ve < 0.0:
-                h_ve = 0.0
-            h_ve *= _profile_value(zname, "ventilation_profile", tstep, 1.0)
             purge_factor_applied = 1.0
             purge_active = 0
 
-            # Optional summer night purge:
-            # boost ventilation when outdoor air is cooler than indoor air,
-            # within configured months/hours.
+            # Optional summer night purge: represented as an additional outdoor-air stream.
+            # H_purge = max(0, boost_factor - 1) * H_base so total equals boost_factor * H_base.
             purge_cfg = zone_obj.get("summer_night_purge", None)
             if not isinstance(purge_cfg, dict):
                 purge_cfg = (
@@ -4251,11 +4380,22 @@ class ISO52016:
 
                 if month_ok and hour_ok:
                     if float(theta_air_prev) - float(T_out) >= delta_t_min:
+                        H_base = base_bdy.heat_transfer_coefficient_w_k
+                        H_purge = max(0.0, boost_factor - 1.0) * H_base
+                        if H_purge > 0.0:
+                            purge_stream = VentilationStream(
+                                name="summer_night_purge",
+                                heat_transfer_coefficient_w_k=H_purge,
+                                source_temperature_c=float(T_out),
+                                category="outdoor_air",
+                            )
+                            base_bdy = VentilationBoundary(
+                                streams=base_bdy.streams + (purge_stream,)
+                            )
                         purge_factor_applied = float(boost_factor)
                         purge_active = 1
-                        h_ve *= purge_factor_applied
 
-            return max(0.0, float(h_ve)), purge_factor_applied, purge_active
+            return base_bdy, purge_factor_applied, purge_active
 
         def _zone_solar_transmitted_w(tstep: int) -> np.ndarray:
             phi_sol = np.zeros(Z, dtype=float)
@@ -4323,6 +4463,7 @@ class ISO52016:
             tstep: int,
             phi_int_z: np.ndarray,
             h_ve_z: np.ndarray,
+            s_ve_z: np.ndarray,
             phi_sol_z: np.ndarray,
         ):
             A = np.zeros((Ntot, Ntot), dtype=float)
@@ -4339,13 +4480,14 @@ class ISO52016:
             for zi in range(Z):
                 C_air = float(C_air_zone[zi])
                 h_ve = float(h_ve_z[zi])
+                s_ve = float(s_ve_z[zi])
                 h_tb = float(H_tb_zone[zi])
                 phi_int = float(phi_int_z[zi])
                 phi_sol_conv = float(f_sol_c) * float(phi_sol_z[zi])
 
                 A[zi, zi] += C_air / dt_s + h_ve + h_tb
                 B[zi] += (C_air / dt_s) * float(theta_prev[zi])
-                B[zi] += h_ve * T_out + h_tb * T_out
+                B[zi] += s_ve + h_tb * T_out
                 B[zi] += float(f_int_c) * phi_int + phi_sol_conv
 
             # surfaces
@@ -4508,6 +4650,7 @@ class ISO52016:
             theta_prev: np.ndarray,
             mode_vec,
             h_ve_z: np.ndarray,
+            s_ve_z: np.ndarray,
             phi_int_z: np.ndarray,
             phi_sol_z: np.ndarray,
             T_out: float,
@@ -4520,6 +4663,7 @@ class ISO52016:
                     continue
                 C = float(C_air_zone[zi])
                 h_ve = float(h_ve_z[zi])
+                s_ve = float(s_ve_z[zi])
                 h_tb = float(H_tb_zone[zi])
                 T_air = float(theta_new[zi])
                 T_prev = float(theta_prev[zi])
@@ -4533,7 +4677,7 @@ class ISO52016:
                     (C / dt_s + sum_h + h_ve + h_tb) * T_air
                     - sum_hTs
                     - (C / dt_s) * T_prev
-                    - h_ve * T_out
+                    - s_ve
                     - h_tb * T_out
                     - gains_conv
                 )
@@ -4571,13 +4715,16 @@ class ISO52016:
             T_out = float(sim_df["T2m"].iloc[t])
             phi_int_z_t = np.zeros(Z, dtype=float)
             h_ve_z_t = np.zeros(Z, dtype=float)
+            s_ve_z_t = np.zeros(Z, dtype=float)
             purge_factor_z_t = np.ones(Z, dtype=float)
             purge_active_z_t = np.zeros(Z, dtype=int)
             for zi, zone in enumerate(zones):
                 phi_int_z_t[zi] = _zone_internal_gain_w(zone, t)
-                h_ve_z_t[zi], purge_factor_z_t[zi], purge_active_z_t[zi] = _zone_ventilation_h_wk(
+                vent_bdy, purge_factor_z_t[zi], purge_active_z_t[zi] = _zone_ventilation_h_wk(
                     zone, Theta[zi], t, T_out
                 )
+                h_ve_z_t[zi] = vent_bdy.heat_transfer_coefficient_w_k
+                s_ve_z_t[zi] = vent_bdy.source_term_w
             phi_sol_z_t = _zone_solar_transmitted_w(t)
 
             # Base matrix for this timestep
@@ -4586,6 +4733,7 @@ class ISO52016:
                 t,
                 phi_int_z_t,
                 h_ve_z_t,
+                s_ve_z_t,
                 phi_sol_z_t,
             )
 
@@ -4636,6 +4784,7 @@ class ISO52016:
                 Theta,
                 mode,
                 h_ve_z_t,
+                s_ve_z_t,
                 phi_int_z_t,
                 phi_sol_z_t,
                 T_out,
@@ -4690,6 +4839,7 @@ class ISO52016:
                     Theta,
                     mode,
                     h_ve_z_t,
+                    s_ve_z_t,
                     phi_int_z_t,
                     phi_sol_z_t,
                     T_out,
@@ -4730,6 +4880,13 @@ class ISO52016:
                 zone_out["mode"][t] = mode[zi]
                 zone_out["Phi_int"][t] = float(phi_int_z_t[zi])
                 zone_out["H_ve"][t] = float(h_ve_z_t[zi])
+                zone_out["S_ve"][t] = float(s_ve_z_t[zi])
+                _h_ve_i = float(h_ve_z_t[zi])
+                _s_ve_i = float(s_ve_z_t[zi])
+                zone_out["T_ve_source_eq"][t] = (
+                    _s_ve_i / _h_ve_i if _h_ve_i > 0.0 else np.nan
+                )
+                zone_out["Q_ve"][t] = _h_ve_i * float(Theta_air_t[zi]) - _s_ve_i
                 zone_out["H_ground"][t] = float(zone_h_ground[zi]) if zi < len(zone_h_ground) else 0.0
                 zone_out["Q_ground"][t] = float(q_ground_zone_t.get(str(zone_out["name"]), 0.0))
                 zone_out["night_purge_factor"][t] = float(purge_factor_z_t[zi])
@@ -4770,6 +4927,9 @@ class ISO52016:
             out_data[f"mode_{name}"] = zone_out["mode"]
             out_data[f"Phi_int_{name}"] = zone_out["Phi_int"]
             out_data[f"H_ve_{name}"] = zone_out["H_ve"]
+            out_data[f"S_ve_{name}"] = zone_out["S_ve"]
+            out_data[f"T_ve_source_eq_{name}"] = zone_out["T_ve_source_eq"]
+            out_data[f"Q_ve_{name}"] = zone_out["Q_ve"]
             out_data[f"H_ground_{name}"] = zone_out["H_ground"]
             out_data[f"Q_ground_{name}"] = zone_out["Q_ground"]
             out_data[f"night_purge_factor_{name}"] = zone_out["night_purge_factor"]
@@ -4793,7 +4953,6 @@ class ISO52016:
         warmup_hours=744,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Multizone hourly/annual energy-need calculation.
         This extends the multizone coupled model with profile-driven setpoints,
@@ -4808,6 +4967,7 @@ class ISO52016:
                 One row per zone with heating/cooling annual needs in Wh
                 (plus explicit kWh columns) and specific values.
         """
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         hourly_results = cls.simulate_envelope_multizone_free_floating(
             building_object=building_object,
             path_weather_file=path_weather_file,
@@ -4891,6 +5051,22 @@ class ISO52016:
         bui["building"]["net_floor_area"] = zone_area
         bui["building"]["adj_zones_present"] = False
         bui["building"]["number_adj_zone"] = 0
+        # Zone-specific volume: set from zone dict if present, then remove any
+        # inherited global keys so the legacy lookup cannot silently use building-total
+        # airflow for per-zone constant_ach.
+        _hybrid_zone_vol = (
+            zone.get("zone_volume_m3")
+            or zone.get("zone_volume")
+            or zone.get("volume")
+        )
+        # Remove ALL inherited global volume keys before optionally setting
+        # the zone-specific one. zone_volume_m3 must be cleared too, otherwise
+        # a global "zone_volume_m3" in building_object["building"] survives the
+        # deepcopy and is preferred by the legacy lookup at building.zone_volume_m3.
+        for _vk in ("volume", "zone_volume", "zone_volume_m3"):
+            bui["building"].pop(_vk, None)
+        if _hybrid_zone_vol is not None:
+            bui["building"]["zone_volume_m3"] = float(_hybrid_zone_vol)
 
         zone_bt = _normalize_building_type(zone.get("building_type_class"))
         global_bt = _normalize_building_type(building_object.get("building", {}).get("building_type_class"))
@@ -4975,7 +5151,28 @@ class ISO52016:
         vent["infiltration_schedule_multiplier"] = float(
             zone.get("infiltration_schedule_multiplier", 1.0)
         )
-        bp.setdefault("internal_gains", copy.deepcopy(building_object.get("building_parameters", {}).get("internal_gains", [])))
+        # Pass through new components list when present in "ventilation" sub-key
+        _zone_vent_obj = zone.get("ventilation", {})
+        if isinstance(_zone_vent_obj, dict) and "components" in _zone_vent_obj:
+            vent["components"] = _zone_vent_obj["components"]
+
+        # Forward zone-level ventilation/heating/cooling profiles when present.
+        # The legacy profile generator reads these top-level building_parameters
+        # keys; occupancy/appliances/lighting go through internal_gains instead.
+        for _pkey in ("ventilation_profile", "heating_profile", "cooling_profile"):
+            _zone_prof = zone.get(_pkey)
+            if _zone_prof is not None:
+                bp[_pkey] = copy.deepcopy(_zone_prof)
+
+        # Forward zone-level internal_gains (occupancy/appliances/lighting
+        # schedules) when present.  Direct assignment is required because bp is
+        # already deep-copied from global building_parameters, so setdefault()
+        # would be a no-op when the global already has the key.
+        _zone_gains = zone.get("internal_gains")
+        _global_gains = building_object.get("building_parameters", {}).get("internal_gains", [])
+        bp["internal_gains"] = copy.deepcopy(
+            _zone_gains if _zone_gains is not None else _global_gains
+        )
 
         return bui
 
@@ -5007,6 +5204,7 @@ class ISO52016:
         sim_df.index = pd.DatetimeIndex(sim_df.index)
         sim_df = sim_df.loc[~sim_df.index.duplicated(keep="first")].copy()
         sim_df = sim_df.sort_index()
+        T2m_arr = _series_to_float_array(sim_df, "T2m")
 
         zones = building_object.get("zones", None)
         if not zones:
@@ -5792,7 +5990,6 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
@@ -5860,54 +6057,15 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
-        occupants_schedule_workdays = kwargs.get(
-            "occupants_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        occupants_schedule_weekend = kwargs.get(
-            "occupants_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_workdays = kwargs.get(
-            "appliances_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_weekend = kwargs.get(
-            "appliances_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_workdays = kwargs.get(
-            "lighting_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_weekend = kwargs.get(
-            "lighting_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
+        _sched = _make_sched_resolver(kwargs, iso16798_profiles)
+        occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
+        appliances_schedule_workdays = _sched("appliances_schedule_workdays", "appliances_schedule_workdays")
+        appliances_schedule_weekend = _sched("appliances_schedule_weekend", "appliances_schedule_weekend")
+        lighting_schedule_workdays = _sched("lighting_schedule_workdays", "lighting_schedule_workdays")
+        lighting_schedule_weekend = _sched("lighting_schedule_weekend", "lighting_schedule_weekend")
+
         h_ci_model = _resolve_internal_convection_model(
             building_object,
             kwargs.get("internal_convection_model", None),
@@ -5930,12 +6088,9 @@ class ISO52016:
             pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
+            path_weather_file_ = kwargs.get("path_weather_file", None)
             if kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
-            
-            elif kwargs["weather_source"] == "epw":
-                path_weather_file_ = (kwargs["path_weather_file"] if "path_weather_file" in kwargs else None)
-
             sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation
 
@@ -6261,11 +6416,9 @@ class ISO52016:
             pbar.update(1)
 
             # Temperature ground and thermal bridges
-            t_Th = ISO52016().Temp_calculation_of_ground(
-                building_object,
-                path_weather_file=path_weather_file_,
-                weather_source=kwargs["weather_source"],
-            )
+            _tth_kw = {"path_weather_file": path_weather_file_,
+                        "weather_source": kwargs["weather_source"]}
+            t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
             pbar.update(1)
@@ -6296,6 +6449,7 @@ class ISO52016:
         heating or cooling load, ΦHC;ld;ztc;t, is calculated using the following step-wise procedure: 
         """
         H_ve_nat_all = [0]
+        S_ve_nat_all = [0.0]
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -6325,7 +6479,7 @@ class ISO52016:
         except Exception:
             country_calendar = "IT"
         gen = HourlyProfileGenerator(country=country_calendar, num_months=13, category_profiles=category_profiles)
-        profile_df = gen.generate()      
+        profile_df = gen.generate()
 
         def _has_energy(arrlike):
             a = np.asarray(arrlike, dtype=float)
@@ -6544,6 +6698,8 @@ class ISO52016:
                     Phi_HC_nd_calc[colB_C] = power_cooling_max_act
 
                 iterate = True
+                _H_ve_nat_tstep = 0.0
+                _S_ve_nat_tstep = 0.0
                 while iterate:
 
                     iterate = False
@@ -6611,18 +6767,17 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
-                        type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
-                        custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
-                    # sanifica
-                    if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
-                        H_ve_nat_hour = 0.0
-
-                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
-                    if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
-                        H_ve_nat = 0.0
-                    H_ve_nat_all.append(H_ve_nat)
+                    _vent_bdy = _resolve_single_zone_vent_boundary(
+                        building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
+                    )
+                    H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
+                    S_ve_nat = _vent_bdy.source_term_w
+                    # Record for this timestep; do NOT append here — the while
+                    # loop may iterate again for HVAC re-solving and we must
+                    # emit exactly one entry per timestep to keep diagnostics
+                    # aligned.
+                    _H_ve_nat_tstep = H_ve_nat
+                    _S_ve_nat_tstep = S_ve_nat
                     
                     
                     
@@ -6699,8 +6854,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
-                        + H_ve_nat * T2m_arr[Tstepi]
+                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
+                        + S_ve_nat
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -7020,6 +7175,13 @@ class ISO52016:
                         Theta_op_act[Tstepi] = Theta_int_op[Tstepi, 0]
                         colB_act = 0
 
+                # Append ventilation diagnostics once per timestep (outside the
+                # while loop so HVAC re-solving iterations do not duplicate entries).
+                H_ve_nat_all.append(_H_ve_nat_tstep)
+                S_ve_nat_all.append(_S_ve_nat_tstep)
+                H_ve_nat = _H_ve_nat_tstep
+                S_ve_nat = _S_ve_nat_tstep
+
                 # =========================
                 # === SANKEY (per timestep)
                 # =========================
@@ -7045,10 +7207,10 @@ class ISO52016:
                     if   phi_hc > 0: E_heating_Wh +=  phi_hc * dt_h
                     elif phi_hc < 0: E_cooling_Wh += (-phi_hc) * dt_h
 
-                    # 4) Ventilation
+                    # 4) Ventilation: Q_ve = H_ve * T_in - S_ve (positive = heat leaving zone)
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = T2m_arr[Tstepi]
-                    q_vent = float(H_ve_nat) * (T_in - T_out)
+                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    q_vent = float(H_ve_nat) * T_in - float(S_ve_nat)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
 
@@ -7176,6 +7338,23 @@ class ISO52016:
             columns=["Q_HC", "T_op", "T_ext"],
         )
 
+        # Zone air and ventilation diagnostics
+        _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["T_air"] = _t_air_arr
+        hourly_results["H_ve"] = _h_ve_arr
+        hourly_results["S_ve"] = _s_ve_arr
+        _t_eq = np.full_like(_h_ve_arr, np.nan, dtype=float)
+        np.divide(
+            _s_ve_arr,
+            _h_ve_arr,
+            out=_t_eq,
+            where=_h_ve_arr > 0.0,
+        )
+        hourly_results["T_ve_source_eq"] = _t_eq
+        hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
+
         # separate H/C
         hourly_results["Q_H"] = 0.0
         hourly_results.loc[hourly_results["Q_HC"] > 0, "Q_H"] = hourly_results.loc[hourly_results["Q_HC"] > 0, "Q_HC"]
@@ -7222,7 +7401,6 @@ class ISO52016:
         sankey_graph=False,
         **kwargs,
     ):
-    from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
         """
         Calcualation fo energy needs according to the equation (37) of ISO 52016:2017. Page 60.
 
@@ -7290,54 +7468,15 @@ class ISO52016:
             * **h_pli_eli**: ... result of function ``Conduttance_node_of_element``
 
         """
-        occupants_schedule_workdays = kwargs.get(
-            "occupants_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        occupants_schedule_weekend = kwargs.get(
-            "occupants_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "occupants_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_workdays = kwargs.get(
-            "appliances_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        appliances_schedule_weekend = kwargs.get(
-            "appliances_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "appliances_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_workdays = kwargs.get(
-            "lighting_schedule_workdays",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_workdays",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
-        lighting_schedule_weekend = kwargs.get(
-            "lighting_schedule_weekend",
-            getattr(
-                iso16798_profiles,
-                "lighting_schedule_weekend",
-                {"Residential_apartment": [1.0] * 24},
-            ),
-        )
+        from .generate_profile import HourlyProfileGenerator, get_country_code_from_latlon  # lazy
+        _sched = _make_sched_resolver(kwargs, iso16798_profiles)
+        occupants_schedule_workdays = _sched("occupants_schedule_workdays", "occupants_schedule_workdays")
+        occupants_schedule_weekend = _sched("occupants_schedule_weekend", "occupants_schedule_weekend")
+        appliances_schedule_workdays = _sched("appliances_schedule_workdays", "appliances_schedule_workdays")
+        appliances_schedule_weekend = _sched("appliances_schedule_weekend", "appliances_schedule_weekend")
+        lighting_schedule_workdays = _sched("lighting_schedule_workdays", "lighting_schedule_workdays")
+        lighting_schedule_weekend = _sched("lighting_schedule_weekend", "lighting_schedule_weekend")
+
         external_heating_power_fn = kwargs.get("external_heating_power_fn", None)
         if external_heating_power_fn is not None and not callable(external_heating_power_fn):
             raise TypeError("external_heating_power_fn must be callable or None.")
@@ -7368,14 +7507,16 @@ class ISO52016:
             pbar.set_postfix({"Info": f"Initialization {i}"})
 
             # INIZIALIZATION
+            path_weather_file_ = kwargs.get("path_weather_file", None)
             if kwargs["weather_source"] == "pvgis":
                 path_weather_file_ = None
-            
+
             elif kwargs["weather_source"] == "epw":
                 path_weather_file_ = (kwargs["path_weather_file"] if "path_weather_file" in kwargs else None)
-            
+
             elif kwargs["weather_source"] == "climatedata":
                 path_weather_file_ = None
+
 
             sim_df = ISO52016().Weather_data_bui(building_object, path_weather_file_, weather_source=kwargs["weather_source"]).simulation_df
             Tstepn = len(sim_df)  # number of hours to perform the simulation
@@ -7703,11 +7844,9 @@ class ISO52016:
             pbar.update(1)
 
             # Temperature ground and thermal bridges
-            t_Th = ISO52016().Temp_calculation_of_ground(
-                building_object,
-                path_weather_file=path_weather_file_,
-                weather_source=kwargs["weather_source"],
-            )
+            _tth_kw = {"path_weather_file": path_weather_file_,
+                        "weather_source": kwargs["weather_source"]}
+            t_Th = ISO52016().Temp_calculation_of_ground(building_object, **_tth_kw)
             #
             pbar.set_postfix({"Info": f"Calculating ground temperature"})
             pbar.update(1)
@@ -7738,6 +7877,7 @@ class ISO52016:
         heating or cooling load, ΦHC;ld;ztc;t, is calculated using the following step-wise procedure: 
         """
         H_ve_nat_all = [0]
+        S_ve_nat_all = [0.0]
         # Time step for indoor temperature in adjacent zones
         if building_object['building']['adj_zones_present']:
             list_adj_zones = building_object['building']['number_adj_zone']
@@ -7767,7 +7907,7 @@ class ISO52016:
         except Exception:
             country_calendar = "IT"
         gen = HourlyProfileGenerator(country=country_calendar, num_months=13, category_profiles=category_profiles)
-        profile_df = gen.generate()      
+        profile_df = gen.generate()
 
         def _has_energy(arrlike):
             a = np.asarray(arrlike, dtype=float)
@@ -8034,6 +8174,8 @@ class ISO52016:
                     Phi_HC_nd_calc[colB_C] = power_cooling_max_act
 
                 iterate = True
+                _H_ve_nat_tstep = 0.0
+                _S_ve_nat_tstep = 0.0
                 while iterate:
 
                     iterate = False
@@ -8101,18 +8243,17 @@ class ISO52016:
                     the convective fraction of the heating/cooling system
                     '''
 
-                    H_ve_nat_hour = vig.heat_transfer_coefficient_by_ventilation(
-                        building_object, Theta_old[ri], T2m_arr[Tstepi], WS10m_arr[Tstepi],
-                        type_ventilation=building_object["building_parameters"]['ventilation']['ventilation_type'], flowrate_person=building_object["building_parameters"]['ventilation']['flow_rate_per_person'],
-                        custom_Hve_k_t=building_object["building_parameters"]['ventilation']['custom_heat_transfer_coefficient_ventilation'])
-                    # sanifica
-                    if not np.isfinite(H_ve_nat_hour) or H_ve_nat_hour < 0:
-                        H_ve_nat_hour = 0.0
-
-                    H_ve_nat = float(H_ve_nat_hour) * vent_prof_arr[Tstepi]
-                    if not np.isfinite(H_ve_nat) or H_ve_nat < 0:
-                        H_ve_nat = 0.0
-                    H_ve_nat_all.append(H_ve_nat)
+                    _vent_bdy = _resolve_single_zone_vent_boundary(
+                        building_object, float(Theta_old[ri]), Tstepi, sim_df, profile_df,
+                    )
+                    H_ve_nat = _vent_bdy.heat_transfer_coefficient_w_k
+                    S_ve_nat = _vent_bdy.source_term_w
+                    # Record for this timestep; do NOT append here — the while
+                    # loop may iterate again for HVAC re-solving and we must
+                    # emit exactly one entry per timestep to keep diagnostics
+                    # aligned.
+                    _H_ve_nat_tstep = H_ve_nat
+                    _S_ve_nat_tstep = S_ve_nat
                     
                     
                     
@@ -8189,8 +8330,8 @@ class ISO52016:
                         ext_int_gain = 0.0
                     
                     XTemp = (
-                        t_Th.thermal_bridge_heat * T2m_arr[Tstepi]
-                        + H_ve_nat * T2m_arr[Tstepi]
+                        t_Th.thermal_bridge_heat * sim_df.iloc[Tstepi]["T2m"]
+                        + S_ve_nat
                         + f_int_c * int_gains
                         + ext_int_gain
                         + f_sol_c * Phi_sol_dir_zt_t
@@ -8547,6 +8688,13 @@ class ISO52016:
                         Theta_op_act[Tstepi] = Theta_int_op[Tstepi, 0]
                         colB_act = 0
 
+                # Append ventilation diagnostics once per timestep (outside the
+                # while loop so HVAC re-solving iterations do not duplicate entries).
+                H_ve_nat_all.append(_H_ve_nat_tstep)
+                S_ve_nat_all.append(_S_ve_nat_tstep)
+                H_ve_nat = _H_ve_nat_tstep
+                S_ve_nat = _S_ve_nat_tstep
+
                 # =========================
                 # === SANKEY (per timestep)
                 # =========================
@@ -8572,10 +8720,10 @@ class ISO52016:
                     if   phi_hc > 0: E_heating_Wh +=  phi_hc * dt_h
                     elif phi_hc < 0: E_cooling_Wh += (-phi_hc) * dt_h
 
-                    # 4) Ventilation
+                    # 4) Ventilation: Q_ve = H_ve * T_in - S_ve (positive = heat leaving zone)
                     T_in  = float(Theta_int_air[Tstepi, 0])
-                    T_out = T2m_arr[Tstepi]
-                    q_vent = float(H_ve_nat) * (T_in - T_out)
+                    T_out = float(sim_df["T2m"].iloc[Tstepi])
+                    q_vent = float(H_ve_nat) * T_in - float(S_ve_nat)
                     if q_vent > 0:  E_vent_loss_Wh += q_vent * dt_h
                     else:           E_solar_Wh     += (-q_vent) * dt_h
 
@@ -8707,6 +8855,23 @@ class ISO52016:
         )
         hourly_results["T_air"] = Theta_int_air[act_slice, 0]
         hourly_results["T_rad"] = Theta_int_r_mn[act_slice, 0]
+
+        # Zone air and ventilation diagnostics
+        _h_ve_arr = np.array(H_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _s_ve_arr = np.array(S_ve_nat_all[1:Tstepn + 1], dtype=float)[act_slice]
+        _t_air_arr = Theta_int_air[act_slice, 0]
+        hourly_results["T_air"] = _t_air_arr
+        hourly_results["H_ve"] = _h_ve_arr
+        hourly_results["S_ve"] = _s_ve_arr
+        _t_eq = np.full_like(_h_ve_arr, np.nan, dtype=float)
+        np.divide(
+            _s_ve_arr,
+            _h_ve_arr,
+            out=_t_eq,
+            where=_h_ve_arr > 0.0,
+        )
+        hourly_results["T_ve_source_eq"] = _t_eq
+        hourly_results["Q_ve"] = _h_ve_arr * _t_air_arr - _s_ve_arr
 
         # separate H/C
         hourly_results["Q_H"] = 0.0
