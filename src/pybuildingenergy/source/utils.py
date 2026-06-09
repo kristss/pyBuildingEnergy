@@ -211,6 +211,7 @@ def _ahu_coll_to_columns(ahu_coll_act):
 
         cols[f"Q_ahu_coil{sfx}"]     = _arr("actual_heating_coil_power_w")
         cols[f"Q_ahu_coil_req{sfx}"] = _arr("required_heating_coil_power_w")
+        cols[f"Q_ahu_cool{sfx}"]     = _arr("actual_cooling_coil_power_w")
         cols[f"Q_ahu_cool_req{sfx}"] = _arr("required_cooling_coil_power_w")
         cols[f"Q_ahu_hr{sfx}"]       = _arr("heat_recovery_power_w")
         cols[f"P_ahu_fan{sfx}"]      = _arr("fan_electric_power_w")

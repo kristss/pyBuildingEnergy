@@ -273,9 +273,12 @@ class SensibleAHUConfig:
     """Configuration for the sensible EN 16798-5-1 AHU timestep model.
 
     Covers balanced scheduled CAV with sensible heat recovery,
-    EXHAUST_LIMIT frost protection, modulating-bypass economizer, and a
-    heating coil. Cooling coil support is not yet implemented;
-    ``cooling_coil_enabled`` must be False.
+    EXHAUST_LIMIT frost protection, modulating-bypass economizer, and
+    heating and cooling coils. Cooling is sensible only (no
+    dehumidification); set ``cooling_coil_enabled=True`` to deliver
+    mechanical cooling, optionally capped by ``cooling_coil_max_power_w``.
+    When the cooling coil is disabled, any cooling load is still reported
+    in ``required_cooling_coil_power_w`` as an unmet shortfall.
 
     Fan model:
       ``supply_fan_specific_power_w_per_m3_s`` and
@@ -302,6 +305,9 @@ class SensibleAHUConfig:
     extract_fan_specific_power_w_per_m3_s: float
     supply_fan_heat_fraction_to_air: float
     extract_fan_heat_fraction_to_air: float
+    # Cooling coil capacity [W]; None = unlimited. Ignored when
+    # cooling_coil_enabled is False. Mirrors heating_coil_max_power_w.
+    cooling_coil_max_power_w: float | None = None
     frost_exhaust_limit_c: float = -5.0
     fan_performance_model: FanPerformanceModel | str = FanPerformanceModel.EN16798_5_1
     supply_fan_design_pressure_pa: float | None = None
@@ -365,6 +371,15 @@ class SensibleAHUConfig:
                     "heating_coil_max_power_w must be finite and non-negative when provided"
                 )
 
+        if self.cooling_coil_max_power_w is not None:
+            if (
+                not math.isfinite(self.cooling_coil_max_power_w)
+                or self.cooling_coil_max_power_w < 0.0
+            ):
+                raise ValueError(
+                    "cooling_coil_max_power_w must be finite and non-negative when provided"
+                )
+
         for name, value in (
             ("supply_fan_specific_power_w_per_m3_s",
              self.supply_fan_specific_power_w_per_m3_s),
@@ -403,11 +418,6 @@ class SensibleAHUConfig:
 
         if not math.isfinite(self.frost_exhaust_limit_c):
             raise ValueError("frost_exhaust_limit_c must be finite")
-
-        if self.cooling_coil_enabled:
-            raise NotImplementedError(
-                "cooling_coil_enabled=True is not yet implemented; set to False"
-            )
 
 
 @dataclass(frozen=True)
@@ -497,13 +507,18 @@ class AHUStepOutputs:
                                     configurations because the effective HR outlet temperature
                                     is determined by a different algorithm.
                                     Positive in heating mode; negative in economizer mode.
-    required_heating_coil_power_w:  coil power needed to reach setpoint.
-    actual_heating_coil_power_w:    coil power actually delivered (≤ required).
-    required_cooling_coil_power_w:  cooling coil power that would be needed to reach the
-                                    setpoint but cannot be delivered (cooling_coil_enabled
-                                    is not yet implemented).  Non-zero when the requested
-                                    supply temperature is below the minimum achievable by
-                                    bypass alone.
+    required_heating_coil_power_w:  heating coil power needed to reach setpoint.
+    actual_heating_coil_power_w:    heating coil power actually delivered (≤ required).
+    required_cooling_coil_power_w:  sensible cooling coil power needed to pull the
+                                    post-HR/bypass supply air down to the setpoint.
+                                    Non-zero when the requested supply temperature is
+                                    below the minimum achievable by bypass alone.
+                                    Placed before the heating coil in the air path,
+                                    per EN 16798-5-1.
+    actual_cooling_coil_power_w:    cooling coil power actually delivered (≤ required).
+                                    Zero when cooling_coil_enabled is False — the
+                                    required value then reports the unmet shortfall.
+                                    Capacity-limited by cooling_coil_max_power_w.
     fan_electric_power_w:           total fan electrical power (separate from thermal).
     bypass_fraction:                effective fraction of the HR bypassed, derived from
                                     actual vs nominal recovery [0, 1].  Reflects efficiency
@@ -519,6 +534,7 @@ class AHUStepOutputs:
     required_heating_coil_power_w: float
     actual_heating_coil_power_w: float
     required_cooling_coil_power_w: float
+    actual_cooling_coil_power_w: float
     fan_electric_power_w: float
     heat_recovery_power_w: float
     bypass_fraction: float
@@ -616,10 +632,14 @@ def calculate_sensible_ahu_step(
         reach internal target; full bypass yields outdoor air, no bypass yields HR
         outlet.  Compute total bypass_fraction combining frost and modulation.
     7.  Compute heat recovery power (net thermal gain to supply vs outdoor).
-    8.  Compute required and actual heating-coil power; raise supply temperature.
+    8a. Compute required and actual cooling-coil power; lower supply temperature
+        toward the target.  When cooling is disabled the required value reports the
+        unmet shortfall and nothing is delivered.  Cooling precedes heating in the
+        air path, per EN 16798-5-1.
+    8b. Compute required and actual heating-coil power; raise supply temperature.
         Coil capacity applies while operating; required and delivered powers are
         then averaged over the timestep with operation_fraction.
-    9.  Add supply fan heat to supply after coil.
+    9.  Add supply fan heat to supply after the coils.
     10. Return AHUStepOutputs with all quantities separated.
 
     When operation_fraction, flow_fraction, or required supply flow is zero,
@@ -651,6 +671,7 @@ def calculate_sensible_ahu_step(
             required_heating_coil_power_w=0.0,
             actual_heating_coil_power_w=0.0,
             required_cooling_coil_power_w=0.0,
+            actual_cooling_coil_power_w=0.0,
             fan_electric_power_w=0.0,
             heat_recovery_power_w=0.0,
             bypass_fraction=0.0,
@@ -760,14 +781,35 @@ def calculate_sensible_ahu_step(
     # Step 7: Heat recovery power (net thermal gain to supply vs outdoor air)
     hr_power_operating_w = rho_cp_q * (t_after_hr - t_outdoor)
 
-    # Unmet cooling: power that would be needed to reach t_target but cannot be
-    # delivered because no cooling coil is present.  Positive when bypass has been
-    # driven to its limit and the supply is still above the setpoint.
+    # Step 8a: Cooling coil — placed before the heating coil to follow the
+    # EN 16798-5-1 air path (the spreadsheet's cooling/dehumidification block,
+    # formulas around D111-D158, precedes the heating block at D129-D154).  In
+    # this sensible single-setpoint model the two coils are mutually exclusive
+    # within a timestep, so ordering does not change the result, but it keeps the
+    # sequence faithful to the standard and ready for a future dehumidification-
+    # reheat extension.
+    #
+    # required_cooling is the sensible load needed to pull the post-HR/bypass air
+    # down to t_target.  When the coil is disabled it is reported as the unmet
+    # cooling shortfall (actual delivered = 0); when enabled it is met up to the
+    # optional capacity limit.  This mirrors the heating coil below.
     required_cooling_operating_w = rho_cp_q * max(0.0, t_after_hr - t_target)
+    if not config.cooling_coil_enabled:
+        actual_cooling_operating_w = 0.0
+    elif config.cooling_coil_max_power_w is None:
+        actual_cooling_operating_w = required_cooling_operating_w
+    else:
+        actual_cooling_operating_w = min(
+            required_cooling_operating_w,
+            config.cooling_coil_max_power_w,
+        )
 
-    # Step 8: Heating coil targeting t_target so delivered temperature equals
-    # requested_t_sup after supply fan heat is added in step 9.
-    required_heating_operating_w = rho_cp_q * max(0.0, t_target - t_after_hr)
+    t_after_cooling = t_after_hr - actual_cooling_operating_w / rho_cp_q
+
+    # Step 8b: Heating coil targeting t_target so delivered temperature equals
+    # requested_t_sup after supply fan heat is added in step 9.  It sees the
+    # post-cooling temperature; with a single setpoint at most one coil is active.
+    required_heating_operating_w = rho_cp_q * max(0.0, t_target - t_after_cooling)
     if config.heating_coil_max_power_w is None:
         actual_heating_operating_w = required_heating_operating_w
     else:
@@ -776,9 +818,9 @@ def calculate_sensible_ahu_step(
             config.heating_coil_max_power_w,
         )
 
-    t_after_coil = t_after_hr + actual_heating_operating_w / rho_cp_q
+    t_after_coil = t_after_cooling + actual_heating_operating_w / rho_cp_q
 
-    # Step 9: Supply fan heat (after HR and coil, before zone delivery)
+    # Step 9: Supply fan heat (after HR and coils, before zone delivery)
     t_actual_supply = t_after_coil + dt_sup_fan
 
     return AHUStepOutputs(
@@ -789,6 +831,7 @@ def calculate_sensible_ahu_step(
         required_heating_coil_power_w=required_heating_operating_w * op,
         actual_heating_coil_power_w=actual_heating_operating_w * op,
         required_cooling_coil_power_w=required_cooling_operating_w * op,
+        actual_cooling_coil_power_w=actual_cooling_operating_w * op,
         fan_electric_power_w=fan_electric_power_w,
         heat_recovery_power_w=hr_power_operating_w * op,
         bypass_fraction=bypass_fraction,
@@ -802,6 +845,28 @@ def calculate_sensible_ahu_step(
 
 def _opt_float(v) -> "float | None":
     return None if v is None else float(v)
+
+
+def _parse_bool(v, *, key: str) -> bool:
+    """Parse a config flag robustly.
+
+    Native bools pass through; recognised strings are mapped explicitly so a
+    JSON/CSV value of ``"false"`` does not become ``True`` via ``bool("false")``.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off", ""):
+            return False
+    raise ValueError(
+        f"{key!r} must be a boolean or a recognised string "
+        f"(true/false/yes/no/on/off/1/0); got {v!r}"
+    )
 
 
 def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
@@ -827,10 +892,11 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
       ``frost_exhaust_limit_c``             — -5.0 [°C]
       ``heating_coil_max_power_w``          — None (unlimited)
       ``cooling_coil_enabled``              — False
+      ``cooling_coil_max_power_w``          — None (unlimited; ignored when disabled)
       ``supply_fan_specific_power_w_per_m3_s`` — 0.0  (nominal SFP at design flow)
       ``extract_fan_specific_power_w_per_m3_s`` — 0.0  (nominal SFP at design flow)
-      ``supply_fan_heat_fraction_to_air``   — 1.0
-      ``extract_fan_heat_fraction_to_air``  — 1.0
+      ``supply_fan_heat_fraction_to_air``   — 0.90
+      ``extract_fan_heat_fraction_to_air``  — 0.90
       ``fan_performance_model``              — "en16798_5_1"
       ``supply_fan_design_pressure_pa``      — derived from nominal SFP and efficiency
       ``extract_fan_design_pressure_pa``     — derived from nominal SFP and efficiency
@@ -842,6 +908,10 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
     heating_coil_max = d.get("heating_coil_max_power_w")
     if heating_coil_max is not None:
         heating_coil_max = float(heating_coil_max)
+
+    cooling_coil_max = d.get("cooling_coil_max_power_w")
+    if cooling_coil_max is not None:
+        cooling_coil_max = float(cooling_coil_max)
 
     ctrl_mode_str = str(d.get("supply_temperature_mode", "fixed")).strip().lower()
     if ctrl_mode_str in ("fixed", ""):
@@ -894,7 +964,10 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
         frost_control=str(d.get("frost_control", "exhaust_limit")),
         frost_exhaust_limit_c=float(d.get("frost_exhaust_limit_c", -5.0)),
         heating_coil_max_power_w=heating_coil_max,
-        cooling_coil_enabled=bool(d.get("cooling_coil_enabled", False)),
+        cooling_coil_enabled=_parse_bool(
+            d.get("cooling_coil_enabled", False), key="cooling_coil_enabled"
+        ),
+        cooling_coil_max_power_w=cooling_coil_max,
         supply_fan_specific_power_w_per_m3_s=float(
             d.get("supply_fan_specific_power_w_per_m3_s", 0.0)
         ),
@@ -902,10 +975,10 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
             d.get("extract_fan_specific_power_w_per_m3_s", 0.0)
         ),
         supply_fan_heat_fraction_to_air=float(
-            d.get("supply_fan_heat_fraction_to_air", 1.0)
+            d.get("supply_fan_heat_fraction_to_air", 0.90)
         ),
         extract_fan_heat_fraction_to_air=float(
-            d.get("extract_fan_heat_fraction_to_air", 1.0)
+            d.get("extract_fan_heat_fraction_to_air", 0.90)
         ),
         fan_performance_model=str(
             d.get("fan_performance_model", "en16798_5_1")

@@ -323,9 +323,19 @@ def test_config_rejects_wrong_supply_temperature_control_type():
         _cfg(supply_temperature_control="fixed:18")
 
 
-def test_config_rejects_cooling_coil_enabled():
-    with pytest.raises(NotImplementedError, match="cooling_coil_enabled"):
-        _cfg(cooling_coil_enabled=True)
+def test_config_accepts_cooling_coil_enabled():
+    cfg = _cfg(cooling_coil_enabled=True)
+    assert cfg.cooling_coil_enabled is True
+
+
+def test_config_accepts_cooling_coil_max():
+    cfg = _cfg(cooling_coil_enabled=True, cooling_coil_max_power_w=2000.0)
+    assert cfg.cooling_coil_max_power_w == pytest.approx(2000.0)
+
+
+def test_config_rejects_negative_cooling_coil_max():
+    with pytest.raises(ValueError, match="cooling_coil_max_power_w"):
+        _cfg(cooling_coil_enabled=True, cooling_coil_max_power_w=-100.0)
 
 
 def test_config_accepts_exhaust_limit_frost_control():
@@ -676,7 +686,7 @@ def test_zero_coil_max_delivers_no_heat():
 
 
 # ---------------------------------------------------------------------------
-# Cooling disabled — unattainable cold setpoints
+# Cooling coil — delivery, capacity, and shortfall
 # ---------------------------------------------------------------------------
 
 def test_disabled_cooling_full_bypass_when_setpoint_below_outdoor():
@@ -698,12 +708,63 @@ def test_disabled_cooling_full_bypass_when_setpoint_below_outdoor():
     # Cooling shortfall: full bypass delivers T_outdoor=5°C; setpoint=2°C needs 3 K more
     expected_cooling = _rho_cp_q() * (5.0 - 2.0)
     assert out.required_cooling_coil_power_w == pytest.approx(expected_cooling, rel=1e-6)
+    # Disabled: required reports the shortfall but nothing is delivered.
+    assert out.actual_cooling_coil_power_w == pytest.approx(0.0, abs=1e-9)
+
+
+def test_enabled_cooling_reaches_setpoint_below_outdoor():
+    # Same boundary as the disabled case, but with the cooling coil active the
+    # residual 3 K (after full bypass to T_outdoor=5°C) is removed to reach 2°C.
+    ctrl = SupplyTemperatureControl(mode="fixed", setpoint_c=2.0)
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.75,
+        supply_temperature_control=ctrl,
+        cooling_coil_enabled=True,
+    )
+    out = calculate_sensible_ahu_step(
+        cfg, _inp(outdoor_temperature_c=5.0, extract_temperature_c=22.0)
+    )
+    expected_cooling = _rho_cp_q() * (5.0 - 2.0)
+    assert out.required_cooling_coil_power_w == pytest.approx(expected_cooling, rel=1e-6)
+    assert out.actual_cooling_coil_power_w == pytest.approx(expected_cooling, rel=1e-6)
+    assert out.actual_supply_temperature_c == pytest.approx(2.0, abs=1e-6)
+    assert out.required_heating_coil_power_w == pytest.approx(0.0, abs=1e-9)
+
+
+def test_cooling_capacity_limit_caps_delivered_power_and_supply():
+    # Cooling coil capped at 1 K worth of power: it removes 1 K of the 3 K
+    # required, so supply settles at 4°C and the required value still reports 3 K.
+    ctrl = SupplyTemperatureControl(mode="fixed", setpoint_c=2.0)
+    coil_max = _rho_cp_q() * 1.0
+    cfg = _cfg(
+        sensible_heat_recovery_efficiency=0.75,
+        supply_temperature_control=ctrl,
+        cooling_coil_enabled=True,
+        cooling_coil_max_power_w=coil_max,
+    )
+    out = calculate_sensible_ahu_step(
+        cfg, _inp(outdoor_temperature_c=5.0, extract_temperature_c=22.0)
+    )
+    assert out.actual_cooling_coil_power_w == pytest.approx(coil_max, rel=1e-9)
+    assert out.required_cooling_coil_power_w == pytest.approx(
+        _rho_cp_q() * 3.0, rel=1e-6
+    )
+    assert out.actual_supply_temperature_c == pytest.approx(4.0, abs=1e-6)
 
 
 def test_cooling_unmet_load_zero_in_normal_heating_mode():
     # Normal winter: HR undershoots setpoint → heating coil needed, no cooling shortfall
     out = calculate_sensible_ahu_step(_cfg(), _inp())
     assert out.required_cooling_coil_power_w == pytest.approx(0.0, abs=1e-9)
+
+
+def test_enabled_cooling_idle_in_heating_mode():
+    # Cooling coil enabled but boundary calls for heating: cooling stays at zero
+    # and the heating coil does the work — the two coils never co-activate.
+    out = calculate_sensible_ahu_step(_cfg(cooling_coil_enabled=True), _inp())
+    assert out.actual_cooling_coil_power_w == pytest.approx(0.0, abs=1e-9)
+    assert out.required_cooling_coil_power_w == pytest.approx(0.0, abs=1e-9)
+    assert out.actual_heating_coil_power_w > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1238,8 +1299,8 @@ def test_from_dict_defaults():
     assert cfg.cooling_coil_enabled is False
     assert cfg.supply_fan_specific_power_w_per_m3_s == pytest.approx(0.0)
     assert cfg.extract_fan_specific_power_w_per_m3_s == pytest.approx(0.0)
-    assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(1.0)
-    assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(1.0)
+    assert cfg.supply_fan_heat_fraction_to_air == pytest.approx(0.90)
+    assert cfg.extract_fan_heat_fraction_to_air == pytest.approx(0.90)
     assert cfg.fan_performance_model is FanPerformanceModel.EN16798_5_1
     assert cfg.supply_fan_nominal_efficiency == pytest.approx(0.72)
     assert cfg.extract_fan_nominal_efficiency == pytest.approx(0.78)

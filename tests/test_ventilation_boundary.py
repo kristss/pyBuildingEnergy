@@ -2045,6 +2045,7 @@ def _make_step_outputs(**overrides) -> AHUStepOutputs:
         required_heating_coil_power_w=500.0,
         actual_heating_coil_power_w=500.0,
         required_cooling_coil_power_w=0.0,
+        actual_cooling_coil_power_w=0.0,
         fan_electric_power_w=200.0,
         heat_recovery_power_w=3000.0,
         bypass_fraction=0.0,
@@ -2061,7 +2062,8 @@ class TestAhuCollToColumns:
         out = _make_step_outputs()
         cols = _ahu_coll_to_columns([{"ahu": out}])
         expected = {
-            "Q_ahu_coil_ahu", "Q_ahu_coil_req_ahu", "Q_ahu_cool_req_ahu",
+            "Q_ahu_coil_ahu", "Q_ahu_coil_req_ahu",
+            "Q_ahu_cool_ahu", "Q_ahu_cool_req_ahu",
             "Q_ahu_hr_ahu", "P_ahu_fan_ahu",
             "T_ahu_sup_ahu", "T_ahu_sup_req_ahu",
             "q_sup_m3h_ahu", "q_ext_m3h_ahu",
