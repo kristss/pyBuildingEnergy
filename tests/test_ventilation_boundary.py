@@ -56,44 +56,22 @@ class TestVentilationStream:
         )
         assert s.heat_transfer_coefficient_w_k == 0.0
 
-    def test_negative_conductance_rejected(self):
-        with pytest.raises(ValueError, match="H_k must be >= 0"):
+    @pytest.mark.parametrize(
+        ("name", "h_k", "t_src", "match"),
+        [
+            ("x", -1.0, 10.0, "H_k must be >= 0"),
+            ("x", float("nan"), 10.0, "H_k must be finite"),
+            ("x", float("inf"), 10.0, "H_k must be finite"),
+            ("x", 100.0, float("nan"), "source_temperature_c must be finite"),
+            ("", 100.0, 5.0, "name must be non-empty"),
+        ],
+    )
+    def test_stream_rejects_invalid(self, name, h_k, t_src, match):
+        with pytest.raises(ValueError, match=match):
             VentilationStream(
-                name="bad",
-                heat_transfer_coefficient_w_k=-1.0,
-                source_temperature_c=10.0,
-            )
-
-    def test_nan_conductance_rejected(self):
-        with pytest.raises(ValueError, match="H_k must be finite"):
-            VentilationStream(
-                name="nan",
-                heat_transfer_coefficient_w_k=float("nan"),
-                source_temperature_c=10.0,
-            )
-
-    def test_inf_conductance_rejected(self):
-        with pytest.raises(ValueError, match="H_k must be finite"):
-            VentilationStream(
-                name="inf",
-                heat_transfer_coefficient_w_k=float("inf"),
-                source_temperature_c=10.0,
-            )
-
-    def test_nan_source_temperature_rejected(self):
-        with pytest.raises(ValueError, match="source_temperature_c must be finite"):
-            VentilationStream(
-                name="nan_temp",
-                heat_transfer_coefficient_w_k=100.0,
-                source_temperature_c=float("nan"),
-            )
-
-    def test_empty_name_rejected(self):
-        with pytest.raises(ValueError, match="name must be non-empty"):
-            VentilationStream(
-                name="",
-                heat_transfer_coefficient_w_k=100.0,
-                source_temperature_c=5.0,
+                name=name,
+                heat_transfer_coefficient_w_k=h_k,
+                source_temperature_c=t_src,
             )
 
     def test_frozen_immutable(self):
@@ -1348,7 +1326,8 @@ def _run_legacy(building, n=48, t_out=-5.0, profile_df=None):
 
 
 class TestLegacyCausalSolverPaths:
-    """Verify affine boundary in legacy and causal solver paths (utils.py lines ~6515, ~8047)."""
+    """Verify the affine boundary end-to-end in the legacy and causal single-zone
+    solver cores (via utils.py::_resolve_single_zone_vent_boundary)."""
 
     def test_legacy_prescribed_h_ve_appears_in_output(self):
         """Legacy solver must emit H_ve matching the prescribed component H_k."""
@@ -1657,7 +1636,8 @@ def _run_causal(building, n=48, t_out=-5.0, profile_df=None):
 
 
 class TestCausalSolverPath:
-    """Verify affine boundary in the causal solver path (utils.py ~8047 and ~8072)."""
+    """Verify the affine boundary end-to-end in the causal solver core
+    (via utils.py::_resolve_single_zone_vent_boundary)."""
 
     def test_causal_prescribed_h_ve_in_output(self):
         """Causal solver must emit H_ve matching the prescribed component H_k."""
@@ -1706,9 +1686,9 @@ class TestCausalSolverPath:
     def test_causal_mixed_profile_end_to_end(self):
         """Causal solver end-to-end: AHU schedule toggles H_ve between two states.
 
-        Mirrors test_legacy_mixed_profile_end_to_end for the causal path
-        (_comp_mult_leg extraction at utils.py ~8088).  Would fail if the
-        schedule-extraction code were removed from the causal core.
+        Mirrors test_legacy_mixed_profile_end_to_end for the causal path.
+        Would fail if the _comp_mult_leg schedule extraction were removed
+        from the causal core.
         """
         rho, cp, ach, vol = 1.204, 1006.0, 0.015, 300.0
         h_inf = rho * cp * ach * vol / 3600.0
@@ -1810,8 +1790,8 @@ class TestMechanicalSupplyComponent:
         # equivalent_supply_temperature_c = S_ve / H_ve
         assert bdy.equivalent_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
 
-    def test_ahu_off_when_operation_fraction_zero(self):
-        """An AHU with operation_fraction=0 contributes zero H_ve and S_ve."""
+    def test_ahu_off_when_flow_fraction_zero(self):
+        """An AHU with flow_fraction=0.0 contributes zero H_ve and S_ve."""
         bdy = resolve_ventilation_boundary(
             _ahu_building([_ahu_component()]),
             zone_temperature_c=21.0,
@@ -2032,8 +2012,8 @@ class TestMechanicalSupplyComponent:
 # _ahu_coll_to_columns integration: column contract, types, and edge cases
 # ---------------------------------------------------------------------------
 
-from pybuildingenergy.source.ventilation_16798_5_1 import AHUStepOutputs
-from pybuildingenergy.source.utils import _ahu_coll_to_columns
+from pybuildingenergy.source.ventilation_16798_5_1 import AHUStepOutputs, calculate_sensible_ahu_step
+from pybuildingenergy.source.utils import _ahu_coll_to_columns, _AHU_DIAG_SPEC
 
 
 def _make_step_outputs(**overrides) -> AHUStepOutputs:
@@ -2130,3 +2110,179 @@ class TestAhuCollToColumns:
     def test_empty_collector_returns_empty_dict(self):
         assert _ahu_coll_to_columns([]) == {}
         assert _ahu_coll_to_columns([{}, {}]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Helpers for multizone-solver AHU tests
+# ---------------------------------------------------------------------------
+
+def _outdoor_wall_surface(zone_name, area=50.0):
+    """Minimal outdoor opaque wall that creates creates thermal mass so T_air and T_op diverge."""
+    return {
+        "name": f"south_wall_{zone_name}",
+        "type": "opaque",
+        "boundary": "OUTDOORS",
+        "area": area,
+        "zone": zone_name,
+        "sky_view_factor": 0.5,
+        "u_value": 0.3,
+        "thermal_capacity": 80000.0,
+        "solar_absorptance": 0.6,
+        "orientation": {"azimuth": 180, "tilt": 90},
+    }
+
+
+def _ahu_zone_building(components):
+    """One-zone building with component-list ventilation for the multizone solver."""
+    return {
+        "building": {
+            "net_floor_area": 100.0,
+            "building_type_class": "Residential_apartment",
+            "adj_zones_present": False,
+            "construction_class": "class_i",
+        },
+        "building_parameters": {"ventilation": {}, "temperature_setpoints": {}},
+        "building_surface": [_adiabatic_surface("zone1")],
+        "zones": [{
+            "name": "zone1",
+            "net_floor_area": 100.0,
+            "heating_setpoint": 21.0,
+            "heating_setback": 15.0,
+            "cooling_setpoint": 26.0,
+            "cooling_setback": 30.0,
+            "ventilation": {"components": components},
+        }],
+    }
+
+
+def _ahu_zone_building_with_mass(components):
+    """One-zone building with an outdoor wall, so T_air != T_op under HVAC control.
+
+    The wall surface nodes (Pln=5) are initialized to 20 °C and lag behind the air
+    node after heating begins, giving T_rad < T_air and therefore T_op < T_air.
+    """
+    return {
+        "building": {
+            "net_floor_area": 100.0,
+            "building_type_class": "Residential_apartment",
+            "adj_zones_present": False,
+            "construction_class": "class_i",
+        },
+        "building_parameters": {"ventilation": {}, "temperature_setpoints": {}},
+        "building_surface": [
+            _adiabatic_surface("zone1"),
+            _outdoor_wall_surface("zone1"),
+        ],
+        "zones": [{
+            "name": "zone1",
+            "net_floor_area": 100.0,
+            "heating_setpoint": 21.0,
+            "heating_setback": 15.0,
+            "cooling_setpoint": 26.0,
+            "cooling_setback": 30.0,
+            "ventilation": {"components": components},
+        }],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mechanical-supply flow-fraction pre-validation
+# ---------------------------------------------------------------------------
+
+class TestMechanicalSupplyFlowFractionValidation:
+    """component_fraction is validated before AHUStepInputs so the error names the component."""
+
+    @pytest.mark.parametrize("bad_fraction", [-0.1, 1.1, float("nan")])
+    def test_invalid_flow_fraction_raises_with_component_name(self, bad_fraction):
+        with pytest.raises(ValueError, match="ahu"):
+            resolve_ventilation_boundary(
+                _ahu_building([_ahu_component()]),
+                zone_temperature_c=21.0,
+                outdoor_temperature_c=-5.0,
+                wind_speed_m_s=0.0,
+                component_multipliers={"ahu": bad_fraction},
+            )
+
+
+# ---------------------------------------------------------------------------
+# Multizone solver — AHU diagnostic output contract
+# ---------------------------------------------------------------------------
+
+class TestMultizoneAhuDiagnostics:
+    """Multizone solver output must contain all 12 _AHU_DIAG_SPEC fields per component."""
+
+    def test_all_12_diagnostic_columns_present(self):
+        bld = _ahu_zone_building([_ahu_component()])
+        with _patched_weather(n=4):
+            out = ISO52016.simulate_envelope_multizone_free_floating(
+                building_object=bld,
+            )
+        # Verify each _AHU_DIAG_SPEC prefix appears as a column
+        for col_pfx, attr, dtype in _AHU_DIAG_SPEC:
+            col = f"{col_pfx}_ahu_zone1"
+            assert col in out.columns, (
+                f"Expected multizone diagnostic column {col!r} missing from output. "
+                f"Present AHU columns: {[c for c in out.columns if 'ahu' in c.lower()]}"
+            )
+
+    def test_diagnostic_values_are_finite_for_operating_ahu(self):
+        bld = _ahu_zone_building([_ahu_component()])
+        with _patched_weather(n=4, t_out=-5.0):
+            out = ISO52016.simulate_envelope_multizone_free_floating(
+                building_object=bld,
+            )
+        # Numeric fields (excluding frost int and optional requested_supply_temperature_c)
+        float_cols = [
+            f"{col_pfx}_ahu_zone1"
+            for col_pfx, _, dtype in _AHU_DIAG_SPEC
+            if dtype == float and col_pfx != "T_ahu_sup_req"
+        ]
+        for col in float_cols:
+            assert np.all(np.isfinite(out[col].to_numpy())), (
+                f"Column {col!r} has non-finite values: {out[col].to_numpy()}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Multizone solver — extract-temperature coupling regression
+# ---------------------------------------------------------------------------
+
+class TestMultizoneAhuCouplingLag:
+    """AHU receives the previous-timestep zone AIR temperature as extract temperature."""
+
+    def test_extract_temperature_equals_previous_air_not_operative(self):
+        """Verify T_extract = T_air[t-1], not T_op[t-1], with T_air != T_op.
+
+        _ahu_zone_building_with_mass provides an outdoor wall whose surface nodes
+        (Pln=5, initialized to 20 °C) lag behind the air node after HVAC heats the
+        zone.  This gives T_rad < T_air and therefore T_op != T_air by > 0.5 K,
+        making the air-vs-operative distinction detectable.
+        """
+        bld = _ahu_zone_building_with_mass([_ahu_component()])
+        captured = []
+
+        def _capture(cfg, inp):
+            captured.append(inp)
+            return calculate_sensible_ahu_step(cfg, inp)
+
+        with patch(
+            "pybuildingenergy.source.ventilation_16798_5_1.calculate_sensible_ahu_step",
+            side_effect=_capture,
+        ):
+            with _patched_weather(n=4):
+                out = ISO52016.simulate_envelope_multizone_free_floating(
+                    building_object=bld,
+                )
+
+        assert len(captured) >= 2, "Expected at least 2 AHU calls (one per timestep)"
+        t_air_step0 = float(out["T_air_zone1"].iloc[0])
+        t_op_step0 = float(out["T_op_zone1"].iloc[0])
+
+        # Fixture must produce a meaningful T_air / T_op difference
+        assert abs(t_air_step0 - t_op_step0) > 0.5, (
+            f"Fixture did not produce T_air != T_op: T_air={t_air_step0:.3f}, "
+            f"T_op={t_op_step0:.3f}"
+        )
+        # Extract temperature must equal previous AIR temperature, not operative
+        assert captured[1].extract_temperature_c == pytest.approx(t_air_step0, abs=1e-6)
+        assert abs(captured[1].extract_temperature_c - t_op_step0) > 0.5

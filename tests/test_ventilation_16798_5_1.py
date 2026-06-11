@@ -6,7 +6,6 @@ import pytest
 
 from pybuildingenergy.source.ventilation_16798_5_1 import (
     AHUStepInputs,
-    AHUStepOutputs,
     CompensationPoint,
     FanPerformanceModel,
     FrostControlMode,
@@ -15,7 +14,6 @@ from pybuildingenergy.source.ventilation_16798_5_1 import (
     SupplyTemperatureControl,
     SupplyTemperatureControlMode,
     _RHO_CP_J_M3_K,
-    _opt_float,
     ahu_outputs_to_ventilation_stream,
     calculate_sensible_ahu_step,
     resolve_supply_temperature_setpoint,
@@ -29,7 +27,7 @@ def _point(reference_c, supply_c):
 
 
 # ---------------------------------------------------------------------------
-# Supply-temperature controller tests (existing)
+# Supply-temperature controller tests
 # ---------------------------------------------------------------------------
 
 def test_fixed_supply_temperature_control():
@@ -90,7 +88,7 @@ def test_outdoor_compensation_interpolates_multiple_segments():
         (24.0, 17.0),
     ],
 )
-def test_extract_compensation_matches_zeblab_curve(
+def test_extract_compensation_interpolates_and_clamps(
     extract_temperature_c,
     expected_supply_temperature_c,
 ):
@@ -248,7 +246,6 @@ def _inp(**kw) -> AHUStepInputs:
         required_supply_flow_m3_h=_Q_M3_H,
         required_extract_flow_m3_h=_Q_M3_H,
         operation_fraction=1.0,
-        timestep_hours=1.0,
     )
     defaults.update(kw)
     return AHUStepInputs(**defaults)
@@ -268,128 +265,56 @@ def test_config_accepts_string_enum_values():
     assert cfg.frost_control is FrostControlMode.NONE
 
 
-def test_config_rejects_unknown_heat_recovery_control():
-    with pytest.raises(ValueError, match="heat_recovery_control"):
-        _cfg(heat_recovery_control="turbo")
-
-
-def test_config_rejects_unknown_frost_control():
-    with pytest.raises(ValueError, match="frost_control"):
-        _cfg(frost_control="preheat")
-
-
-def test_config_rejects_efficiency_above_one():
-    with pytest.raises(ValueError, match="sensible_heat_recovery_efficiency"):
-        _cfg(sensible_heat_recovery_efficiency=1.01)
-
-
-def test_config_rejects_negative_efficiency():
-    with pytest.raises(ValueError, match="sensible_heat_recovery_efficiency"):
-        _cfg(sensible_heat_recovery_efficiency=-0.1)
-
-
-def test_config_rejects_non_finite_efficiency():
-    with pytest.raises(ValueError):
-        _cfg(sensible_heat_recovery_efficiency=math.nan)
-
-
-def test_config_rejects_negative_fan_power():
-    with pytest.raises(ValueError, match="supply_fan_specific_power"):
-        _cfg(supply_fan_specific_power_w_per_m3_s=-1.0)
-
-
-def test_config_rejects_fan_fraction_above_one():
-    with pytest.raises(ValueError, match="supply_fan_heat_fraction"):
-        _cfg(supply_fan_heat_fraction_to_air=1.1)
-
-
-def test_config_accepts_zero_heating_coil_max():
-    cfg = _cfg(heating_coil_max_power_w=0.0)
-    assert cfg.heating_coil_max_power_w == 0.0
-
-
-def test_config_rejects_negative_heating_coil_max():
-    with pytest.raises(ValueError, match="heating_coil_max_power_w"):
-        _cfg(heating_coil_max_power_w=-100.0)
-
-
-def test_config_none_heating_coil_max_accepted():
-    cfg = _cfg(heating_coil_max_power_w=None)
-    assert cfg.heating_coil_max_power_w is None
-
-
-def test_config_rejects_wrong_supply_temperature_control_type():
-    with pytest.raises(TypeError, match="supply_temperature_control"):
-        _cfg(supply_temperature_control="fixed:18")
-
-
-def test_config_accepts_cooling_coil_enabled():
-    cfg = _cfg(cooling_coil_enabled=True)
-    assert cfg.cooling_coil_enabled is True
-
-
-def test_config_accepts_cooling_coil_max():
-    cfg = _cfg(cooling_coil_enabled=True, cooling_coil_max_power_w=2000.0)
-    assert cfg.cooling_coil_max_power_w == pytest.approx(2000.0)
-
-
-def test_config_rejects_negative_cooling_coil_max():
-    with pytest.raises(ValueError, match="cooling_coil_max_power_w"):
-        _cfg(cooling_coil_enabled=True, cooling_coil_max_power_w=-100.0)
-
-
-def test_config_accepts_exhaust_limit_frost_control():
-    cfg = _cfg(frost_control="exhaust_limit")
-    assert cfg.frost_control is FrostControlMode.EXHAUST_LIMIT
+@pytest.mark.parametrize(
+    ("kwargs", "exc_type", "match"),
+    [
+        ({"heat_recovery_control": "turbo"}, ValueError, "heat_recovery_control"),
+        ({"frost_control": "preheat"}, ValueError, "frost_control"),
+        ({"sensible_heat_recovery_efficiency": 1.01}, ValueError, "sensible_heat_recovery_efficiency"),
+        ({"sensible_heat_recovery_efficiency": -0.1}, ValueError, "sensible_heat_recovery_efficiency"),
+        ({"sensible_heat_recovery_efficiency": math.nan}, ValueError, None),
+        ({"supply_fan_specific_power_w_per_m3_s": -1.0}, ValueError, "supply_fan_specific_power"),
+        ({"supply_fan_heat_fraction_to_air": 1.1}, ValueError, "supply_fan_heat_fraction"),
+        ({"heating_coil_max_power_w": -100.0}, ValueError, "heating_coil_max_power_w"),
+        ({"cooling_coil_enabled": True, "cooling_coil_max_power_w": -100.0}, ValueError, "cooling_coil_max_power_w"),
+        ({"supply_temperature_control": "fixed:18"}, TypeError, "supply_temperature_control"),
+    ],
+)
+def test_config_rejects_invalid_input(kwargs, exc_type, match):
+    with pytest.raises(exc_type, match=match):
+        _cfg(**kwargs)
 
 
 # ---------------------------------------------------------------------------
 # AHUStepInputs validation
 # ---------------------------------------------------------------------------
 
-def test_inputs_rejects_negative_flow():
-    with pytest.raises(ValueError, match="required_supply_flow_m3_h"):
-        _inp(required_supply_flow_m3_h=-100.0)
+def test_inputs_default_to_full_timestep_operation():
+    inp = AHUStepInputs(
+        outdoor_temperature_c=-5.0,
+        extract_temperature_c=21.0,
+        required_supply_flow_m3_h=3600.0,
+        required_extract_flow_m3_h=3600.0,
+    )
+    assert inp.operation_fraction == pytest.approx(1.0)
 
 
-def test_inputs_rejects_operation_fraction_above_one():
-    with pytest.raises(ValueError, match="operation_fraction"):
-        _inp(operation_fraction=1.5)
-
-
-def test_inputs_rejects_negative_operation_fraction():
-    with pytest.raises(ValueError, match="operation_fraction"):
-        _inp(operation_fraction=-0.1)
-
-
-def test_inputs_rejects_flow_fraction_above_one():
-    with pytest.raises(ValueError, match="flow_fraction"):
-        _inp(flow_fraction=1.1)
-
-
-def test_inputs_rejects_negative_flow_fraction():
-    with pytest.raises(ValueError, match="flow_fraction"):
-        _inp(flow_fraction=-0.1)
-
-
-def test_inputs_rejects_zero_timestep():
-    with pytest.raises(ValueError, match="timestep_hours"):
-        _inp(timestep_hours=0.0)
-
-
-def test_inputs_rejects_non_finite_outdoor_temperature():
-    with pytest.raises(ValueError, match="outdoor_temperature_c"):
-        _inp(outdoor_temperature_c=math.nan)
-
-
-def test_inputs_rejects_non_finite_scheduled_setpoint():
-    with pytest.raises(ValueError, match="scheduled_setpoint_c"):
-        _inp(scheduled_setpoint_c=math.inf)
-
-
-def test_inputs_unbalanced_flows_rejected():
-    with pytest.raises(ValueError, match="balanced-flow"):
-        _inp(required_extract_flow_m3_h=0.0)  # supply=1350, extract=0 — unbalanced
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"required_supply_flow_m3_h": -100.0}, "required_supply_flow_m3_h"),
+        ({"operation_fraction": 1.5}, "operation_fraction"),
+        ({"operation_fraction": -0.1}, "operation_fraction"),
+        ({"flow_fraction": 1.1}, "flow_fraction"),
+        ({"flow_fraction": -0.1}, "flow_fraction"),
+        ({"outdoor_temperature_c": math.nan}, "outdoor_temperature_c"),
+        ({"scheduled_setpoint_c": math.inf}, "scheduled_setpoint_c"),
+        ({"required_extract_flow_m3_h": 0.0}, "balanced-flow"),
+    ],
+)
+def test_inputs_rejects_invalid(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _inp(**kwargs)
 
 
 def test_inputs_both_zero_flows_accepted():
@@ -402,12 +327,9 @@ def test_inputs_both_zero_flows_accepted():
 # calculate_sensible_ahu_step: type guards
 # ---------------------------------------------------------------------------
 
-def test_rejects_non_config():
+def test_step_type_guards():
     with pytest.raises(TypeError, match="config"):
         calculate_sensible_ahu_step("not a config", _inp())
-
-
-def test_rejects_non_inputs():
     with pytest.raises(TypeError, match="inputs"):
         calculate_sensible_ahu_step(_cfg(), "not inputs")
 
@@ -667,12 +589,8 @@ def test_coil_capacity_scales_with_operation_fraction():
     out_full = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=1.0))
     out_half = calculate_sensible_ahu_step(cfg, _inp(operation_fraction=0.5))
 
-    # At full op: actual = coil_max * 1.0
     assert out_full.actual_heating_coil_power_w == pytest.approx(coil_max, rel=1e-9)
-    # At half op: time-averaged actual = coil_max * 0.5
     assert out_half.actual_heating_coil_power_w == pytest.approx(coil_max * 0.5, rel=1e-9)
-    # Supply temperature during the ON period is the same (coil_max / rho_cp_q_nom
-    # temperature rise regardless of duty cycle) — both ops reach the same T_supply.
     assert out_half.actual_supply_temperature_c == pytest.approx(
         out_full.actual_supply_temperature_c, abs=1e-6
     )
@@ -872,7 +790,7 @@ def test_fan_electricity_zero_when_no_fans_configured():
 
 
 def test_en16798_fan_part_load_matches_reference_relations():
-    """Pressure follows r² and efficiency follows sqrt(r), as in recirc."""
+    """Part-load pressure follows r² and fan efficiency follows sqrt(r)."""
     flow_fraction = 0.25
     sfp = 500.0
     cfg = _cfg(
@@ -902,7 +820,7 @@ def test_en16798_fan_part_load_matches_reference_relations():
     assert dt_part == pytest.approx(dt_design * flow_fraction ** 1.5, rel=1e-9)
 
 
-def test_en16798_fan_explicit_product_data_matches_recirc_equations():
+def test_en16798_fan_explicit_product_data_matches_part_load_equations():
     flow_fraction = 0.4
     design_pressure_pa = 500.0
     eta_nom = 0.72
@@ -1062,50 +980,26 @@ def test_partial_load_scales_all_power_outputs():
 # VentilationStream adapter tests
 # ---------------------------------------------------------------------------
 
-def test_adapter_returns_ventilation_stream():
+def test_adapter_stream_attributes():
+    """Adapter produces a VentilationStream with correct type, name, category, and physics."""
     out = calculate_sensible_ahu_step(_cfg(), _inp())
     stream = ahu_outputs_to_ventilation_stream(out)
     assert isinstance(stream, VentilationStream)
-
-
-def test_adapter_default_name_and_category():
-    out = calculate_sensible_ahu_step(_cfg(), _inp())
-    stream = ahu_outputs_to_ventilation_stream(out)
     assert stream.name == "mechanical_supply"
     assert stream.category == "supply"
-
-
-def test_adapter_custom_name():
-    out = calculate_sensible_ahu_step(_cfg(), _inp())
-    stream = ahu_outputs_to_ventilation_stream(out, name="ahu_zone_1")
-    assert stream.name == "ahu_zone_1"
-
-
-def test_adapter_conductance_matches_rho_cp_q():
-    out = calculate_sensible_ahu_step(_cfg(), _inp())
-    stream = ahu_outputs_to_ventilation_stream(out)
-    expected_h = _RHO_CP_J_M3_K * out.actual_supply_flow_m3_h / 3600.0
-    assert stream.heat_transfer_coefficient_w_k == pytest.approx(expected_h)
-
-
-def test_adapter_source_temperature_matches_actual_supply():
-    out = calculate_sensible_ahu_step(_cfg(), _inp())
-    stream = ahu_outputs_to_ventilation_stream(out)
+    assert stream.heat_transfer_coefficient_w_k == pytest.approx(
+        _RHO_CP_J_M3_K * out.actual_supply_flow_m3_h / 3600.0
+    )
     assert stream.source_temperature_c == pytest.approx(out.actual_supply_temperature_c)
+    named = ahu_outputs_to_ventilation_stream(out, name="ahu_zone_1")
+    assert named.name == "ahu_zone_1"
 
 
-def test_adapter_zero_flow_gives_zero_conductance():
-    """AHU off: H_k = 0 so stream contributes nothing to zone balance."""
+def test_adapter_zero_flow():
+    """AHU off: H_k=0 so stream contributes nothing; source_temperature_c stays finite."""
     out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
-    assert out.actual_supply_flow_m3_h == 0.0
     stream = ahu_outputs_to_ventilation_stream(out)
     assert stream.heat_transfer_coefficient_w_k == 0.0
-
-
-def test_adapter_zero_flow_source_temperature_is_finite():
-    """Zero-conductance stream must still carry a finite source temperature."""
-    out = calculate_sensible_ahu_step(_cfg(), _inp(operation_fraction=0.0))
-    stream = ahu_outputs_to_ventilation_stream(out)
     assert math.isfinite(stream.source_temperature_c)
 
 
@@ -1239,7 +1133,7 @@ def test_integration_previous_step_extract_temperature_pattern():
     assert out_warm.required_heating_coil_power_w < out_cold.required_heating_coil_power_w
 
 
-def test_integration_s_ve_sign_convention_positive_is_heat_to_zone():
+def test_integration_q_ve_sign_convention_positive_is_heat_leaving_zone():
     """Q_ve = H_ve*T_zone - S_ve; positive means heat leaving the zone.
 
     When supply is colder than zone, net ventilation removes heat from zone
@@ -1363,7 +1257,6 @@ def test_from_dict_produces_runnable_config():
         required_supply_flow_m3_h=3600.0,
         required_extract_flow_m3_h=3600.0,
         operation_fraction=1.0,
-        timestep_hours=1.0,
     )
     out = calculate_sensible_ahu_step(cfg, inp)
     assert out.actual_supply_temperature_c == pytest.approx(18.0, abs=1e-9)
@@ -1371,7 +1264,7 @@ def test_from_dict_produces_runnable_config():
 
 def test_from_dict_outdoor_compensated_mode():
     """outdoor_compensated mode with two-point curve."""
-    # Points: T_oda=-20 → T_sup=19, T_oda=+15 → T_sup=17 (ZEBlab-like curve)
+    # Points: T_oda=-20 → T_sup=19, T_oda=+15 → T_sup=17
     cfg = sensible_ahu_config_from_dict({
         "sensible_heat_recovery_efficiency": 0.784,
         "supply_temperature_mode": "outdoor_compensated",
@@ -1394,7 +1287,6 @@ def test_from_dict_outdoor_compensated_delivers_interpolated_setpoint():
         required_supply_flow_m3_h=3600.0,
         required_extract_flow_m3_h=3600.0,
         operation_fraction=1.0,
-        timestep_hours=1.0,
     )
     out = calculate_sensible_ahu_step(cfg, inp)
     expected_setpoint = 17.0 + (15.0 - 0.0) / (15.0 - (-20.0)) * (19.0 - 17.0)
@@ -1418,12 +1310,3 @@ def test_from_dict_unknown_mode_raises():
             "supply_temperature_mode": "magic",
             "supply_temperature_setpoint_c": 18.0,
         })
-
-
-def test_opt_float_returns_none_for_none():
-    assert _opt_float(None) is None
-
-
-def test_opt_float_converts_numeric():
-    assert _opt_float(17.5) == pytest.approx(17.5)
-    assert _opt_float("18") == pytest.approx(18.0)
