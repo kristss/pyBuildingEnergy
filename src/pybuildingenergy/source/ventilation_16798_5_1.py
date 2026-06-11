@@ -256,12 +256,11 @@ class FrostControlMode(str, Enum):
 class FanPerformanceModel(str, Enum):
     """Fan power and temperature-rise calculation method.
 
-    EN16798_5_1 applies the single-zone no-control fan relations used by the
-    EN 16798-5-1 reference implementation: pressure varies with the square of
-    the flow ratio and fan efficiency follows the product-data square-root
-    correction.
+    EN16798_5_1 applies the EN 16798-5-1 single-zone no-control fan
+    relations: pressure varies with the square of the flow ratio and fan
+    efficiency follows the product-data square-root correction.
 
-    CONSTANT_SFP retains the legacy relation P = q * SFP at every flow.
+    CONSTANT_SFP applies the constant-SFP relation P = q * SFP at every flow.
     """
 
     EN16798_5_1 = "en16798_5_1"
@@ -272,7 +271,7 @@ class FanPerformanceModel(str, Enum):
 class SensibleAHUConfig:
     """Configuration for the sensible EN 16798-5-1 AHU timestep model.
 
-    Covers balanced scheduled CAV with sensible heat recovery,
+    Covers balanced single-zone airflow with sensible heat recovery,
     EXHAUST_LIMIT frost protection, modulating-bypass economizer, and
     heating and cooling coils. Cooling is sensible only (no
     dehumidification); set ``cooling_coil_enabled=True`` to deliver
@@ -292,7 +291,7 @@ class SensibleAHUConfig:
       ``delta_p = delta_p_design * (q / q_design)**2``
       ``eta = eta_ref * sqrt(q / q_ref)``
 
-      ``constant_sfp`` retains the legacy ``P = q * SFP`` relation.
+      ``constant_sfp`` applies ``P = q * SFP`` at every flow.
     """
 
     sensible_heat_recovery_efficiency: float
@@ -427,15 +426,17 @@ class AHUStepInputs:
     ``operation_fraction`` is the fraction of the timestep for which the AHU
     operates. ``flow_fraction`` is the continuous operating-flow ratio relative
     to the required/design flow. Keeping these separate distinguishes ON/OFF
-    duty averaging from true fan-speed reduction.
+    duty averaging from true fan-speed reduction. The ISO 52016 component
+    adapter maps schedules only to ``flow_fraction`` and fixes
+    ``operation_fraction`` at 1.0. Direct users of this standalone API may
+    supply a duty fraction explicitly.
     """
 
     outdoor_temperature_c: float
     extract_temperature_c: float
     required_supply_flow_m3_h: float
     required_extract_flow_m3_h: float
-    operation_fraction: float
-    timestep_hours: float
+    operation_fraction: float = 1.0
     scheduled_setpoint_c: float | None = None
     flow_fraction: float = 1.0
 
@@ -477,9 +478,6 @@ class AHUStepInputs:
         ):
             raise ValueError("flow_fraction must be finite and in [0, 1]")
 
-        if not math.isfinite(self.timestep_hours) or self.timestep_hours <= 0.0:
-            raise ValueError("timestep_hours must be positive and finite")
-
         if (
             self.scheduled_setpoint_c is not None
             and not math.isfinite(self.scheduled_setpoint_c)
@@ -491,8 +489,8 @@ class AHUStepInputs:
 class AHUStepOutputs:
     """Computed outputs for one AHU timestep.
 
-    Power quantities are in watts, averaged over the timestep. Energy for a
-    timestep is power_w * timestep_hours / 1000 kWh.
+    Power quantities are in watts, averaged over the timestep. The caller is
+    responsible for converting power to energy using its timestep duration.
 
     requested_supply_temperature_c: setpoint from the supply-temperature controller,
                                     or None when the AHU is off (flow = 0).
@@ -556,8 +554,10 @@ def _fan_power_and_temperature_rise(
 ) -> tuple[float, float]:
     """Return timestep-average fan electric power [W] and operating delta-T [K].
 
-    The EN 16798-5-1 mode follows the same pressure and fan-efficiency
-    relations as the recirc reference implementation. The temperature rise is
+    The EN 16798-5-1 mode derives the design pressure from nominal specific
+    fan power and efficiency unless given explicitly, then applies
+    ``delta_p = delta_p_design * (q / q_design)**2`` and
+    ``eta = eta_ref * sqrt(q / q_ref)`` at part load. The temperature rise is
     evaluated while the fan is operating; electric power is averaged over the
     timestep using ``operation_fraction``.
     """
@@ -615,44 +615,25 @@ def calculate_sensible_ahu_step(
 ) -> AHUStepOutputs:
     """Calculate one timestep of the sensible EN 16798-5-1 AHU model.
 
-    Calculation sequence
-    --------------------
-    1.  Scale operating flows by flow_fraction and timestep-average quantities
-        by operation_fraction. Return a zero-flow result immediately if the AHU
-        is off.
-    2.  Resolve requested supply-temperature setpoint from config controller.
-    3.  Compute fan electricity; add extract fan heat to extract before HR,
-        accumulate supply fan heat for addition after HR and coil.
-    4.  Apply EXHAUST_LIMIT frost protection: reduce effective HR efficiency
-        so the exhaust leaving the HR stays at or above frost_exhaust_limit_c.
-    5.  Compute HR outlet temperature from outdoor and frost-limited efficiency.
-    6.  Compute fan-adjusted internal coil target: subtract downstream supply fan
-        heat from requested setpoint so that delivered temperature equals requested
-        after the fan addition.  Apply modulating bypass (clamped to [0, 1]) to
-        reach internal target; full bypass yields outdoor air, no bypass yields HR
-        outlet.  Compute total bypass_fraction combining frost and modulation.
-    7.  Compute heat recovery power (net thermal gain to supply vs outdoor).
-    8a. Compute required and actual cooling-coil power; lower supply temperature
-        toward the target.  When cooling is disabled the required value reports the
-        unmet shortfall and nothing is delivered.  Cooling precedes heating in the
-        air path, per EN 16798-5-1.
-    8b. Compute required and actual heating-coil power; raise supply temperature.
-        Coil capacity applies while operating; required and delivered powers are
-        then averaged over the timestep with operation_fraction.
-    9.  Add supply fan heat to supply after the coils.
-    10. Return AHUStepOutputs with all quantities separated.
+    Air-path order: extract fan heat -> heat recovery (frost-limited
+    efficiency, modulating bypass) -> cooling coil -> heating coil ->
+    supply fan heat.  The coil target is pre-compensated for downstream
+    supply-fan heat so the delivered temperature meets the requested
+    setpoint when capacity allows.
 
-    When operation_fraction, flow_fraction, or required supply flow is zero,
-    all flow and energy outputs are zero and actual supply temperature equals
-    outdoor.
+    Power outputs are timestep averages (scaled by operation_fraction);
+    temperature outputs describe the operating airstream.  When
+    operation_fraction, flow_fraction, or required supply flow is zero, all
+    flow and energy outputs are zero and the actual supply temperature
+    equals outdoor.
     """
     if not isinstance(config, SensibleAHUConfig):
         raise TypeError("config must be a SensibleAHUConfig")
     if not isinstance(inputs, AHUStepInputs):
         raise TypeError("inputs must be an AHUStepInputs")
 
-    # Step 1: distinguish operating flow from timestep-average flow. This keeps
-    # reduced fan speed separate from ON/OFF duty averaging.
+    # Operating flow vs timestep-average flow: keeps reduced fan speed
+    # (flow_fraction) separate from ON/OFF duty averaging (operation_fraction).
     op = inputs.operation_fraction
     flow_fraction = inputs.flow_fraction
     operating_supply_m3_h = flow_fraction * inputs.required_supply_flow_m3_h
@@ -678,7 +659,7 @@ def calculate_sensible_ahu_step(
             frost_protection_required=False,
         )
 
-    # Step 1: Resolve requested setpoint (only reached when AHU is actually running)
+    # Requested setpoint (only resolved when the AHU is actually running)
     requested_t_sup = resolve_supply_temperature_setpoint(
         config.supply_temperature_control,
         inputs.outdoor_temperature_c,
@@ -688,8 +669,8 @@ def calculate_sensible_ahu_step(
 
     rho_cp_q = _RHO_CP_J_M3_K * q_sup  # W/K for supply stream
 
-    # Step 3: fan electricity and temperature rises. Power outputs are
-    # timestep averages; temperature rises describe the operating airstream.
+    # Fan electricity and temperature rises. Power outputs are timestep
+    # averages; temperature rises describe the operating airstream.
     p_sup_fan, dt_sup_fan = _fan_power_and_temperature_rise(
         model=config.fan_performance_model,
         operating_flow_m3_h=operating_supply_m3_h,
@@ -725,12 +706,10 @@ def calculate_sensible_ahu_step(
     eta_nom = config.sensible_heat_recovery_efficiency
     dT = t_ext_at_hr - t_outdoor  # K; positive in heating mode
 
-    # Step 4: EXHAUST_LIMIT frost protection — EN 16798-5-1 formula (46)
-    # direct effectiveness control. Reduce effective HR efficiency to keep
-    # T_EHA >= frost_exhaust_limit_c.
-    # The exhaust leaving the HR (EHA) must stay >= frost_exhaust_limit_c.
-    # For balanced flow: T_EHA = T_extract_at_hr - eta * dT
-    # If T_EHA < limit, reduce eta_eff so T_EHA exactly equals the limit.
+    # EXHAUST_LIMIT frost protection — EN 16798-5-1 formula (46) direct
+    # effectiveness control.  For balanced flow the exhaust leaving the HR is
+    # T_EHA = T_extract_at_hr - eta * dT; if it would fall below
+    # frost_exhaust_limit_c, reduce eta_eff so T_EHA sits exactly at the limit.
     frost_protection_req = False
     eta_eff = eta_nom
     if (
@@ -744,12 +723,11 @@ def calculate_sensible_ahu_step(
             eta_frost = (t_ext_at_hr - config.frost_exhaust_limit_c) / dT
             eta_eff = max(0.0, min(eta_nom, eta_frost))
 
-    # Step 5: HR outlet temperature (before modulation)
+    # HR outlet temperature (before bypass modulation)
     t_after_hr = t_outdoor + eta_eff * dT
 
-    # Step 6: Modulating bypass and total bypass_fraction.
-    # Internal target: subtract downstream supply fan heat so delivered temperature
-    # equals requested_t_sup after the fan addition in step 9.
+    # Internal coil/bypass target: subtract downstream supply fan heat so the
+    # delivered temperature equals requested_t_sup after the fan addition below.
     t_target = requested_t_sup - dt_sup_fan
 
     # Bypass formula: bp = (T_hr - T_target) / (T_hr - T_outdoor), clamped to [0, 1].
@@ -769,8 +747,8 @@ def calculate_sensible_ahu_step(
             bp = max(0.0, min(1.0, bp))
             t_after_hr = t_outdoor * bp + t_after_hr * (1.0 - bp)
 
-    # Total effective bypass fraction: fraction of supply air bypassing the HR core
-    # due to both frost protection (step 4) and setpoint modulation above.
+    # Total effective bypass fraction: fraction of supply air bypassing the HR
+    # core due to both frost protection and setpoint modulation.
     if eta_nom > 0.0 and abs(dT) > 1e-9:
         bypass_fraction = max(
             0.0, min(1.0, 1.0 - (t_after_hr - t_outdoor) / (eta_nom * dT))
@@ -778,16 +756,12 @@ def calculate_sensible_ahu_step(
     else:
         bypass_fraction = 0.0
 
-    # Step 7: Heat recovery power (net thermal gain to supply vs outdoor air)
+    # Heat recovery power: net thermal gain of the supply stream vs outdoor air
     hr_power_operating_w = rho_cp_q * (t_after_hr - t_outdoor)
 
-    # Step 8a: Cooling coil — placed before the heating coil to follow the
-    # EN 16798-5-1 air path (the spreadsheet's cooling/dehumidification block,
-    # formulas around D111-D158, precedes the heating block at D129-D154).  In
-    # this sensible single-setpoint model the two coils are mutually exclusive
-    # within a timestep, so ordering does not change the result, but it keeps the
-    # sequence faithful to the standard and ready for a future dehumidification-
-    # reheat extension.
+    # Cooling coil — precedes the heating coil, following the EN 16798-5-1 air
+    # path.  In this sensible single-setpoint model the two coils are mutually
+    # exclusive within a timestep, so the ordering does not change the result.
     #
     # required_cooling is the sensible load needed to pull the post-HR/bypass air
     # down to t_target.  When the coil is disabled it is reported as the unmet
@@ -806,8 +780,8 @@ def calculate_sensible_ahu_step(
 
     t_after_cooling = t_after_hr - actual_cooling_operating_w / rho_cp_q
 
-    # Step 8b: Heating coil targeting t_target so delivered temperature equals
-    # requested_t_sup after supply fan heat is added in step 9.  It sees the
+    # Heating coil targeting t_target so the delivered temperature equals
+    # requested_t_sup after supply-fan heat is added below.  It sees the
     # post-cooling temperature; with a single setpoint at most one coil is active.
     required_heating_operating_w = rho_cp_q * max(0.0, t_target - t_after_cooling)
     if config.heating_coil_max_power_w is None:
@@ -820,7 +794,7 @@ def calculate_sensible_ahu_step(
 
     t_after_coil = t_after_cooling + actual_heating_operating_w / rho_cp_q
 
-    # Step 9: Supply fan heat (after HR and coils, before zone delivery)
+    # Supply fan heat (after HR and coils, before zone delivery)
     t_actual_supply = t_after_coil + dt_sup_fan
 
     return AHUStepOutputs(
@@ -875,16 +849,14 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
     Required keys:
       ``sensible_heat_recovery_efficiency`` — float in [0, 1]
 
-    Supply temperature control — choose one mode:
-
-    Fixed (default; use when ``supply_temperature_mode`` is absent or "fixed"):
-      ``supply_temperature_setpoint_c``     — fixed setpoint [°C]
-
-    Outdoor-compensated (``supply_temperature_mode = "outdoor_compensated"``):
-      ``supply_temperature_points``         — list of [T_oda, T_sup] pairs, e.g.
-                                             [[-20, 19], [15, 17]] for ZEBlab
-      ``supply_temperature_minimum_c``      — optional clamp [°C]
-      ``supply_temperature_maximum_c``      — optional clamp [°C]
+    Supply temperature control — ``supply_temperature_mode`` selects one mode:
+      "fixed" (default):        ``supply_temperature_setpoint_c`` [°C]
+      "outdoor_compensated" /
+      "extract_compensated":    ``supply_temperature_points`` — list of
+                                [T_reference, T_supply] pairs, e.g.
+                                [[-20, 19], [15, 17]]
+      All modes accept optional ``supply_temperature_minimum_c`` and
+      ``supply_temperature_maximum_c`` clamps [°C].
 
     Optional keys and their defaults:
       ``heat_recovery_control``             — "modulating_bypass"
@@ -897,13 +869,16 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
       ``extract_fan_specific_power_w_per_m3_s`` — 0.0  (nominal SFP at design flow)
       ``supply_fan_heat_fraction_to_air``   — 0.90
       ``extract_fan_heat_fraction_to_air``  — 0.90
-      ``fan_performance_model``              — "en16798_5_1"
+      ``fan_performance_model``              — "en16798_5_1" (see FanPerformanceModel)
       ``supply_fan_design_pressure_pa``      — derived from nominal SFP and efficiency
       ``extract_fan_design_pressure_pa``     — derived from nominal SFP and efficiency
       ``supply_fan_nominal_efficiency``      — 0.72
       ``extract_fan_nominal_efficiency``     — 0.78
       ``*_fan_reference_flow_m3_h``          — required/design flow for the timestep
       ``*_fan_reference_efficiency``         — corresponding nominal efficiency
+
+    See docs/ventilation_ahu_audit.html for the full key reference and the
+    discussion of the defaulted fan product data.
     """
     heating_coil_max = d.get("heating_coil_max_power_w")
     if heating_coil_max is not None:
@@ -936,7 +911,7 @@ def sensible_ahu_config_from_dict(d: dict) -> SensibleAHUConfig:
         if not raw_pts:
             raise KeyError(
                 f"{ctrl_mode_str} control requires 'supply_temperature_points' "
-                "(list of [T_ref, T_sup] pairs, e.g. [[21, 19], [24, 17]] for ZEBlab)"
+                "(list of [T_ref, T_sup] pairs, e.g. [[21, 19], [24, 17]])"
             )
         points = tuple(
             CompensationPoint(

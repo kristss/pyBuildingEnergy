@@ -179,15 +179,33 @@ def _resolve_single_zone_vent_boundary(
     )
 
 
+# Ordered specification of AHU diagnostic output fields: (column_prefix, attribute_name, dtype).
+# Used by both _ahu_coll_to_columns (legacy/causal paths) and the multizone buffer, so that
+# all solver paths expose the same 12 diagnostic columns.
+# AHU coil energy must NOT be added to the zone Sankey — the ventilation term already uses
+# the conditioned supply temperature, so adding coil energy would double-count.
+_AHU_DIAG_SPEC: tuple = (
+    ("Q_ahu_coil",     "actual_heating_coil_power_w",    float),
+    ("Q_ahu_coil_req", "required_heating_coil_power_w",  float),
+    ("Q_ahu_cool",     "actual_cooling_coil_power_w",    float),
+    ("Q_ahu_cool_req", "required_cooling_coil_power_w",  float),
+    ("Q_ahu_hr",       "heat_recovery_power_w",          float),
+    ("P_ahu_fan",      "fan_electric_power_w",           float),
+    ("T_ahu_sup",      "actual_supply_temperature_c",    float),
+    ("T_ahu_sup_req",  "requested_supply_temperature_c", float),
+    ("q_sup_m3h",      "actual_supply_flow_m3_h",        float),
+    ("q_ext_m3h",      "actual_extract_flow_m3_h",       float),
+    ("ahu_bypass",     "bypass_fraction",                float),
+    ("ahu_frost",      "frost_protection_required",      int),
+)
+
+
 def _ahu_coll_to_columns(ahu_coll_act):
     """Convert per-timestep {component_name: AHUStepOutputs} dicts to hourly column arrays.
 
     Returns {col_name: np.array} for all mechanical_supply components found in the list.
     Only called when at least one such component is present.
-
-    AHU coil energy is NOT added to the zone Sankey.  Adding it would conflict
-    with the zone-boundary energy balance, because the ventilation loss term
-    already uses the conditioned supply temperature.
+    Column schema is defined by _AHU_DIAG_SPEC — identical to the multizone path.
     """
     names = sorted({k for d in ahu_coll_act for k in d})
     if not names:
@@ -198,29 +216,15 @@ def _ahu_coll_to_columns(ahu_coll_act):
     for name in names:
         sfx = f"_{name}"
         vv = [d.get(name) for d in ahu_coll_act]
-
-        def _arr(attr, _vv=vv, dtype=float):
+        for col_pfx, attr, dtype in _AHU_DIAG_SPEC:
             a = np.empty(n, dtype=dtype)
-            for i, v in enumerate(_vv):
+            for i, v in enumerate(vv):
                 raw = getattr(v, attr) if v is not None else None
                 if dtype == float:
                     a[i] = float(raw) if raw is not None else np.nan
                 else:
                     a[i] = int(bool(raw)) if raw is not None else 0
-            return a
-
-        cols[f"Q_ahu_coil{sfx}"]     = _arr("actual_heating_coil_power_w")
-        cols[f"Q_ahu_coil_req{sfx}"] = _arr("required_heating_coil_power_w")
-        cols[f"Q_ahu_cool{sfx}"]     = _arr("actual_cooling_coil_power_w")
-        cols[f"Q_ahu_cool_req{sfx}"] = _arr("required_cooling_coil_power_w")
-        cols[f"Q_ahu_hr{sfx}"]       = _arr("heat_recovery_power_w")
-        cols[f"P_ahu_fan{sfx}"]      = _arr("fan_electric_power_w")
-        cols[f"T_ahu_sup{sfx}"]      = _arr("actual_supply_temperature_c")
-        cols[f"T_ahu_sup_req{sfx}"]  = _arr("requested_supply_temperature_c")
-        cols[f"q_sup_m3h{sfx}"]      = _arr("actual_supply_flow_m3_h")
-        cols[f"q_ext_m3h{sfx}"]      = _arr("actual_extract_flow_m3_h")
-        cols[f"ahu_bypass{sfx}"]     = _arr("bypass_fraction")
-        cols[f"ahu_frost{sfx}"]      = _arr("frost_protection_required", dtype=int)
+            cols[f"{col_pfx}{sfx}"] = a
     return cols
 
 
@@ -3928,9 +3932,9 @@ class ISO52016:
             )
 
         # Per-zone AHU output buffers: keyed by (zone_index, component_name).
-        # Populated lazily on first encounter so unknown component sets don't need pre-scanning.
-        # Keys: "Q_coil" [W actual], "Q_hr" [W], "P_fan" [W], "T_sup" [°C], "frost" [0/1].
-        _ahu_buffers: dict = {}  # (zi, comp_name) -> {"Q_coil": np.array, ...}
+        # Populated lazily on first encounter. Keys are the _AHU_DIAG_SPEC column prefixes,
+        # so the multizone output schema matches _ahu_coll_to_columns (legacy/causal paths).
+        _ahu_buffers: dict = {}  # (zi, comp_name) -> {col_pfx: np.array}
 
         # ------------------------
         # 7) Ground virtual temperature (optional)
@@ -4782,6 +4786,8 @@ class ISO52016:
             purge_active_z_t = np.zeros(Z, dtype=int)
             for zi, zone in enumerate(zones):
                 phi_int_z_t[zi] = _zone_internal_gain_w(zone, t)
+                # Theta[zi] is the zone AIR node (first Z rows of state vector),
+                # not the operative temperature — explicit lag, no algebraic loop.
                 vent_bdy, purge_factor_z_t[zi], purge_active_z_t[zi], _ahu_step = (
                     _zone_ventilation_h_wk(zone, Theta[zi], t, T_out)
                 )
@@ -4791,18 +4797,19 @@ class ISO52016:
                     _key = (zi, _cn)
                     if _key not in _ahu_buffers:
                         _ahu_buffers[_key] = {
-                            "Q_coil": np.full(Tstepn, np.nan),
-                            "Q_hr": np.full(Tstepn, np.nan),
-                            "P_fan": np.full(Tstepn, np.nan),
-                            "T_sup": np.full(Tstepn, np.nan),
-                            "frost": np.zeros(Tstepn, dtype=np.int8),
+                            col_pfx: (
+                                np.full(Tstepn, np.nan, dtype=float) if dtype == float
+                                else np.zeros(Tstepn, dtype=dtype)
+                            )
+                            for col_pfx, _, dtype in _AHU_DIAG_SPEC
                         }
                     _buf = _ahu_buffers[_key]
-                    _buf["Q_coil"][t] = _ao.actual_heating_coil_power_w
-                    _buf["Q_hr"][t] = _ao.heat_recovery_power_w
-                    _buf["P_fan"][t] = _ao.fan_electric_power_w
-                    _buf["T_sup"][t] = _ao.actual_supply_temperature_c
-                    _buf["frost"][t] = int(_ao.frost_protection_required)
+                    for col_pfx, attr, dtype in _AHU_DIAG_SPEC:
+                        raw = getattr(_ao, attr)
+                        if dtype == float:
+                            _buf[col_pfx][t] = float(raw) if raw is not None else np.nan
+                        else:
+                            _buf[col_pfx][t] = int(bool(raw))
             phi_sol_z_t = _zone_solar_transmitted_w(t)
 
             # Base matrix for this timestep
@@ -5017,15 +5024,14 @@ class ISO52016:
         for surface_out in opaque_inside_surface_output_buffers:
             out_data[f"Q_opaque_inside_surface_{surface_out['surface_token']}"] = surface_out["Q_inside"]
 
-        # AHU component outputs: Q_ahu_coil, Q_ahu_hr, P_ahu_fan, T_ahu_sup, ahu_frost
+        # AHU component diagnostics — 12 fields per component (from _AHU_DIAG_SPEC).
+        # Column names: {col_pfx}_{comp_name}_{zone_name}.  Same field set as the
+        # legacy/causal paths (_ahu_coll_to_columns), different suffix convention.
         # Columns appear only when at least one mechanical_supply component ran.
         for (zi, comp_name), _buf in _ahu_buffers.items():
             _zn = zone_names[zi]
-            out_data[f"Q_ahu_coil_{comp_name}_{_zn}"] = _buf["Q_coil"]
-            out_data[f"Q_ahu_hr_{comp_name}_{_zn}"] = _buf["Q_hr"]
-            out_data[f"P_ahu_fan_{comp_name}_{_zn}"] = _buf["P_fan"]
-            out_data[f"T_ahu_sup_{comp_name}_{_zn}"] = _buf["T_sup"]
-            out_data[f"ahu_frost_{comp_name}_{_zn}"] = _buf["frost"]
+            for col_pfx, _, _ in _AHU_DIAG_SPEC:
+                out_data[f"{col_pfx}_{comp_name}_{_zn}"] = _buf[col_pfx]
 
         out = pd.DataFrame(out_data, index=sim_df.index)
         out = out.iloc[start_idx:].copy()
