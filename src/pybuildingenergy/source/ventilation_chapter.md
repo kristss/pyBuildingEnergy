@@ -281,6 +281,14 @@ A `components` list may combine infiltration (no profile → always active) and 
 supply (with profile → follows schedule), which is the practical purpose of the additive
 stream model and the contract used by the EN 16798-5-1 AHU module (section 4.6).
 
+When a component has a `profile`, the profile name must be resolvable by the
+active solver path.  For `mechanical_supply`, a missing or unsupported profile
+raises `ValueError` by default because treating a misspelled AHU schedule as
+full-flow operation can materially change the result.  To preserve that fallback
+intentionally, set `"missing_profile_policy": "warn"` on the component; the
+solver will emit a warning and use multiplier `1.0`.  Non-AHU components retain
+the warning fallback by default for compatibility.
+
 ### 4.6 The `mechanical_supply` component (EN 16798-5-1 sensible AHU)
 
 The `"mechanical_supply"` type replaces the externally known supply condition of

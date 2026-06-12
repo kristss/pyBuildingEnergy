@@ -16,6 +16,7 @@ import tempfile
 import copy
 import re
 import time
+import warnings
 # timezonefinder imported lazily -- avoids ~0.7s startup cost
 from pytz import timezone
 import numpy as np
@@ -131,6 +132,86 @@ def _make_sched_resolver(kwargs, iso16798_profiles_obj):
     return _sched
 
 
+_VENTILATION_COMPONENT_PROFILE_COLUMNS = {
+    "occupancy_profile",
+    "appliances_profile",
+    "lighting_profile",
+    "heating_profile",
+    "cooling_profile",
+    "ventilation_profile",
+}
+
+_VENTILATION_MISSING_PROFILE_POLICIES = {"error", "warn"}
+
+
+def _ventilation_component_type(component):
+    return str(component.get("ventilation_type", "")).strip().lower()
+
+
+def _ventilation_missing_profile_policy(component):
+    """Return the missing-profile policy for a ventilation component.
+
+    Mechanical supply components represent active AHU flow. If their schedule is
+    misspelled, silently running them at 100% flow is a large modelling error, so
+    the default is strict. Passive/prescribed legacy components retain the older
+    warning fallback unless callers opt into strictness.
+    """
+    raw_policy = component.get("missing_profile_policy")
+    if raw_policy is None:
+        return "error" if _ventilation_component_type(component) == "mechanical_supply" else "warn"
+
+    policy = str(raw_policy).strip().lower().replace("-", "_")
+    aliases = {
+        "raise": "error",
+        "strict": "error",
+        "warning": "warn",
+        "use_default": "warn",
+        "default": "warn",
+        "fallback": "warn",
+    }
+    policy = aliases.get(policy, policy)
+    if policy not in _VENTILATION_MISSING_PROFILE_POLICIES:
+        raise ValueError(
+            "Unsupported ventilation component missing_profile_policy "
+            f"{raw_policy!r}; expected one of {sorted(_VENTILATION_MISSING_PROFILE_POLICIES)}."
+        )
+    return policy
+
+
+def _resolve_ventilation_component_profile_multiplier(
+    *,
+    component,
+    component_name,
+    profile_columns,
+    value_getter,
+    context,
+):
+    """Resolve one component profile multiplier or None when it should default to 1.0."""
+    profile_name = component.get("profile")
+    if profile_name is None:
+        return None
+
+    profile_name = str(profile_name).strip()
+    if not profile_name:
+        return None
+
+    available_columns = {str(col) for col in profile_columns}
+    if profile_name in available_columns:
+        return float(value_getter(profile_name))
+
+    policy = _ventilation_missing_profile_policy(component)
+    message = (
+        f"{context} component {component_name!r}: profile {profile_name!r} is not "
+        f"available; available columns are {sorted(available_columns)}. "
+        "Add the profile column or set missing_profile_policy='warn' to use 1.0 explicitly."
+    )
+    if policy == "error":
+        raise ValueError(message)
+
+    warnings.warn(f"{message} Using 1.0.", stacklevel=3)
+    return None
+
+
 def _resolve_single_zone_vent_boundary(
     building_object, T_zone, Tstepi, sim_df, profile_df,
     ahu_outputs_collector=None,
@@ -155,18 +236,17 @@ def _resolve_single_zone_vent_boundary(
     _comp_mult: dict = {}
     for _comp in _vent_cfg.get("components", []):
         _cname = str(_comp.get("name", "")).strip()
-        _cprof = _comp.get("profile")
-        if _cname and _cprof is not None:
-            _col = str(_cprof)
-            if _col in profile_df.columns:
-                _comp_mult[_cname] = float(profile_df[_col].iloc[Tstepi])
-            else:
-                import warnings as _w
-                _w.warn(
-                    f"Component {_cname!r}: profile column {_col!r} not in "
-                    f"profile_df; available columns: {list(profile_df.columns)}. Using 1.0.",
-                    stacklevel=3,
-                )
+        if not _cname:
+            continue
+        _mult = _resolve_ventilation_component_profile_multiplier(
+            component=_comp,
+            component_name=_cname,
+            profile_columns=profile_df.columns,
+            value_getter=lambda col: profile_df[col].iloc[Tstepi],
+            context="Single-zone ventilation",
+        )
+        if _mult is not None:
+            _comp_mult[_cname] = _mult
     return resolve_ventilation_boundary(
         building_object,
         float(T_zone),
@@ -4313,30 +4393,25 @@ class ISO52016:
                 or 0.0
             )
 
-            # Per-component schedules: each component may have a "profile" key
-            # naming a profile in the profile registry.  Components without a
-            # profile key always run at full capacity (1.0) so infiltration
-            # remains active independently of the mechanical schedule.
-            # Only the six standard profile columns are supported; unknown names
-            # warn once and fall back to 1.0.
-            _known_profiles = {
-                "occupancy_profile", "appliances_profile", "lighting_profile",
-                "heating_profile", "cooling_profile", "ventilation_profile",
-            }
+            # Per-component schedules: each component may have a "profile" key.
+            # Components without a profile key run at full capacity (1.0), so
+            # infiltration remains active independently of AHU schedules.
             _comp_mult: dict = {}
             for _comp in vent_cfg.get("components", []):
                 _cname = str(_comp.get("name", "")).strip()
-                _prof = _comp.get("profile")
-                if _cname and _prof is not None:
-                    if _prof not in _known_profiles:
-                        import warnings as _w
-                        _w.warn(
-                            f"Zone {zname!r} component {_cname!r}: profile {_prof!r} is not "
-                            f"one of the supported profile columns {sorted(_known_profiles)}. "
-                            "Using 1.0.",
-                            stacklevel=2,
-                        )
-                    _comp_mult[_cname] = _profile_value(zname, _prof, tstep, 1.0)
+                if not _cname:
+                    continue
+                _mult = _resolve_ventilation_component_profile_multiplier(
+                    component=_comp,
+                    component_name=_cname,
+                    profile_columns=_VENTILATION_COMPONENT_PROFILE_COLUMNS,
+                    value_getter=lambda col, _zname=zname, _tstep=tstep: _profile_value(
+                        _zname, col, _tstep, 1.0
+                    ),
+                    context=f"Zone {zname!r}",
+                )
+                if _mult is not None:
+                    _comp_mult[_cname] = _mult
 
             _ahu_coll: dict = {}
             try:
