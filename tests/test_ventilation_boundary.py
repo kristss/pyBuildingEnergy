@@ -249,6 +249,50 @@ class TestResolveVentilationBoundary:
         assert bdy.heat_transfer_coefficient_w_k == pytest.approx(expected_h, rel=1e-4)
         assert bdy.source_term_w == pytest.approx(expected_h * t_out, rel=1e-4)
 
+    def test_constant_ach_outdoor_air_matches_legacy_custom_boundary(self):
+        """Outdoor-air-only component gives the same affine boundary as legacy custom H_ve."""
+        zone_vol = 486.0
+        ach = 0.30
+        t_zone = 21.0
+        t_out = 4.0
+        rho, cp = 1.204, 1006.0
+        h_ve = rho * cp * ach * zone_vol / 3600.0
+
+        component_bld = {
+            "building_parameters": {
+                "ventilation": {
+                    "components": [{
+                        "name": "outdoor_air",
+                        "ventilation_type": "constant_ach",
+                        "air_changes_per_hour": ach,
+                    }]
+                }
+            }
+        }
+        component_bdy = resolve_ventilation_boundary(
+            component_bld,
+            t_zone,
+            t_out,
+            0.0,
+            zone_volume_m3=zone_vol,
+        )
+        legacy_bdy = resolve_ventilation_boundary(
+            self._custom_building(h_ve),
+            t_zone,
+            t_out,
+            0.0,
+        )
+
+        assert component_bdy.heat_transfer_coefficient_w_k == pytest.approx(
+            legacy_bdy.heat_transfer_coefficient_w_k,
+            rel=1e-9,
+        )
+        assert component_bdy.source_term_w == pytest.approx(legacy_bdy.source_term_w, rel=1e-9)
+        assert component_bdy.sensible_heat_flow_w(t_zone) == pytest.approx(
+            legacy_bdy.sensible_heat_flow_w(t_zone),
+            rel=1e-9,
+        )
+
     def test_components_prescribed(self):
         """Prescribed stream has arbitrary source temperature."""
         bld = {
@@ -1218,7 +1262,7 @@ class TestCrossSolverRegressions:
         assert bdy_half.heat_transfer_coefficient_w_k == pytest.approx(300.0)
 
     def test_unknown_profile_emits_warning_in_multizone_path(self):
-        """An unknown component profile key in the multizone path must emit a warning."""
+        """A non-AHU unknown component profile keeps the legacy warning fallback."""
         import warnings
         bld = _one_zone_building()
         bld["zones"][0]["ventilation"] = {
@@ -1242,6 +1286,43 @@ class TestCrossSolverRegressions:
         assert any("nonexistent_column" in str(w.message) for w in caught), (
             "Expected a warning about the unknown profile column"
         )
+
+    def test_missing_mechanical_supply_profile_raises_in_multizone_path(self):
+        """A mechanical_supply schedule typo must fail fast unless explicitly downgraded."""
+        bld = _one_zone_building()
+        bld["zones"][0]["ventilation"] = {
+            "components": [
+                _ahu_component(profile="nonexistent_column"),
+            ]
+        }
+        bld["building_parameters"]["ventilation"] = {}
+
+        with pytest.raises(ValueError, match="nonexistent_column"):
+            with _patched_weather(n=4):
+                ISO52016.simulate_envelope_multizone_free_floating(
+                    building_object=bld,
+                    use_profiles=False,
+                )
+
+    def test_missing_mechanical_supply_profile_can_warn_explicitly(self):
+        """missing_profile_policy='warn' documents the fallback to full-flow operation."""
+        import warnings
+        bld = _one_zone_building()
+        bld["zones"][0]["ventilation"] = {
+            "components": [
+                _ahu_component(profile="nonexistent_column", missing_profile_policy="warn"),
+            ]
+        }
+        bld["building_parameters"]["ventilation"] = {}
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with _patched_weather(n=4):
+                ISO52016.simulate_envelope_multizone_free_floating(
+                    building_object=bld,
+                    use_profiles=False,
+                )
+        assert any("missing_profile_policy='warn'" in str(w.message) for w in caught)
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1475,22 @@ class TestLegacyCausalSolverPaths:
             out["H_ve"].to_numpy(), expected, rtol=1e-4,
             err_msg="H_ve must match ahu_schedule: infiltration+AHU when on, infiltration-only when off",
         )
+
+    def test_legacy_missing_mechanical_supply_profile_raises(self):
+        """Single-zone mechanical_supply components are strict about missing profiles."""
+        bld = _legacy_building([_ahu_component(profile="nonexistent_column")])
+        with pytest.raises(ValueError, match="nonexistent_column"):
+            _run_legacy(bld, n=4)
+
+    def test_legacy_missing_mechanical_supply_profile_warn_policy(self):
+        """An explicit warn policy keeps the previous full-flow fallback visible."""
+        bld = _legacy_building([
+            _ahu_component(profile="nonexistent_column", missing_profile_policy="warn")
+        ])
+        with pytest.warns(UserWarning, match="missing_profile_policy='warn'"):
+            out = _run_legacy(bld, n=4)
+        assert "H_ve" in out.columns
+        assert np.all(out["H_ve"].to_numpy() > 0.0)
 
     def test_legacy_q_ve_closes(self):
         """Legacy Q_ve = H_ve * T_air - S_ve at every timestep."""
